@@ -1,0 +1,42 @@
+{
+  "name": "short-link-generator",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1 --port 1420 --strictPort",
+    "build": "tsc -b && vite build",
+    "test": "vitest run",
+    "test:edge": "node --test edge/*.test.mjs",
+    "test:tooling": "node --test scripts/*.test.mjs",
+    "check:privacy": "node scripts/privacy-check.mjs --working-tree",
+    "tauri": "tauri",
+    "desktop:dev": "tauri dev",
+    "desktop:build": "tauri build",
+    "test:probe": "node --test probe/*.test.mjs"
+  },
+  "dependencies": {
+    "@phosphor-icons/react": "2.1.10",
+    "@tauri-apps/api": "^2.11.0",
+    "@tauri-apps/plugin-clipboard-manager": "^2.3.2",
+    "@tauri-apps/plugin-dialog": "^2.6.0",
+    "@tauri-apps/plugin-fs": "^2.4.5",
+    "@tauri-apps/plugin-opener": "^2.5.3",
+    "@tauri-apps/plugin-updater": "^2.10.0",
+    "react": "19.3.0",
+    "react-dom": "19.3.0"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "2.12.0",
+    "@testing-library/react": "^16.3.2",
+    "@testing-library/user-event": "^14.6.1",
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^6.0.0",
+    "jsdom": "^29.0.0",
+    "typescript": "^6.0.2",
+    "vite": "8.3.1",
+    "vitest": "5.0.2",
+    "yaml": "^2.8.3"
+  }
+}

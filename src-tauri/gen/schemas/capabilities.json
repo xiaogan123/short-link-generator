@@ -1,0 +1,1 @@
+{"main":{"identifier":"main","description":"Main application window","local":true,"windows":["main"],"permissions":["core:default","opener:default","clipboard-manager:allow-read-text","clipboard-manager:allow-write-text","dialog:default","fs:allow-read-text-file","fs:allow-write-text-file"]}}

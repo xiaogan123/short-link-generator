@@ -1,0 +1,67 @@
+name: Checks
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      platform:
+        type: choice
+        options: [mac-arm, mac-intel, windows]
+        default: windows
+permissions:
+  contents: read
+concurrency:
+  group: checks-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  source:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '24'
+          cache: npm
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - name: Install desktop compile dependencies
+        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev libxdo-dev librsvg2-dev patchelf libssl-dev build-essential
+      - run: npm ci
+      - run: npm run test:edge
+      - run: npm run test:probe
+      - run: npm run test:tooling
+      - run: npm test
+      - run: npm run build
+      - run: cargo fmt --manifest-path src-tauri/Cargo.toml --check
+      - run: cargo test --manifest-path src-tauri/Cargo.toml --locked
+      - run: cargo clippy --manifest-path src-tauri/Cargo.toml --locked --all-targets -- -D warnings
+      - run: node scripts/privacy-check.mjs --public --working-tree --history
+  native:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ${{ inputs.platform == 'windows' && 'windows-2022' || inputs.platform == 'mac-intel' && 'macos-15-intel' || 'macos-15' }}
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '24'
+          cache: npm
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+        with:
+          toolchain: stable
+          targets: ${{ inputs.platform == 'windows' && 'x86_64-pc-windows-msvc' || inputs.platform == 'mac-intel' && 'x86_64-apple-darwin' || 'aarch64-apple-darwin' }}
+          components: rustfmt, clippy
+      - run: npm ci
+      - run: npm run build
+      - run: cargo fmt --manifest-path src-tauri/Cargo.toml --check
+      - run: cargo test --manifest-path src-tauri/Cargo.toml --locked --target ${{ inputs.platform == 'windows' && 'x86_64-pc-windows-msvc' || inputs.platform == 'mac-intel' && 'x86_64-apple-darwin' || 'aarch64-apple-darwin' }}
+      - run: cargo clippy --manifest-path src-tauri/Cargo.toml --locked --target ${{ inputs.platform == 'windows' && 'x86_64-pc-windows-msvc' || inputs.platform == 'mac-intel' && 'x86_64-apple-darwin' || 'aarch64-apple-darwin' }} --all-targets -- -D warnings
