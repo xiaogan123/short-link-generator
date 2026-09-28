@@ -22,6 +22,8 @@ Pool = `{id, name, official:{prefix,suffix}, candidates:[{id,prefix,suffix,enabl
 `h:<poolId>`: `{revision,checkedAt:<unix seconds>,targets:{[candidateId]:{state:'healthy'|'unhealthy'|'unknown',failures,successes,checkedAt}}}`.
 `m:monitor`: `{endpoint,poolIds:string[]}`. Maintain poolIds from managed pool records; never expose this key publicly. No product signatures in redirect responses.
 
+Serialized `p:` and `m:monitor` records must each fit within 16,384 bytes. A monitor record supports at most 256 pool IDs. The desktop validates these limits before cloud writes, including the projected monitor record when changing a pool.
+
 Pool updates invalidate old health by revision. Mainland selects the first enabled candidate not marked unhealthy by fresh matching-revision health. Unknown/missing/stale (older than 3600 seconds) results keep user priority and are not labeled healthy. If every enabled candidate is freshly unhealthy, return neutral 503 (HEAD empty); do not silently substitute the other-region URL. Other countries use the official template. Selftest uses the identical choice algorithm and reports a temporarily unavailable pool truthfully.
 
 ## Measurement provider protocol
