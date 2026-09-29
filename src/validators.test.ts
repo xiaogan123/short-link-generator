@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { normalizeHost, shortUrl, validateHost, validatePrefix, validateSlug, validateTarget } from './validators';
+import { normalizeHost, shortUrl, splitInvitationLink, validateHost, validatePrefix, validateSlug, validateTarget } from './validators';
 
 describe('link inputs', () => {
   it('accepts URLs and international hostnames while preserving www', () => {
@@ -28,4 +28,19 @@ describe('link inputs', () => {
     expect(validateTarget('/relative')).not.toBeNull();
   });
   it('constructs exact route paths', () => expect(shortUrl('go.example.com', 'r', 'test')).toBe('https://go.example.com/r/test'));
+  it('splits supported invitation links without losing query parameters',()=>{
+    expect(splitInvitationLink('https://example.com/join/CODE_1?lang=zh')).toEqual({prefix:'https://example.com/join/',code:'CODE_1',suffix:'?lang=zh'});
+    expect(splitInvitationLink('https://example.org/zh/share/CODE-2')).toEqual({prefix:'https://example.org/zh/share/',code:'CODE-2',suffix:''});
+    expect(splitInvitationLink('https://example.com/register?lang=zh&ref=CODE_3&utm=sample')).toEqual({prefix:'https://example.com/register?lang=zh&ref=',code:'CODE_3',suffix:'&utm=sample'});
+    expect(splitInvitationLink('https://EXAMPLE.com/register?lang=%2F&ref=CODE_4&utm=%2B')).toEqual({prefix:'https://EXAMPLE.com/register?lang=%2F&ref=',code:'CODE_4',suffix:'&utm=%2B'});
+  });
+  it('rejects unknown invitation forms instead of guessing where the code begins',()=>{
+    expect(()=>splitInvitationLink('https://example.com/ref/CODE_1')).toThrow(/暂不识别/);
+    expect(()=>splitInvitationLink('https://example.com/register?ref=ONE&ref=TWO')).toThrow(/多个 ref/);
+    expect(()=>splitInvitationLink('https://example.com/register?ref=ONE&%72ef=TWO')).toThrow(/多个 ref/);
+    expect(()=>splitInvitationLink('https://example.com/join/ONE?ref=TWO')).toThrow(/位置不明确/);
+    expect(()=>splitInvitationLink('https://example.com/join/ONE?%72ef=TWO')).toThrow(/位置不明确/);
+    expect(()=>splitInvitationLink('https://@example.com/join/ONE')).toThrow(/不能包含 @/);
+    expect(()=>splitInvitationLink('https://example.com/join/CODE#fragment')).toThrow(/# 后面的内容/);
+  });
 });

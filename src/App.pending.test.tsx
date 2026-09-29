@@ -16,7 +16,7 @@ it('offers structured pending actions and requires a review plan before resuming
   expect(await screen.findByRole('region',{name:'可继续的变更'})).toBeTruthy();
   fireEvent.click(screen.getByRole('button',{name:'继续同步'}));
   const poolPlan=await screen.findByRole('dialog',{name:'继续同步地址池'});
-  expect(within(poolPlan).getByText('地址池：示例地址池')).toBeTruthy();
+  expect(within(poolPlan).getByText('平台地址：示例地址池')).toBeTruthy();
   expect(calls.some(call=>call.action==='prepare_change'&&call.payload.kind==='resume_pool_sync'&&call.payload.poolId==='p')).toBe(true);
   fireEvent.click(within(poolPlan).getByRole('button',{name:'返回'}));
   fireEvent.click(screen.getByRole('button',{name:'继续处理监测'}));

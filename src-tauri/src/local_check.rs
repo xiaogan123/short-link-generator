@@ -44,10 +44,10 @@ async fn client_for(url: &url::Url) -> Result<Client, String> {
         || !url.username().is_empty()
         || url.password().is_some()
     {
-        return Err("仅检查公开 HTTPS 目标".into());
+        return Err("只检测公开的 HTTPS 网站".into());
     }
     let host = url.host_str().unwrap();
-    let port = url.port_or_known_default().ok_or("目标端口无效")?;
+    let port = url.port_or_known_default().ok_or("网站端口无效")?;
     let addrs: Vec<SocketAddr> = if let Ok(ip) = host.parse::<IpAddr>() {
         vec![SocketAddr::new(ip, port)]
     } else {
@@ -61,7 +61,7 @@ async fn client_for(url: &url::Url) -> Result<Client, String> {
         .collect()
     };
     if addrs.is_empty() || addrs.iter().any(|a| !public_ip(a.ip())) {
-        return Err("目标解析到非公开地址，停止检查".into());
+        return Err("网站域名解析到非公开地址，停止检测".into());
     }
     Client::builder()
         .redirect(reqwest::redirect::Policy::none())
@@ -77,7 +77,7 @@ pub async fn check(label: &str, initial: &str) -> Value {
     let checked_at = Utc::now().to_rfc3339();
     let mut url = match url::Url::parse(initial) {
         Ok(v) => v,
-        Err(_) => return result(label, "unknown", "保存的目标地址无效", &checked_at, initial),
+        Err(_) => return result(label, "unknown", "保存的网站地址无效", &checked_at, initial),
     };
     for hop in 0..=3 {
         let client = match client_for(&url).await {
@@ -112,7 +112,7 @@ pub async fn check(label: &str, initial: &str) -> Value {
             return result(
                 label,
                 "unknown",
-                "目标返回访问挑战，无法判定",
+                "网站要求完成验证码等验证，暂时无法确认",
                 &checked_at,
                 url.as_str(),
             );
@@ -123,7 +123,7 @@ pub async fn check(label: &str, initial: &str) -> Value {
                 return result(
                     label,
                     "unknown",
-                    "目标跳转次数过多",
+                    "网站跳转次数过多，暂时无法确认",
                     &checked_at,
                     url.as_str(),
                 );
@@ -138,7 +138,7 @@ pub async fn check(label: &str, initial: &str) -> Value {
                     return result(
                         label,
                         "unknown",
-                        "目标跳转缺少地址",
+                        "网站跳转时没有提供新地址，暂时无法确认",
                         &checked_at,
                         url.as_str(),
                     )
@@ -150,7 +150,7 @@ pub async fn check(label: &str, initial: &str) -> Value {
                     return result(
                         label,
                         "unknown",
-                        "目标跳转地址无效",
+                        "网站跳转地址无效，暂时无法确认",
                         &checked_at,
                         url.as_str(),
                     )
@@ -159,18 +159,18 @@ pub async fn check(label: &str, initial: &str) -> Value {
             continue;
         }
         let (state, message) = if status.is_success() {
-            ("passed", "本机可访问目标")
+            ("passed", "当前电脑已收到网站的正常响应")
         } else if status == StatusCode::FORBIDDEN
             || status == StatusCode::TOO_MANY_REQUESTS
             || status == StatusCode::UNAUTHORIZED
         {
-            ("unknown", "目标拒绝或限制探测，无法判定")
+            ("unknown", "网站拒绝或限制自动检测，暂时无法确认")
         } else if status == StatusCode::NOT_FOUND || status == StatusCode::GONE {
-            ("failed", "目标返回 404/410")
+            ("failed", "页面不存在或已移除（404/410）")
         } else if status.is_server_error() {
-            ("failed", "目标返回服务器错误")
+            ("failed", "网站服务器报错")
         } else {
-            ("unknown", "目标响应无法判定")
+            ("unknown", "网站响应无法确认")
         };
         return result(label, state, message, &checked_at, url.as_str());
     }

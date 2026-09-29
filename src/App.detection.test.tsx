@@ -19,7 +19,7 @@ afterEach(()=>cleanup());
 describe('visible local detection provenance',()=>{
   it.each([
     {status:'failed' as const,message:'HTTP 404',tone:'red',label:'本机检测发现失败'},
-    {status:'unknown' as const,message:'HTTP 403：无法确认',tone:'amber',label:'有待确认结果'},
+    {status:'unknown' as const,message:'HTTP 403：无法确认',tone:'amber',label:'暂时无法确认'},
     {status:'passed' as const,message:'本机请求成功。',tone:'green',label:'跳转与目标本机检测通过'},
   ])('shows $status with its source and row warning',async({status,message,tone,label})=>{
     sample.status=status;sample.message=message;

@@ -14,7 +14,7 @@ pub fn valid_id(id: &str) -> bool {
 
 pub fn compose(template: &Template, code: &str) -> Result<String, String> {
     if !valid_code(code) {
-        return Err("模板代码需为 1–128 位字母、数字、下划线或连字符".into());
+        return Err("邀请码需为 1–128 位字母、数字、下划线或连字符".into());
     }
     if template.prefix.len() + template.suffix.len() > 1900
         || template
@@ -26,24 +26,24 @@ pub fn compose(template: &Template, code: &str) -> Result<String, String> {
             .bytes()
             .any(|b| b <= 32 || b == 127 || b == b'\\')
     {
-        return Err("模板地址含有不允许的字符或过长".into());
+        return Err("平台地址模板含有不允许的字符或过长".into());
     }
     let rest = template
         .prefix
         .strip_prefix("https://")
-        .ok_or("模板必须使用完整 HTTPS 主机")?;
+        .ok_or("平台地址模板必须包含完整的 HTTPS 主机名")?;
     let authority_end = rest
         .find(['/', '?'])
-        .ok_or("模板代码只能插入路径或查询部分")?;
+        .ok_or("邀请码只能放在网址的路径或查询部分")?;
     if authority_end == 0
         || rest[..authority_end].contains(['#', '@'])
         || template.prefix.contains('#')
     {
-        return Err("模板主机或片段无效".into());
+        return Err("平台地址模板的主机名或片段无效".into());
     }
-    let prefix_url = url::Url::parse(&template.prefix).map_err(|_| "模板前缀无效")?;
+    let prefix_url = url::Url::parse(&template.prefix).map_err(|_| "平台地址模板前半段无效")?;
     let target = format!("{}{}{}", template.prefix, code, template.suffix);
-    let url = url::Url::parse(&target).map_err(|_| "模板地址无效".to_string())?;
+    let url = url::Url::parse(&target).map_err(|_| "平台地址模板生成的网址无效".to_string())?;
     if url.scheme() != "https"
         || url.host_str().is_none()
         || !url.username().is_empty()
@@ -52,20 +52,20 @@ pub fn compose(template: &Template, code: &str) -> Result<String, String> {
         || target.len() > 2048
         || url.origin() != prefix_url.origin()
     {
-        return Err("模板必须生成不含凭据或片段的完整 HTTPS 地址".into());
+        return Err("平台地址模板必须生成不含账号信息或片段的完整 HTTPS 网址".into());
     }
     Ok(url.to_string())
 }
 
 pub fn validate_pool(pool: &Pool) -> Result<(), String> {
     if !valid_id(&pool.id) {
-        return Err("资源池 ID 无效".into());
+        return Err("平台地址 ID 无效".into());
     }
     if pool.name.trim().is_empty() || pool.name.chars().count() > 64 {
-        return Err("资源池名称需为 1–64 个字符".into());
+        return Err("平台地址名称需为 1–64 个字符".into());
     }
     if chrono::DateTime::parse_from_rfc3339(&pool.updated).is_err() {
-        return Err("资源池修订时间无效".into());
+        return Err("平台地址修订时间无效".into());
     }
     compose(&pool.official, "probe")?;
     if url::Url::parse(&compose(&pool.official, "probe")?)
@@ -75,35 +75,35 @@ pub fn validate_pool(pool: &Pool) -> Result<(), String> {
             .unwrap()
             .origin()
     {
-        return Err("模板代码不得改变主机".into());
+        return Err("邀请码不得改变主机".into());
     }
     if pool.candidates.is_empty() || pool.candidates.len() > 10 {
-        return Err("大陆候选目标需为 1–10 个".into());
+        return Err("大陆备用地址需为 1–10 个".into());
     }
     let mut ids = std::collections::HashSet::new();
     let mut enabled = false;
     for candidate in &pool.candidates {
         if !valid_id(&candidate.id) || !ids.insert(&candidate.id) {
-            return Err("候选目标 ID 无效或重复".into());
+            return Err("大陆备用地址 ID 无效或重复".into());
         }
         compose(&Template::from(candidate), "probe")?;
         compose(&Template::from(candidate), "sample2")?;
         enabled |= candidate.enabled;
     }
     if !enabled {
-        return Err("至少启用一个大陆候选目标".into());
+        return Err("至少启用一个大陆备用地址".into());
     }
     if pool.account_ids.len() > 100 {
-        return Err("资源池账号过多".into());
+        return Err("关联账号超过上限".into());
     }
     let mut accounts = std::collections::HashSet::new();
     for id in &pool.account_ids {
         if !valid_id(id) || !accounts.insert(id) {
-            return Err("资源池账号 ID 无效或重复".into());
+            return Err("关联账号标识无效或重复".into());
         }
     }
     if cloud_value(pool).to_string().len() > 16_384 {
-        return Err("资源池配置超过 Worker 的 16 KiB 上限".into());
+        return Err("这组平台地址的云端配置超过 16 KiB 上限".into());
     }
     Ok(())
 }

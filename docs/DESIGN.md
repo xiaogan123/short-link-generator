@@ -1,15 +1,23 @@
 # Desktop UI design
 
-The reference image informed the interface's spatial structure: an evergreen sidebar, warm ivory canvas, small uppercase section labels, a serif Chinese headline, thin dividers, and restrained tables. The implementation uses original text, icons from Phosphor, and no copied screenshot or production data.
+The interface retains an evergreen sidebar and warm off-white canvas. This is a daily management tool: short page titles, compact summaries and clear actions give working data priority over decorative slogans. System fonts and Phosphor icons avoid remote asset requests.
 
 ## Navigation and workflows
 
-- **短链接** groups links by exact domain. Search covers slug, host, and destinations. A domain filter narrows the table. Creating or editing a link validates the slug and HTTPS targets before requesting a backend plan. Copy uses the system clipboard, and route selftest presents the backend's precise status and checks.
-- **地址池** stores shared regional templates and their priority. Links reference the pool and preserve an individual code; changing a pool updates all referencing links. Confirmation states affected accounts and links. Definite target failures are red, inconclusive results amber, and untested or stale results gray. Local target results do not claim mainland reachability.
-- **域名** shows domain ownership and the number of links. Adding one starts with backend preflight checks and an explicit candidate choice when ownership is ambiguous. The user sees the returned plan before applying. `www` remains distinct from the bare host.
-- **账户** offers a system-browser token template, local rename and removal, and planned recovery, key rotation, and remote cleanup. Clipboard text is inspected only after the token field receives focus and never filled without a separate click. Export/import use native file dialogs.
-- **更新** checks only on user request. An available version opens a confirmation dialog before installation; an unconfigured channel is shown as unavailable.
+- **短链接** groups links by domain. Search and domain filtering stay close to the list. Copy, check and edit actions use visible Chinese labels. Forms use concrete terms such as 邀请码 and 跳转网址.
+- **平台地址** keeps one other-region address and several mainland backup addresses together. Links reference the platform and retain their individual invitation codes. Editing an address updates associated links after cloud propagation. Forms distinguish the part before the invitation code from optional trailing parameters.
+- **域名管理** shows ownership and link counts. Adding a domain checks existing configuration and asks the user to confirm the exact scope before making changes. The bare host and `www` remain separate.
+- **Cloudflare 账户** handles API token import, local names, backups and account-level service settings. Destructive cloud cleanup remains separate from local removal.
+- **更新** is checked on request. An unconfigured channel is explicitly unavailable; an available update requires confirmation before installation.
 
-Remote writes pass through `prepare_domain` or `prepare_change`, then `apply_plan`. The backend's plan text and expiry are presented alongside the selected target. Saving a link automatically begins the backend selftest and displays its result. Preview data activates only through `?preview=1`, stays in memory, and is visibly labeled. Ordinary browser launch without that query calls the real Tauri bridge and reports an error if unavailable.
+## States and accessibility
 
-The layout is optimized for 1180×780 and scales down to 960×700. Dialogs trap focus, close with Escape, and restore focus to the invoking element. Empty, loading, pending, failure, and success states have distinct copy. System font stacks avoid network font requests.
+Definite failures use red plus text, inconclusive results amber, and untested or stale results gray. Each check retains its source and time. Local checks do not imply mainland accessibility. Detailed technical explanations belong next to the relevant result or inside an expandable section.
+
+Dialogs keep keyboard focus inside, restore focus on close, and provide visible labels. Destructive actions explain whether they affect local records, individual cloud records, or shared services. Empty, pending, loading and error states must each give a useful next action.
+
+The target window range starts at 840×600, with the standard desktop window at 1120×760. Long addresses and dense forms must remain readable through wrapping and internal scrolling. Browser previews use visibly marked neutral data and never cloud writes. Native verification is separate from browser layout testing.
+
+## Preserved behavior
+
+Remote writes still pass through backend preparation followed by explicit confirmation. The UI presents the exact affected domain, addresses and accounts. Saving a link begins its check; unknown or stale results cannot appear as success. Changes remain compatible with existing local configuration, with no routing or storage migration in this UI revision.

@@ -66,8 +66,8 @@ function previewDispatch(action: Action, payload: Record<string, unknown>): unkn
   }
   if (action === 'prepare_change') {
     const kind = String(payload.kind);
-    const titles: Record<string, string> = { save_link: '保存短链接', delete_link: '删除短链接', save_pool: '保存地址池', resume_pool_sync:'继续同步地址池', delete_pool: '删除地址池', remove_domain: '移除域名', cleanup_account: '清理远端资源', recover_account: '恢复账户资源', rotate_selftest: '轮换检测密钥' };
-    if (kind === 'delete_pool' && local.links.some(l => l.poolId === payload.poolId)) throw new Error('地址池仍有链接引用，无法删除。');
+    const titles: Record<string, string> = { save_link: '保存短链接', delete_link: '删除短链接', save_pool: '保存平台地址', resume_pool_sync:'继续同步平台地址', delete_pool: '删除平台地址', remove_domain: '移除域名', cleanup_account: '清理远端资源', recover_account: '恢复账户资源', rotate_selftest: '轮换检测密钥' };
+    if (kind === 'delete_pool' && local.links.some(l => l.poolId === payload.poolId)) throw new Error('平台地址仍有链接引用，无法删除。');
     return makePlan(titles[kind] || '确认变更', [`核对当前状态与资源归属`, `${titles[kind] || kind}并记录结果`], kind === 'delete_link' || kind === 'remove_domain' || kind === 'cleanup_account' ? ['该操作会修改远端资源。请确认影响范围。'] : [], kind, payload);
   }
   if (action === 'apply_plan') {
@@ -78,7 +78,7 @@ function previewDispatch(action: Action, payload: Record<string, unknown>): unkn
     if (item.action === 'add_domain') local.domains.push({ id: uid(), host: String(p.host), prefix: String(p.prefix), accountId: String(p.accountId), zoneId: String(p.zoneId), routeId: `demo-route-${uid()}` });
     if (item.action === 'save_link') {
       const pool = (local.pools || []).find(pool => pool.id === p.poolId);
-      if (p.poolId && !pool) throw new Error('地址池不存在。');
+      if (p.poolId && !pool) throw new Error('平台地址不存在。');
       const code = String(p.code || '');
       const entry: Link = pool ? { domainId: String(p.domainId), slug: String(p.slug), poolId: pool.id, code, cnUrl: '', defaultUrl: '', updated: now() } : { domainId: String(p.domainId), slug: String(p.slug), cnUrl: String(p.cnUrl), defaultUrl: String(p.defaultUrl), updated: now() };
       local.links = local.links.filter(l => !(l.domainId === entry.domainId && l.slug === entry.slug)); local.links.push(entry);
@@ -95,7 +95,7 @@ function previewDispatch(action: Action, payload: Record<string, unknown>): unkn
     return clone();
   }
   if (action === 'selftest_link') return { status: 'pending', message: '本地预览只展示检测流程，无法判断真实网络或大陆可达性。', checks: [] } satisfies Selftest;
-  if (action === 'check_link_targets') return {checkedAt:now(),checks:[{label:'中国大陆目标',status:'unknown',message:'本地预览未发起网络检测。',checkedAt:now(),source:'local',url:''},{label:'默认目标',status:'unknown',message:'本地预览未发起网络检测。',checkedAt:now(),source:'local',url:''}]} satisfies TargetReport;
+  if (action === 'check_link_targets') return {checkedAt:now(),checks:[{label:'中国大陆打开的网址',status:'unknown',message:'本地预览未发起网络检测。',checkedAt:now(),source:'local',url:''},{label:'其他地区打开的网址',status:'unknown',message:'本地预览未发起网络检测。',checkedAt:now(),source:'local',url:''}]} satisfies TargetReport;
   if (action === 'check_pool_health') {const pool=(local.pools||[]).find(p=>p.id===payload.poolId);return {poolId:String(payload.poolId),accounts:(pool?.accountIds||[]).map(accountId=>({accountId,source:'unconfigured' as const,checkedAt:null,status:'unknown' as const,candidates:pool!.candidates.map(c=>({id:c.id,status:'unknown' as const,checkedAt:null,message:'本地预览未连接检测服务。'}))}))} satisfies PoolHealth;}
   if (action === 'prepare_monitor') return makePlan('启用检测服务',['配置您提供的 HTTPS 检测端点','保存密钥并启用定时检测'],['本地预览不会连接检测服务。'],'enable_monitor',{accountId:payload.accountId,endpoint:payload.endpoint});
   if (action === 'disable_monitor') return makePlan('停用检测服务',['移除定时检测与配置'],[],'disable_monitor',{accountId:payload.accountId});

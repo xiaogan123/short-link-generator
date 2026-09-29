@@ -225,9 +225,9 @@ impl From<&Database> for State {
                     pool_id: Some(p.pool.id.clone()),
                     account_id: None,
                     label: if p.deleting {
-                        format!("继续删除资源池 {}", p.pool.name)
+                        format!("继续删除平台地址 {}", p.pool.name)
                     } else {
-                        format!("继续同步资源池 {}", p.pool.name)
+                        format!("继续同步平台地址 {}", p.pool.name)
                     },
                 })
                 .chain(db.pending_monitor_changes.iter().map(|p| PendingAction {

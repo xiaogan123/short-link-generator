@@ -222,15 +222,15 @@ fn monitor_endpoint(value: &str) -> Result<String, String> {
 fn validate_monitor_config(value: &Value) -> Result<(), String> {
     let endpoint = value["endpoint"].as_str().ok_or("监测服务地址缺失")?;
     monitor_endpoint(endpoint)?;
-    let ids = value["poolIds"].as_array().ok_or("监测资源池清单无效")?;
+    let ids = value["poolIds"].as_array().ok_or("监测平台地址清单无效")?;
     if ids.len() > 256 || value.to_string().len() > 16_384 {
-        return Err("监测资源池清单超过 Worker 上限".into());
+        return Err("监测平台地址清单超过 Worker 上限".into());
     }
     let mut unique = HashSet::new();
     for id in ids {
-        let id = id.as_str().ok_or("监测资源池清单无效")?;
+        let id = id.as_str().ok_or("监测平台地址清单无效")?;
         if !pools::valid_id(id) || !unique.insert(id) {
-            return Err("监测资源池清单无效".into());
+            return Err("监测平台地址清单无效".into());
         }
     }
     Ok(())
@@ -290,19 +290,21 @@ fn link_from_remote(
     pools: &[Pool],
 ) -> Result<Link, String> {
     if let Some(pool_id) = remote["poolId"].as_str() {
-        let code = remote["code"].as_str().ok_or("模板链接缺少代码")?;
+        let code = remote["code"]
+            .as_str()
+            .ok_or("按平台地址生成的链接缺少邀请码")?;
         if !pools::valid_code(code) {
-            return Err("模板代码无效".into());
+            return Err("邀请码无效".into());
         }
         let pool = pools
             .iter()
             .find(|p| p.id == pool_id)
-            .ok_or("找不到链接引用的资源池")?;
+            .ok_or("找不到链接引用的平台地址")?;
         let candidate = pool
             .candidates
             .iter()
             .find(|c| c.enabled)
-            .ok_or("资源池没有启用的候选")?;
+            .ok_or("这组平台地址没有已启用的大陆备用地址")?;
         pools::compose(&model::Template::from(candidate), code)?;
         pools::compose(&pool.official, code)?;
         return Ok(Link {
@@ -656,12 +658,12 @@ impl Backend {
         });
         let active = zone.is_some_and(|z| z.status == "active");
         checks.push(Check {
-            label: "区域状态".into(),
+            label: "域名归属状态".into(),
             ok: active,
             message: if active {
-                "区域已启用".into()
+                "域名所属区域已启用".into()
             } else {
-                "区域未启用或归属不匹配".into()
+                "域名所属区域未启用，或不属于此账号".into()
             },
         });
         if !active {
@@ -685,12 +687,12 @@ impl Backend {
                 && v["result"]["account"]["id"].as_str() == Some(account_id)
         });
         checks.push(Check {
-            label: "实时区域状态".into(),
+            label: "云端域名归属".into(),
             ok: remote_active,
             message: if remote_active {
-                "云端确认区域已启用".into()
+                "云端确认域名所属区域已启用".into()
             } else {
-                "无法确认云端区域已启用且归属一致".into()
+                "无法确认域名所属区域已启用且归属此账号".into()
             },
         });
         if !remote_active {
@@ -713,7 +715,7 @@ impl Backend {
                     if ok {
                         "DNS 已代理"
                     } else {
-                        "该主机名没有 DNS 记录，或存在未代理记录"
+                        "该主机名没有可用于访问的 DNS 记录，或其中有未代理的记录"
                     },
                 )
             }
@@ -732,9 +734,9 @@ impl Backend {
             Ok(v) => {
                 let Some(arr) = v["result"].as_array() else {
                     checks.push(Check {
-                        label: "路由".into(),
+                        label: "转发规则".into(),
                         ok: false,
-                        message: "云端路由列表格式无效".into(),
+                        message: "云端转发规则列表格式无效".into(),
                     });
                     return checks;
                 };
@@ -746,22 +748,25 @@ impl Backend {
                 (
                     !found,
                     if found {
-                        "现有 Worker 路由与此前缀重叠"
+                        "现有转发规则与此前缀重叠"
                     } else {
-                        "没有发现重叠路由"
+                        "没有发现重叠的转发规则"
                     },
                 )
             }
-            Err(_) => (false, "无法读取 Worker 路由"),
+            Err(_) => (false, "无法读取云端转发规则"),
         };
         checks.push(Check {
-            label: "路由".into(),
+            label: "转发规则".into(),
             ok,
             message: message.into(),
         });
         for (label, path) in [
-            ("前缀根路径", format!("/{prefix}/")),
-            ("随机子路径", format!("/{prefix}/{}", random_name("probe"))),
+            ("短链接目录", format!("/{prefix}/")),
+            (
+                "随机测试链接",
+                format!("/{prefix}/{}", random_name("probe")),
+            ),
         ] {
             let url = format!("https://{host}{path}");
             let result = self.cloud_probe(&url, None).await;
@@ -770,7 +775,7 @@ impl Backend {
                 label: label.into(),
                 ok,
                 message: if ok {
-                    "返回 404，可使用此前缀".into()
+                    "没有发现内容（HTTP 404），可使用这个前缀".into()
                 } else {
                     "路径已有内容或无法确定，请换前缀或检查网络".into()
                 },
@@ -815,9 +820,9 @@ impl Backend {
             });
         } else if candidates.is_empty() {
             checks.push(Check {
-                label: "区域归属".into(),
+                label: "域名归属".into(),
                 ok: false,
-                message: "域名不在已导入账号的区域里".into(),
+                message: "已导入的账号均不管理这个域名".into(),
             });
         } else if selected.is_none() {
             checks.push(Check {
@@ -833,10 +838,10 @@ impl Backend {
                 let has_resources = self.account(&c.account_id)?.resources.is_some();
                 let mut steps = Vec::new();
                 if !has_resources {
-                    steps.push("创建此账号专用的 KV 与 Worker，并设置自检密钥".into());
+                    steps.push("创建此账号专用的云端转发程序和链接存储，并设置自检密钥".into());
                 }
                 steps.push(format!("写入 {host} 的前缀配置"));
-                steps.push(format!("创建路由 {}", route_pattern(&host, &prefix)));
+                steps.push(format!("为 {} 添加转发规则", route_pattern(&host, &prefix)));
                 plan = Some(self.make_plan(
                     "添加域名",
                     steps,
@@ -888,22 +893,22 @@ impl Backend {
                     if let Some(pool_id) = payload["poolId"].as_str().filter(|s| !s.is_empty()) {
                         let code = field(payload, "code")?;
                         if !pools::valid_code(code) {
-                            return Err("模板代码无效".into());
+                            return Err("邀请码无效".into());
                         }
                         let pool = self
                             .db
                             .pools
                             .iter()
                             .find(|p| p.id == pool_id)
-                            .ok_or("找不到此资源池")?;
+                            .ok_or("找不到此平台地址")?;
                         if !pool.account_ids.contains(&domain.account_id) {
-                            return Err("此资源池未授权给域名所属账号".into());
+                            return Err("此平台地址未授权给域名所属账号".into());
                         }
                         let candidate = pool
                             .candidates
                             .iter()
                             .find(|c| c.enabled)
-                            .ok_or("资源池没有已启用候选目标")?;
+                            .ok_or("这组平台地址没有已启用的大陆备用地址")?;
                         (
                             pools::compose(&model::Template::from(candidate), code)?,
                             pools::compose(&pool.official, code)?,
@@ -926,7 +931,21 @@ impl Backend {
                     .any(|l| l.domain_id == domain_id && l.slug == slug);
                 (
                     "保存链接",
-                    vec![format!("{}：{} 配置地区目标", domain.host, slug)],
+                    vec![if let (Some(pool_id), Some(code)) = (&pool_id, &code) {
+                        let pool_name = self
+                            .db
+                            .pools
+                            .iter()
+                            .find(|pool| pool.id == *pool_id)
+                            .map(|pool| pool.name.as_str())
+                            .unwrap_or(pool_id);
+                        format!(
+                            "为 {} 的短码 {} 保存平台地址“{}”和邀请码 {}",
+                            domain.host, slug, pool_name, code
+                        )
+                    } else {
+                        format!("为 {} 的短码 {} 保存大陆与默认跳转地址", domain.host, slug)
+                    }],
                     if existing {
                         vec!["这会覆盖现有链接目标".into()]
                     } else {
@@ -944,7 +963,7 @@ impl Backend {
             }
             "save_pool" => {
                 let mut pool: Pool = serde_json::from_value(payload["pool"].clone())
-                    .map_err(|_| "资源池数据格式无效".to_string())?;
+                    .map_err(|_| "平台地址数据格式无效".to_string())?;
                 if pool.id.is_empty() {
                     pool.id = random_id();
                 }
@@ -954,7 +973,7 @@ impl Backend {
                     .iter()
                     .any(|p| p.pool.id == pool.id)
                 {
-                    return Err("此资源池有未完成同步，请先恢复该操作".into());
+                    return Err("此平台地址有未完成同步，请先恢复该操作".into());
                 }
                 if self.db.pending_monitor_changes.iter().any(|m| {
                     pool.account_ids.contains(&m.account_id)
@@ -981,12 +1000,13 @@ impl Backend {
                     .count();
                 let accounts = pool.account_ids.len();
                 (
-                    "保存资源池",
+                    "保存平台地址",
                     vec![format!(
-                        "同步至 {accounts} 个账号；现有 {refs} 条引用随资源池生效"
+                        "将平台地址“{}”同步到 {accounts} 个账号；现有 {refs} 条链接会使用更新后的设置",
+                        pool.name
                     )],
                     if refs > 0 {
-                        vec!["变更将影响全部引用此资源池的链接".into()]
+                        vec!["变更将影响全部使用这组平台地址的链接".into()]
                     } else {
                         vec![]
                     },
@@ -1000,9 +1020,9 @@ impl Backend {
                     .pending_pool_changes
                     .iter()
                     .find(|p| p.pool.id == pool_id && !p.deleting)
-                    .ok_or("此资源池没有未完成同步")?;
+                    .ok_or("此平台地址没有未完成同步")?;
                 (
-                    "恢复资源池同步",
+                    "恢复平台地址同步",
                     vec![format!(
                         "继续核对并同步 {} 个账号",
                         pending.pool.account_ids.len()
@@ -1020,7 +1040,7 @@ impl Backend {
                     .pools
                     .iter()
                     .find(|p| p.id == pool_id)
-                    .ok_or("找不到此资源池")?;
+                    .ok_or("找不到此平台地址")?;
                 if self
                     .db
                     .pending_monitor_changes
@@ -1035,7 +1055,7 @@ impl Backend {
                     .iter()
                     .any(|p| p.pool.id == pool_id && !p.deleting)
                 {
-                    return Err("资源池同步尚未完成，不能删除".into());
+                    return Err("平台地址同步尚未完成，不能删除".into());
                 }
                 if self
                     .db
@@ -1043,13 +1063,14 @@ impl Backend {
                     .iter()
                     .any(|l| l.pool_id.as_deref() == Some(&pool_id))
                 {
-                    return Err("仍有链接引用此资源池".into());
+                    return Err("仍有链接引用此平台地址".into());
                 }
                 (
-                    "删除资源池",
+                    "删除平台地址",
                     vec![format!(
-                        "从 {} 个账号删除资源池配置",
-                        pool.account_ids.len()
+                        "从 {} 个账号删除平台地址“{}”的云端配置",
+                        pool.account_ids.len(),
+                        pool.name
                     )],
                     vec!["云端若仍存在引用，操作将被拒绝".into()],
                     PlanKind::DeletePool { pool_id },
@@ -1082,7 +1103,10 @@ impl Backend {
                 (
                     "移除域名",
                     vec![
-                        format!("删除 {} 的 Worker 路由", domain.host),
+                        format!(
+                            "删除 {} 的转发规则",
+                            route_pattern(&domain.host, &domain.prefix)
+                        ),
                         format!("删除此前缀配置和 {count} 条链接记录"),
                     ],
                     vec!["边缘节点可能暂时保留已缓存的配置".into()],
@@ -1099,8 +1123,8 @@ impl Backend {
                 (
                     "清理账号资源",
                     vec![
-                        format!("删除 Worker {}", resources.script),
-                        format!("删除 KV 命名空间 {}", resources.namespace),
+                        format!("删除专用转发程序 Worker：{}", resources.script),
+                        format!("删除专用链接存储 KV：{}", resources.namespace),
                     ],
                     vec!["此操作会永久删除账号专用云端资源".into()],
                     PlanKind::CleanupAccount { account_id: id },
@@ -1112,7 +1136,7 @@ impl Backend {
                 (
                     "从账号找回",
                     vec![
-                        "只读扫描账号里的 Worker、KV 与路由，并验证归属".into(),
+                        "只读检查账号里的转发程序、链接存储和转发规则，并验证归属".into(),
                         "恢复本机域名和链接清单".into(),
                     ],
                     vec![],
@@ -1123,12 +1147,12 @@ impl Backend {
                 let id = field(payload, "accountId")?.to_owned();
                 let account = self.account(&id)?;
                 if account.resources.is_none() {
-                    return Err("账号尚无 Worker".into());
+                    return Err("账号尚未创建专用转发程序".into());
                 }
                 (
                     "重置自检密钥",
                     vec![
-                        "生成新密钥并更新云端 Worker 绑定".into(),
+                        "生成新密钥并更新云端转发程序".into(),
                         "把新密钥存入系统凭据库".into(),
                     ],
                     vec!["其他设备保存的旧自检密钥将失效".into()],
@@ -1216,7 +1240,7 @@ impl Backend {
                             .as_ref()
                             .is_some_and(|old| old.account_ids.contains(&account_id))
                 }) {
-                    return Err("此账号的资源池操作尚未完成，请先恢复".into());
+                    return Err("此账号的平台地址操作尚未完成，请先恢复".into());
                 }
                 if self
                     .db
@@ -1235,7 +1259,7 @@ impl Backend {
                 }
                 let account = self.account(&account_id)?;
                 if account.resources.is_none() {
-                    return Err("此账号尚无 Worker/KV 资源".into());
+                    return Err("此账号尚未创建专用转发程序和链接存储".into());
                 }
                 if account.monitor_enabled {
                     return Err("监测已启用，请先关闭再更换设置".into());
@@ -1265,7 +1289,7 @@ impl Backend {
                     vec!["服务位置由提供方保证；应用仅验证签名，不证明其位于中国大陆".into()];
                 if enabled_targets > 60 {
                     warnings.push(format!(
-                    "此账号有 {enabled_targets} 个候选目标；每轮最多检查 20 个，轮转间隔可能使结果超出一小时有效期"
+                    "此账号有 {enabled_targets} 个大陆备用地址；每轮最多检查 20 个，轮转间隔可能使结果超出一小时有效期"
                 ));
                 }
                 let view = self.make_plan(
@@ -1273,7 +1297,7 @@ impl Backend {
                     vec![
                         format!("配置监测服务 {endpoint}"),
                         format!(
-                            "配置 Worker 密钥、{pool_count} 个资源池的清单与每 15 分钟计划任务"
+                            "设置云端监测密钥并同步 {pool_count} 组平台地址；每 15 分钟运行一次监测"
                         ),
                     ],
                     warnings,
@@ -1302,8 +1326,8 @@ impl Backend {
                 let view = self.make_plan(
                     "关闭可选监测",
                     vec![
-                        "移除 Worker 计划任务、监测配置与专用密钥".into(),
-                        "保留现有链接和资源池".into(),
+                        "关闭每 15 分钟运行的监测任务，并删除云端监测配置与专用密钥".into(),
+                        "保留现有链接和平台地址".into(),
                     ],
                     vec![],
                     PlanKind::DisableMonitor { account_id },
@@ -1559,7 +1583,7 @@ impl Backend {
         let mut recovered_pools = Vec::new();
         for item in pool_entries {
             let mut pool: Pool =
-                serde_json::from_value(item.clone()).map_err(|_| "备份资源池格式无效")?;
+                serde_json::from_value(item.clone()).map_err(|_| "备份平台地址格式无效")?;
             pool.sync_status.clear();
             pools::validate_pool(&pool)?;
             for id in &pool.account_ids {
@@ -1567,17 +1591,18 @@ impl Backend {
                 let resources = account
                     .resources
                     .as_ref()
-                    .ok_or("备份资源池账号缺少云端资源")?;
+                    .ok_or("备份平台地址账号缺少云端资源")?;
                 let token = keyring_get(id, "token")?;
                 let raw = self
                     .cloud
                     .read_value(&token, id, &resources.namespace, &format!("p:{}", pool.id))
                     .await
                     .map_err(problem)?
-                    .ok_or("云端缺少备份资源池")?;
-                let remote: Value = serde_json::from_str(&raw).map_err(|_| "云端资源池格式无效")?;
+                    .ok_or("云端缺少备份平台地址")?;
+                let remote: Value =
+                    serde_json::from_str(&raw).map_err(|_| "云端平台地址格式无效")?;
                 if !pools::matching_cloud_value(&pool, &remote) {
-                    return Err("云端资源池与备份不同".into());
+                    return Err("云端平台地址与备份不同".into());
                 }
                 pool.sync_status.push(PoolSyncStatus {
                     account_id: id.clone(),
@@ -1625,13 +1650,13 @@ impl Backend {
                 let code = field(item, "code")?;
                 if value["poolId"].as_str() != Some(pool_id) || value["code"].as_str() != Some(code)
                 {
-                    return Err("云端模板链接与备份不同".into());
+                    return Err("云端按平台地址生成的链接与备份不同".into());
                 }
                 if !recovered_pools
                     .iter()
                     .any(|p| p.id == pool_id && p.account_ids.contains(&domain.account_id))
                 {
-                    return Err("备份资源池未包含链接所属账号".into());
+                    return Err("备份平台地址未包含链接所属账号".into());
                 }
                 link_from_remote(&value, &domain.id, slug, &recovered_pools)?
             } else {
@@ -1654,7 +1679,7 @@ impl Backend {
         for pool in &recovered_pools {
             if let Some(existing) = self.db.pools.iter().find(|p| p.id == pool.id) {
                 if pools::cloud_value(existing) != pools::cloud_value(pool) {
-                    return Err("本机已有不同版本的同名资源池".into());
+                    return Err("本机已有不同版本的同名平台地址".into());
                 }
             }
         }
@@ -2161,7 +2186,7 @@ impl Backend {
         let resources = self.ensure_domain_owned(&domain, &token).await?;
         if let (Some(pool_id), Some(code)) = (pool_id, code) {
             if !pools::valid_code(code) {
-                return Err("模板代码无效".into());
+                return Err("邀请码无效".into());
             }
             self.ensure_pool_on_account(pool_id, &domain.account_id, &token, &resources)
                 .await?;
@@ -2245,9 +2270,9 @@ impl Backend {
             .iter()
             .find(|p| p.id == pool_id)
             .cloned()
-            .ok_or("找不到资源池")?;
+            .ok_or("找不到平台地址")?;
         if !pool.account_ids.iter().any(|id| id == account_id) {
-            return Err("资源池未授权给此账号".into());
+            return Err("平台地址未授权给此账号".into());
         }
         let key = format!("p:{pool_id}");
         let remote = self
@@ -2256,13 +2281,13 @@ impl Backend {
             .await
             .map_err(problem)?;
         if let Some(raw) = remote {
-            let value: Value = serde_json::from_str(&raw).map_err(|_| "云端资源池格式无效")?;
+            let value: Value = serde_json::from_str(&raw).map_err(|_| "云端平台地址格式无效")?;
             if !pools::matching_cloud_value(&pool, &value) {
-                return Err("云端资源池与本机版本不同，请先修复同步状态".into());
+                return Err("云端平台地址与本机版本不同，请先修复同步状态".into());
             }
         } else {
             let journal = format!(
-                "首次同步资源池 {} / {} ({})",
+                "首次同步平台地址 {} / {} ({})",
                 pool_id,
                 account_id,
                 random_id()
@@ -2279,7 +2304,7 @@ impl Backend {
                 )
                 .await
             {
-                self.journal_note(&journal, "资源池首次写入未完成")?;
+                self.journal_note(&journal, "平台地址首次写入未完成")?;
                 return Err(e.message);
             }
             if let Some(status) = self
@@ -2330,9 +2355,9 @@ impl Backend {
             .collect();
         let actual: Vec<&str> = value["poolIds"]
             .as_array()
-            .ok_or("监测资源池清单无效")?
+            .ok_or("监测平台地址清单无效")?
             .iter()
-            .map(|v| v.as_str().ok_or("监测资源池清单无效"))
+            .map(|v| v.as_str().ok_or("监测平台地址清单无效"))
             .collect::<Result<_, _>>()?;
         let actual_set = actual
             .iter()
@@ -2379,7 +2404,7 @@ impl Backend {
                 || pools::cloud_value(&p.pool) != pools::cloud_value(&pool)
                 || p.pool.account_ids != pool.account_ids
         }) {
-            return Err("存在不同的未完成资源池操作".into());
+            return Err("存在不同的未完成平台地址操作".into());
         }
         let old = pending
             .as_ref()
@@ -2391,7 +2416,7 @@ impl Backend {
                 .iter()
                 .any(|id| !pool.account_ids.contains(id))
             {
-                return Err("不能从已有资源池直接移除账号，请先删除引用".into());
+                return Err("不能从已有平台地址直接移除账号，请先删除引用".into());
             }
         }
         struct Target {
@@ -2415,7 +2440,7 @@ impl Backend {
             if let Some(mut projected) = monitor.clone() {
                 let ids = projected["poolIds"]
                     .as_array_mut()
-                    .ok_or("监测资源池清单无效")?;
+                    .ok_or("监测平台地址清单无效")?;
                 if !ids.iter().any(|entry| entry.as_str() == Some(&pool.id)) {
                     ids.push(Value::String(pool.id.clone()));
                 }
@@ -2427,7 +2452,8 @@ impl Backend {
                 .await
                 .map_err(problem)?;
             if let Some(raw) = remote {
-                let value: Value = serde_json::from_str(&raw).map_err(|_| "云端资源池格式无效")?;
+                let value: Value =
+                    serde_json::from_str(&raw).map_err(|_| "云端平台地址格式无效")?;
                 let already_desired =
                     pending.is_some() && pools::matching_cloud_value(&pool, &value);
                 let owned = already_desired
@@ -2435,7 +2461,7 @@ impl Backend {
                         prior.account_ids.contains(id) && pools::matching_cloud_value(prior, &value)
                     });
                 if !owned {
-                    return Err("云端已有不同的同名资源池，停止覆盖".into());
+                    return Err("云端已有不同的同名平台地址，停止覆盖".into());
                 }
                 targets.push(Target {
                     account: id.clone(),
@@ -2450,7 +2476,7 @@ impl Backend {
                     .iter()
                     .any(|s| s.account_id == *id && s.status == "synced")
             }) {
-                return Err("已同步资源池在云端缺失，请先核对".into());
+                return Err("已同步平台地址在云端缺失，请先核对".into());
             } else {
                 targets.push(Target {
                     account: id.clone(),
@@ -2473,7 +2499,7 @@ impl Backend {
         let journal = pending
             .as_ref()
             .map(|p| p.journal.clone())
-            .unwrap_or_else(|| format!("同步资源池 {} ({})", pool.id, random_id()));
+            .unwrap_or_else(|| format!("同步平台地址 {} ({})", pool.id, random_id()));
         if pending.is_none() {
             self.journal_start(&journal)?;
             self.db.pending_pool_changes.push(PendingPoolChange {
@@ -2511,7 +2537,7 @@ impl Backend {
                         .iter_mut()
                         .find(|s| s.account_id == target.account)
                 })
-                .ok_or("资源池同步状态丢失")?;
+                .ok_or("平台地址同步状态丢失")?;
             match result {
                 Ok(()) => {}
                 Err(e) => {
@@ -2525,7 +2551,7 @@ impl Backend {
             if let Some(mut monitor) = target.monitor {
                 let ids = monitor["poolIds"]
                     .as_array_mut()
-                    .ok_or("监测资源池清单无效")?;
+                    .ok_or("监测平台地址清单无效")?;
                 if !ids.iter().any(|id| id.as_str() == Some(&pool.id)) {
                     ids.push(Value::String(pool.id.clone()));
                     if let Err(e) = self
@@ -2540,9 +2566,9 @@ impl Backend {
                         .await
                     {
                         status.status = "unknown".into();
-                        status.message = "资源池已写入，监测清单未确认".into();
+                        status.message = "平台地址已写入，监测清单未确认".into();
                         self.persist()?;
-                        self.journal_note(&journal, "资源池已写入，但监测清单未同步")?;
+                        self.journal_note(&journal, "平台地址已写入，但监测清单未同步")?;
                         return Err(e.message);
                     }
                 }
@@ -2570,7 +2596,7 @@ impl Backend {
             .find(|p| p.pool.id == pool_id)
             .cloned();
         if pending.as_ref().is_some_and(|p| !p.deleting) {
-            return Err("资源池同步尚未完成，不能删除".into());
+            return Err("平台地址同步尚未完成，不能删除".into());
         }
         let pool = self
             .db
@@ -2578,7 +2604,7 @@ impl Backend {
             .iter()
             .find(|p| p.id == pool_id)
             .cloned()
-            .ok_or("找不到资源池")?;
+            .ok_or("找不到平台地址")?;
         if self
             .db
             .pending_monitor_changes
@@ -2593,7 +2619,7 @@ impl Backend {
             .iter()
             .any(|l| l.pool_id.as_deref() == Some(pool_id))
         {
-            return Err("仍有本机链接引用此资源池".into());
+            return Err("仍有本机链接引用此平台地址".into());
         }
         struct Target {
             account: String,
@@ -2630,7 +2656,7 @@ impl Backend {
                     .ok_or("云端链接记录在核对时消失")?;
                 let value: Value = serde_json::from_str(&raw).map_err(|_| "云端链接格式无效")?;
                 if value["poolId"].as_str() == Some(pool_id) {
-                    return Err("云端仍有链接引用此资源池".into());
+                    return Err("云端仍有链接引用此平台地址".into());
                 }
             }
             let raw = self
@@ -2640,11 +2666,12 @@ impl Backend {
                 .map_err(problem)?;
             if let Some(raw) = raw {
                 if !pool.account_ids.contains(id) {
-                    return Err("另一账号存在同名资源池，停止删除".into());
+                    return Err("另一账号存在同名平台地址，停止删除".into());
                 }
-                let value: Value = serde_json::from_str(&raw).map_err(|_| "云端资源池格式无效")?;
+                let value: Value =
+                    serde_json::from_str(&raw).map_err(|_| "云端平台地址格式无效")?;
                 if !pools::matching_cloud_value(&pool, &value) {
-                    return Err("云端资源池已变化，停止删除".into());
+                    return Err("云端平台地址已变化，停止删除".into());
                 }
                 targets.push(Target {
                     account: id.clone(),
@@ -2666,13 +2693,13 @@ impl Backend {
                 .iter()
                 .any(|s| s.account_id == *id && s.status == "synced")
             {
-                return Err("已同步资源池在云端缺失，请先核对".into());
+                return Err("已同步平台地址在云端缺失，请先核对".into());
             }
         }
         let journal = pending
             .as_ref()
             .map(|p| p.journal.clone())
-            .unwrap_or_else(|| format!("删除资源池 {} ({})", pool_id, random_id()));
+            .unwrap_or_else(|| format!("删除平台地址 {} ({})", pool_id, random_id()));
         if pending.is_none() {
             self.journal_start(&journal)?;
             self.db.pending_pool_changes.push(PendingPoolChange {
@@ -2702,7 +2729,7 @@ impl Backend {
             if let Some(mut monitor) = target.monitor {
                 let ids = monitor["poolIds"]
                     .as_array_mut()
-                    .ok_or("监测资源池清单无效")?;
+                    .ok_or("监测平台地址清单无效")?;
                 ids.retain(|id| id.as_str() != Some(pool_id));
                 if let Err(e) = self
                     .cloud
@@ -2715,7 +2742,7 @@ impl Backend {
                     )
                     .await
                 {
-                    self.journal_note(&journal, "资源池已删除，但监测清单未同步")?;
+                    self.journal_note(&journal, "平台地址已删除，但监测清单未同步")?;
                     return Err(e.message);
                 }
             }
@@ -3503,29 +3530,29 @@ impl Backend {
             .await
             .map_err(problem)?;
         for key in pool_keys {
-            let id = key.strip_prefix("p:").ok_or("资源池键无效")?;
+            let id = key.strip_prefix("p:").ok_or("平台地址键无效")?;
             if !pools::valid_id(id) {
-                return Err("资源池键无效".into());
+                return Err("平台地址键无效".into());
             }
             let raw = self
                 .cloud
                 .read_value(&token, account_id, &resources.namespace, &key)
                 .await
                 .map_err(problem)?
-                .ok_or("资源池键在扫描中消失")?;
-            let value: Value = serde_json::from_str(&raw).map_err(|_| "资源池记录格式无效")?;
+                .ok_or("平台地址键在扫描中消失")?;
+            let value: Value = serde_json::from_str(&raw).map_err(|_| "平台地址记录格式无效")?;
             if value["version"] != 1 {
-                return Err("资源池版本不受支持".into());
+                return Err("平台地址版本不受支持".into());
             }
             let official: model::Template = serde_json::from_value(value["official"].clone())
-                .map_err(|_| "资源池默认模板无效")?;
+                .map_err(|_| "平台地址默认模板无效")?;
             let candidates: Vec<model::PoolCandidate> =
                 serde_json::from_value(value["candidates"].clone())
-                    .map_err(|_| "资源池候选模板无效")?;
-            let updated = value["revision"].as_str().ok_or("资源池修订号无效")?;
+                    .map_err(|_| "大陆备用地址模板无效")?;
+            let updated = value["revision"].as_str().ok_or("平台地址修订号无效")?;
             let mut pool = Pool {
                 id: id.into(),
-                name: format!("资源池 {id}"),
+                name: format!("平台地址 {id}"),
                 official,
                 candidates,
                 updated: updated.into(),
@@ -3539,7 +3566,7 @@ impl Backend {
             pools::validate_pool(&pool)?;
             if let Some(existing) = recovered_pools.iter_mut().find(|p| p.id == id) {
                 if pools::cloud_value(existing) != pools::cloud_value(&pool) {
-                    return Err("多个账号的同名资源池配置不一致".into());
+                    return Err("多个账号的同名平台地址配置不一致".into());
                 }
                 if !existing.account_ids.contains(&account_id.to_string()) {
                     existing.account_ids.push(account_id.into());
@@ -3580,7 +3607,7 @@ impl Backend {
                         .iter()
                         .any(|p| p.id == pool_id && p.account_ids.contains(&account_id.to_string()))
                     {
-                        return Err("云端模板链接引用的资源池未归属此账号".into());
+                        return Err("云端链接使用的平台地址不属于此账号".into());
                     }
                 }
                 recovered_links.push(link_from_remote(&data, &domain.id, slug, &recovered_pools)?);
@@ -3604,10 +3631,10 @@ impl Backend {
             validate_monitor_config(&config)?;
             let endpoint =
                 monitor_endpoint(config["endpoint"].as_str().ok_or("监测服务地址缺失")?)?;
-            let ids = config["poolIds"].as_array().ok_or("监测资源池清单无效")?;
+            let ids = config["poolIds"].as_array().ok_or("监测平台地址清单无效")?;
             let actual: std::collections::HashSet<&str> = ids
                 .iter()
-                .map(|v| v.as_str().ok_or("监测资源池清单无效"))
+                .map(|v| v.as_str().ok_or("监测平台地址清单无效"))
                 .collect::<Result<_, _>>()?;
             let expected: std::collections::HashSet<&str> = recovered_pools
                 .iter()
@@ -3682,7 +3709,7 @@ impl Backend {
                 .iter()
                 .find(|p| p.id == *pool_id)
                 .cloned()
-                .ok_or("找不到资源池")?;
+                .ok_or("找不到平台地址")?;
             let namespace = self
                 .account(&domain.account_id)?
                 .resources
@@ -3705,7 +3732,7 @@ impl Backend {
                 .candidates
                 .iter()
                 .find(|c| c.enabled)
-                .ok_or("资源池无启用候选")?;
+                .ok_or("这组平台地址没有已启用的大陆备用地址")?;
             (
                 pools::compose(&model::Template::from(candidate), code)?,
                 pools::compose(&pool.official, code)?,
@@ -3732,7 +3759,7 @@ impl Backend {
             .iter()
             .find(|p| p.id == pool_id)
             .cloned()
-            .ok_or("找不到资源池")?;
+            .ok_or("找不到平台地址")?;
         let mut accounts = Vec::new();
         for id in &pool.account_ids {
             let account = self.account(id)?;
@@ -3769,14 +3796,14 @@ impl Backend {
                 .pools
                 .iter()
                 .find(|p| &p.id == pool_id)
-                .ok_or("找不到资源池")?;
+                .ok_or("找不到平台地址")?;
             let mut targets = vec![(
                 "其他地区官方目标".into(),
                 pools::compose(&pool.official, code)?,
             )];
             for c in pool.candidates.iter().filter(|c| c.enabled) {
                 targets.push((
-                    format!("中国大陆候选 {}", c.id),
+                    format!("大陆备用地址 {}", c.id),
                     pools::compose(&model::Template::from(c), code)?,
                 ));
             }
@@ -3823,7 +3850,7 @@ async fn run_pool_health(snapshot: HealthSnapshot) -> Result<Value, String> {
         if !synced {
             accounts.push(json!({"accountId":id,"source":"unknown","checkedAt":null,
                 "status":"unknown","candidates":snapshot.pool.candidates.iter().map(|c|
-                    json!({"id":c.id,"status":"unknown","checkedAt":null,"message":"资源池云端版本未确认"}))
+                    json!({"id":c.id,"status":"unknown","checkedAt":null,"message":"平台地址云端版本未确认"}))
                     .collect::<Vec<_>>() }));
             continue;
         }
@@ -3918,7 +3945,7 @@ async fn run_region_test(
                 return Ok(Check {
                     label: label.into(),
                     ok: false,
-                    message: "边缘确认所有大陆候选暂时不可用（HTTP 503）".into(),
+                    message: "云端监测记录显示所有大陆备用地址暂时不可用，转发返回 HTTP 503".into(),
                 });
             }
             Ok(Ok((404, _))) | Ok(Err(_)) | Err(_) => pending = true,
@@ -3962,7 +3989,7 @@ async fn run_selftest(snapshot: SelftestSnapshot) -> Result<Value, String> {
         .await
         .map_err(|_| "自检超时")??;
         return Ok(
-            json!({"status":"failed","message":"所有已启用大陆候选目标暂时不可用",
+            json!({"status":"failed","message":"云端监测记录显示所有已启用的大陆备用地址暂时不可用",
             "checks":[other,cn]}),
         );
     };
@@ -4001,7 +4028,7 @@ async fn run_selftest(snapshot: SelftestSnapshot) -> Result<Value, String> {
     };
     Ok(json!({"status":status,
             "message":match status {"passed"=>"两个地区的跳转均通过自检",
-                "pending"=>"边缘配置可能仍在传播","failed"=>"自检失败，请检查路由和目标",
+                "pending"=>"边缘配置可能仍在传播","failed"=>"自检失败，请检查转发规则和目标地址",
                 _=>""},"checks":checks}))
 }
 
@@ -4535,7 +4562,7 @@ mod tests {
     fn sample_pool() -> Pool {
         Pool {
             id: "pool1".into(),
-            name: "测试资源池".into(),
+            name: "测试平台地址".into(),
             official: model::Template {
                 prefix: "https://official.example/path/".into(),
                 suffix: "".into(),
