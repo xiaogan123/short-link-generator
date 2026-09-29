@@ -9,13 +9,13 @@ if (process.argv.includes('--validate-tag')) {
     'mac-intel':{os:'macos-15-intel',target:'x86_64-apple-darwin',platform:'darwin-x86_64',bundles:'app,dmg'},
     windows:{os:'windows-2022',target:'x86_64-pc-windows-msvc',platform:'windows-x86_64',bundles:'nsis'},
   };
-  if (target!=='all' && !Object.hasOwn(builds,target)) throw new Error('Select mac-arm, mac-intel, windows, or all.');
+  if (!['all','windows-intel'].includes(target) && !Object.hasOwn(builds,target)) throw new Error('Select mac-arm, mac-intel, windows, windows-intel, or all.');
   if (tag !== `v${pkg.version}` || !/^v\d+\.\d+\.\d+(?:-[a-zA-Z0-9.-]+)?$/.test(tag)) throw new Error('Release tag must match the package version.');
   const head=execFileSync('git',['rev-parse','HEAD'],{encoding:'utf8'}).trim();
   const tagged=execFileSync('git',['rev-parse','--verify',`refs/tags/${tag}^{commit}`],{encoding:'utf8'}).trim();
   if(tagged!==head)throw new Error('The requested tag must exist and point to the checked-out commit.');
   if (!process.env.GITHUB_OUTPUT) throw new Error('Workflow output is unavailable.');
-  const selected=target==='all'?Object.values(builds):[builds[target]];
+  const selected=target==='all'?Object.values(builds):target==='windows-intel'?[builds.windows,builds['mac-intel']]:[builds[target]];
   appendFileSync(process.env.GITHUB_OUTPUT,`tag=${tag}\nsha=${head}\nbuilds=${JSON.stringify(selected)}\n`);
 } else {
   const pubkey=process.env.SLG_UPDATER_PUBLIC_KEY;

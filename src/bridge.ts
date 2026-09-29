@@ -26,8 +26,8 @@ const demoState: State = {
 let local: State = structuredClone(demoState);
 const plans = new Map<string, { plan: Plan; action: string; payload: Record<string, unknown> }>();
 const clone = ():State => {const state=structuredClone(local);state.links=state.links.map(link=>{if(!link.poolId)return link;const pool=state.pools?.find(p=>p.id===link.poolId);if(!pool)return link;const code=encodeURIComponent(link.code||'');const candidate=pool.candidates.find(c=>c.enabled);return {...link,cnUrl:candidate?candidate.prefix+code+candidate.suffix:'',defaultUrl:pool.official.prefix+code+pool.official.suffix};});return state;};
-function makePlan(title: string, steps: string[], warnings: string[], action: string, payload: Record<string, unknown>): Plan {
-  const plan = { id: uid(), title, steps, warnings, expiresAt: new Date(Date.now() + 300000).toISOString() };
+function makePlan(title: string, steps: string[], warnings: string[], action: string, payload: Record<string, unknown>, domainTakeoverConfirmation?: string): Plan {
+  const plan = { id: uid(), title, steps, warnings, expiresAt: new Date(Date.now() + 300000).toISOString(), ...(domainTakeoverConfirmation ? { domainTakeoverConfirmation } : {}) };
   plans.set(plan.id, { plan, action, payload });
   return plan;
 }
@@ -55,13 +55,21 @@ function previewDispatch(action: Action, payload: Record<string, unknown>): unkn
     const host = normalizeHost(String(payload.input || ''));
     const prefix = String(payload.prefix || '');
     const candidates = local.accounts.filter(a => !payload.accountId || a.id === payload.accountId).map(a => ({ accountId: a.id, label: a.label, zoneId: `demo-zone-${a.id}`, status: 'active' }));
+    const managedDomain = local.domains.find(domain => domain.host === host);
+    const isManaged = Boolean(managedDomain);
+    const needsTakeover = !isManaged && host.endsWith('.example.com');
     const checks = [
-      { label: '域名格式', ok: true, message: '格式有效。' },
-      { label: '区域与代理', ok: true, message: '预览模拟：活动区域与代理状态。' },
-      { label: '根路径与随机子路径', ok: true, message: '预览模拟：均返回 404；未发起真实探测。' },
+      { label: '域名格式', ok: true, level: 'pass' as const, message: '格式有效。' },
+      { label: '区域与代理', ok: true, level: 'pass' as const, message: '示例数据：活动区域与代理状态。' },
+      isManaged
+        ? { label: '域名已接入', ok: false, level: 'error' as const, message: `示例数据：${host} 已使用 /${managedDomain?.prefix}/ 目录。一个主机名只能接入一个链接目录，请管理已有域名或更换主机名。` }
+        : needsTakeover
+          ? { label: '现有网页', ok: true, level: 'warning' as const, message: `示例数据：${host}/${prefix}/ 及随机子路径返回 HTTP 200，确认后可将该目录用于短链接。` }
+          : { label: '链接目录', ok: true, level: 'pass' as const, message: '示例数据：目录与随机子路径均返回 404；未发起真实探测。' },
     ];
     const candidate = candidates.length === 1 ? candidates[0] : undefined;
-    const plan = candidate ? makePlan(`添加 ${host}`, [`在 ${candidate.label} 上配置 ${host}/${prefix}/*`, '保存域名与路由关系'], ['本地预览不会连接云服务。'], 'add_domain', { host, prefix, accountId: candidate.accountId, zoneId: candidate.zoneId }) : undefined;
+    const confirmation = needsTakeover ? `确认将 ${host}/${prefix}/ 及其所有下级内容改作短链接。原该目录内网页将不能继续按原方式访问。` : undefined;
+    const plan = candidate && !isManaged ? makePlan(`添加 ${host}`, [`在 ${candidate.label} 上配置 ${host}/${prefix}/*`, '保存域名与路由关系'], ['本地预览使用示例数据，不会连接云服务。'], 'add_domain', { host, prefix, accountId: candidate.accountId, zoneId: candidate.zoneId }, confirmation) : undefined;
     return { host, prefix, candidates, checks, canApply: Boolean(plan), plan } satisfies DomainPreparation;
   }
   if (action === 'prepare_change') {
@@ -73,8 +81,9 @@ function previewDispatch(action: Action, payload: Record<string, unknown>): unkn
   if (action === 'apply_plan') {
     const item = plans.get(String(payload.planId));
     if (!item || Date.parse(item.plan.expiresAt) < Date.now()) throw new Error('计划已过期，请重新准备。');
-    plans.delete(item.plan.id);
     const p = item.payload;
+    if (item.plan.domainTakeoverConfirmation && payload.acknowledgeDomainTakeover !== true) throw new Error('请先确认链接目录的接管范围。');
+    plans.delete(item.plan.id);
     if (item.action === 'add_domain') local.domains.push({ id: uid(), host: String(p.host), prefix: String(p.prefix), accountId: String(p.accountId), zoneId: String(p.zoneId), routeId: `demo-route-${uid()}` });
     if (item.action === 'save_link') {
       const pool = (local.pools || []).find(pool => pool.id === p.poolId);

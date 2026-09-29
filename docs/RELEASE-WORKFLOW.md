@@ -1,6 +1,6 @@
 # 发版候选包工作流
 
-`.github/workflows/release.yml` 只接受手动运行。输入必须是已存在、版本号一致、指向已审查提交的 `v*` tag。`target` 默认 `windows`，还可选 `mac-arm`、`mac-intel`；只有显式选择 `all` 才会构建三个平台并建立草稿 Release。推送 tag 不触发构建。
+`.github/workflows/release.yml` 只接受手动运行。输入必须是已存在、版本号一致、指向已审查提交的 `v*` tag。`target` 默认 `windows`，还可选 `mac-arm`、`mac-intel`、`windows-intel`；最后一项只在 Windows 和 Intel Mac 上分别原生构建，适合复用已经在本机验证的 Apple 芯片候选包。只有显式选择 `all` 才会构建三个平台并建立草稿 Release。推送 tag 不触发构建。
 
 运行前先检查本月 Actions 额度、预算、进行中与排队任务，估算本次所选 runner 的分钟数。本机能完成的检查应先通过；公共问题先在本机解决，再按需运行单平台。完整 `all` 矩阵只用于准备好公开发行的最终候选版本。此文档描述流程，不代表平台验收已经通过。
 
@@ -22,6 +22,8 @@ gh run download <mac-intel-run-id> -n candidate-x86_64-apple-darwin -D candidate
 gh run download <windows-run-id> -n candidate-x86_64-pc-windows-msvc -D candidates/candidate-x86_64-pc-windows-msvc
 GITHUB_REPOSITORY="xiaogan123/short-link-generator" RELEASE_TAG="v$(node -p 'require("./package.json").version')" RELEASE_SHA="$(git rev-parse HEAD)" node scripts/release-manifest.mjs candidates --require-evidence
 ```
+
+使用 `windows-intel` 时，Windows 与 Intel Mac 的两个 artifact 来自同一次运行，各自保留原生证据和隐私检查；不会构建 Apple 芯片包，也不会创建草稿。仍须补齐符合下述要求的本机 Apple 芯片候选包，再通过相同的三平台严格汇总。任何平台失败后先定位，只重新执行需要修复的平台。
 
 `release-manifest.mjs` 遇到不同提交、缺少原生启动证据、更新签名文件或文件散列不符时会拒绝汇总。检查 `release-assets/`、`latest.json`、`SHA256SUMS` 和发版说明后，再决定是否建立或公开 Release；本地汇总命令本身不会上传或发布。本机若自行重建同一候选包，构建进程还须显式导出与正式渠道一致的 `SLG_UPDATER_PUBLIC_KEY` 和 `SLG_UPDATER_ENDPOINT`，并使用 `release-config.json`；仅有配置文件不足以设置编译时环境变量。
 

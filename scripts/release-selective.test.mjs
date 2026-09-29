@@ -18,13 +18,13 @@ function fixture() {
 }
 function put(path, value) { mkdirSync(resolve(path, '..'), { recursive: true }); writeFileSync(path, value); }
 
-test('dispatch selection defaults to Windows and expands only explicit all', () => {
+test('dispatch selection defaults to Windows and preserves explicit native targets', () => {
   const dir = fixture();
   try {
     const git = (...args) => execFileSync('git', args, { cwd: dir, stdio: 'pipe' });
     git('init', '-q'); git('config', 'user.name', 'Example'); git('config', 'user.email', 'example@example.org');
     git('add', '.'); git('commit', '-qm', 'fixture'); git('tag', 'v0.1.1');
-    for (const [target, expected] of [[undefined, ['x86_64-pc-windows-msvc']], ['mac-arm', ['aarch64-apple-darwin']], ['all', ['aarch64-apple-darwin', 'x86_64-apple-darwin', 'x86_64-pc-windows-msvc']]]) {
+    for (const [target, expected] of [[undefined, ['x86_64-pc-windows-msvc']], ['mac-arm', ['aarch64-apple-darwin']], ['windows-intel', ['x86_64-pc-windows-msvc', 'x86_64-apple-darwin']], ['all', ['aarch64-apple-darwin', 'x86_64-apple-darwin', 'x86_64-pc-windows-msvc']]]) {
       const output = join(dir, 'output');
       writeFileSync(output, '');
       const run = spawnSync(process.execPath, [join(root, 'scripts/release-config.mjs'), '--validate-tag'], {
@@ -229,7 +229,7 @@ test('release workflow is manual, selective, and scans before one-day upload', (
   const release = YAML.parse(readFileSync('.github/workflows/release.yml', 'utf8'));
   assert.deepEqual(Object.keys(release.on), ['workflow_dispatch']);
   assert.equal(release.on.workflow_dispatch.inputs.target.default, 'windows');
-  assert.deepEqual(release.on.workflow_dispatch.inputs.target.options, ['windows', 'mac-arm', 'mac-intel', 'all']);
+  assert.deepEqual(release.on.workflow_dispatch.inputs.target.options, ['windows', 'mac-arm', 'mac-intel', 'windows-intel', 'all']);
   assert.match(release.jobs.build.strategy.matrix.include, /fromJSON\(needs.prepare.outputs.builds\)/);
   assert.equal(release.jobs.draft.if, "inputs.target == 'all'");
   const steps = release.jobs.build.steps;

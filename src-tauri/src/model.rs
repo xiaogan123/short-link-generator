@@ -253,6 +253,8 @@ pub struct PlanView {
     pub steps: Vec<String>,
     pub warnings: Vec<String>,
     pub expires_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub domain_takeover_confirmation: Option<String>,
 }
 
 #[derive(Clone, Serialize)]
@@ -263,6 +265,23 @@ pub struct Check {
     pub message: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DomainCheckLevel {
+    Pass,
+    Warning,
+    Error,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DomainCheck {
+    pub label: String,
+    pub ok: bool,
+    pub message: String,
+    pub level: DomainCheckLevel,
+}
+
 #[derive(Clone)]
 pub enum PlanKind {
     Domain {
@@ -270,6 +289,8 @@ pub enum PlanKind {
         zone_id: String,
         host: String,
         prefix: String,
+        path_risk: crate::domain_check::PathRiskSnapshot,
+        requires_takeover_confirmation: bool,
     },
     SaveLink {
         domain_id: String,
@@ -333,7 +354,7 @@ pub struct DomainPreparation {
     pub host: String,
     pub prefix: String,
     pub candidates: Vec<Candidate>,
-    pub checks: Vec<Check>,
+    pub checks: Vec<DomainCheck>,
     pub can_apply: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub plan: Option<PlanView>,

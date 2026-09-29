@@ -553,14 +553,28 @@ impl Cloud {
                 url.path()
             ))
             .map_err(|_| CloudError::new("测试探测地址无效", false))?;
-        let mut req = self.client.head(url);
-        if let Some(h) = header {
+        let mut req = self.client.head(url.clone());
+        if let Some(h) = header.as_deref() {
             req = req.header("X-Selftest", h);
         }
-        let response = req
+        let mut response = req
             .send()
             .await
-            .map_err(|_| CloudError::new("无法访问探测地址", false))?;
+            .map_err(|_| CloudError::new("DNS、TLS、超时或网络连接失败", false))?;
+        if response.status() == StatusCode::METHOD_NOT_ALLOWED {
+            // Do not consume the response body. Range also bounds a compliant server's GET body.
+            let mut req = self
+                .client
+                .get(url)
+                .header(reqwest::header::RANGE, "bytes=0-0");
+            if let Some(h) = header.as_deref() {
+                req = req.header("X-Selftest", h);
+            }
+            response = req
+                .send()
+                .await
+                .map_err(|_| CloudError::new("DNS、TLS、超时或网络连接失败", false))?;
+        }
         let location = response
             .headers()
             .get(reqwest::header::LOCATION)

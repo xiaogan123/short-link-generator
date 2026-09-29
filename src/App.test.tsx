@@ -1,12 +1,21 @@
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import App from './App';
 import userEvent from '@testing-library/user-event';
+import * as bridge from './bridge';
+import type { Action, DomainPreparation } from './types';
 
-afterEach(() => cleanup());
+afterEach(() => { cleanup(); vi.restoreAllMocks(); });
 
 describe('desktop primary flows in explicit preview', () => {
-  it('keeps focus while typing and accepts a pasted domain URL', async () => {
+  it('shows the existing-page warning, requires scope confirmation, and preserves the draft on return', async () => {
+    const originalDispatch = bridge.dispatch;
+    const applyPayloads: Record<string, unknown>[] = [];
+    const mockedDispatch = (action: Action, payload: Record<string, unknown> = {}): Promise<unknown> => {
+      if (action === 'apply_plan') applyPayloads.push(payload);
+      return originalDispatch(action, payload);
+    };
+    vi.spyOn(bridge, 'dispatch').mockImplementation(mockedDispatch as typeof bridge.dispatch);
     const user = userEvent.setup();
     render(<App />);
     await screen.findByRole('heading', {name:'短链接'});
@@ -17,8 +26,93 @@ describe('desktop primary flows in explicit preview', () => {
     await user.type(input, 'https://WWW.example.com/path');
     expect((input as HTMLInputElement).value).toBe('https://WWW.example.com/path');
     expect(document.activeElement).toBe(input);
-    await user.click(within(editor).getByRole('button', { name: '开始检查' }));
-    expect(await within(editor).findByText(/检查结果 · www.example.com/)).toBeTruthy();
+    const prefix = within(editor).getByLabelText(/链接目录/);
+    await user.clear(prefix);
+    await user.type(prefix, 'r');
+    await user.click(within(editor).getByRole('button', { name: '检查并接入' }));
+    expect(await within(editor).findByText('www.example.com/r/')).toBeTruthy();
+    await user.selectOptions(within(editor).getByRole('combobox', { name: /选择账户与区域/ }), 'demo-a');
+    expect(within(editor).queryByText('www.example.com/r/')).toBeNull();
+    await user.click(within(editor).getByRole('button', { name: '检查并接入' }));
+    expect(await within(editor).findByText('确认后可接入')).toBeTruthy();
+    expect(within(editor).getByText(/HTTP 200/)).toBeTruthy();
+    await user.click(within(editor).getByRole('button', { name: '查看接入计划' }));
+    const plan = await screen.findByRole('dialog', { name: '添加 www.example.com' });
+    expect(within(plan).getByText(/www\.example\.com\/r\/ 及其所有下级内容/)).toBeTruthy();
+    expect(within(plan).getByText(/原该目录内网页将不能继续按原方式访问/)).toBeTruthy();
+    expect(within(plan).getByRole('button', { name: '确认使用此目录' })).toBeTruthy();
+    await user.click(within(plan).getByRole('button', { name: '返回' }));
+    const restored = await screen.findByRole('dialog', { name: '添加域名' });
+    expect((within(restored).getByPlaceholderText('go.example.com') as HTMLInputElement).value).toBe('https://WWW.example.com/path');
+    expect(within(restored).getByText('确认后可接入')).toBeTruthy();
+    await user.click(within(restored).getByRole('button', { name: '查看接入计划' }));
+    await user.click(within(await screen.findByRole('dialog', { name: '添加 www.example.com' })).getByRole('button', { name: '确认使用此目录' }));
+    expect(await screen.findByText(/现在可以创建第一条短链接/)).toBeTruthy();
+    expect(applyPayloads).toHaveLength(1);
+    expect(applyPayloads[0].acknowledgeDomainTakeover).toBe(true);
+  });
+
+  it('blocks the same managed host even when a different prefix is entered', async () => {
+    const user = userEvent.setup();
+    render(<App />);
+    await screen.findByRole('heading', {name:'短链接'});
+    await user.click(screen.getByRole('button', { name: /^域名管理$/ }));
+    await user.click(screen.getByRole('button', { name: '添加域名' }));
+    const editor = screen.getByRole('dialog', { name: '添加域名' });
+    await user.clear(within(editor).getByPlaceholderText('go.example.com'));
+    await user.type(within(editor).getByPlaceholderText('go.example.com'), 'go.example.com');
+    const prefix = within(editor).getByLabelText(/链接目录/);
+    await user.clear(prefix);
+    await user.type(prefix, 'other');
+    await user.click(within(editor).getByRole('button', { name: '检查并接入' }));
+    expect(await within(editor).findByText('需要先处理')).toBeTruthy();
+    expect(within(editor).getByText(/已使用 \/r\/ 目录/)).toBeTruthy();
+    expect(within(editor).getByText(/一个主机名只能接入一个链接目录/)).toBeTruthy();
+    expect(within(editor).getByText(/管理已有域名或更换主机名/)).toBeTruthy();
+    expect(within(editor).queryByText(/请选择明确的账户/)).toBeNull();
+    expect(within(editor).queryByRole('button', { name: '查看接入计划' })).toBeNull();
+  });
+
+  it('keeps the ordinary 404 path on the standard confirmation flow', async () => {
+    const user = userEvent.setup();
+    render(<App />);
+    await screen.findByRole('heading', {name:'短链接'});
+    await user.click(screen.getByRole('button', { name: /^域名管理$/ }));
+    await user.click(screen.getByRole('button', { name: '添加域名' }));
+    const editor = screen.getByRole('dialog', { name: '添加域名' });
+    await user.type(within(editor).getByPlaceholderText('go.example.com'), 'unused.example.org');
+    await user.click(within(editor).getByRole('button', { name: '检查并接入' }));
+    await user.selectOptions(await within(editor).findByRole('combobox', { name: /选择账户与区域/ }), 'demo-a');
+    await user.click(within(editor).getByRole('button', { name: '检查并接入' }));
+    expect(await within(editor).findByText('可用')).toBeTruthy();
+    await user.click(within(editor).getByRole('button', { name: '查看接入计划' }));
+    const plan = await screen.findByRole('dialog', { name: '添加 unused.example.org' });
+    expect(within(plan).getByRole('button', { name: '确认并执行' })).toBeTruthy();
+    expect(within(plan).queryByText('请确认接管范围')).toBeNull();
+  });
+
+  it('discards an in-flight domain result after the draft changes', async () => {
+    const originalDispatch = bridge.dispatch;
+    let resolvePreparation: ((value: DomainPreparation) => void) | undefined;
+    const mockedDispatch = (action: Action, payload?: Record<string, unknown>): Promise<unknown> => {
+      if (action === 'prepare_domain') return new Promise<DomainPreparation>(resolve => { resolvePreparation = resolve; });
+      return originalDispatch(action, payload);
+    };
+    vi.spyOn(bridge, 'dispatch').mockImplementation(mockedDispatch as typeof bridge.dispatch);
+    const user = userEvent.setup();
+    render(<App />);
+    await screen.findByRole('heading', {name:'短链接'});
+    await user.click(screen.getByRole('button', { name: /^域名管理$/ }));
+    await user.click(screen.getByRole('button', { name: '添加域名' }));
+    const editor = screen.getByRole('dialog', { name: '添加域名' });
+    const input = within(editor).getByPlaceholderText('go.example.com');
+    await user.type(input, 'old.example.org');
+    await user.click(within(editor).getByRole('button', { name: '检查并接入' }));
+    fireEvent.change(input, { target: { value: 'new.example.org' } });
+    resolvePreparation?.({ host: 'old.example.org', prefix: 'r', candidates: [], checks: [{ label: '旧结果', ok: true, level: 'pass', message: '不应显示' }], canApply: false });
+    await waitFor(() => expect((within(editor).getByRole('button', { name: '检查并接入' }) as HTMLButtonElement).disabled).toBe(false));
+    expect(within(editor).queryByText('旧结果')).toBeNull();
+    expect(within(editor).queryByText(/old\.example\.org/)).toBeNull();
   });
   it('navigates between four working pages', async () => {
     render(<App />);

@@ -7,9 +7,9 @@ on:
         type: string
         required: true
       target:
-        description: Native platform to build; all also creates a draft release
+        description: Native platforms; windows-intel reuses local ARM, all also drafts
         type: choice
-        options: [windows, mac-arm, mac-intel, all]
+        options: [windows, mac-arm, mac-intel, windows-intel, all]
         default: windows
         required: true
 permissions:

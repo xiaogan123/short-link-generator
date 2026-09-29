@@ -1,15 +1,18 @@
 mod cloud;
+mod domain_check;
 mod local_check;
 mod model;
 mod pools;
 
 use chrono::Utc;
 use cloud::{Cloud, CloudError};
+use domain_check::PathRiskSnapshot;
 use futures_util::StreamExt;
 use hmac::{Hmac, Mac};
 use model::{
-    Account, Candidate, Check, Database, Domain, DomainPreparation, Link, PendingMonitorChange,
-    PendingPoolChange, Plan, PlanKind, PlanView, Pool, PoolSyncStatus, Resources, State, Zone,
+    Account, Candidate, Check, Database, Domain, DomainCheck, DomainCheckLevel, DomainPreparation,
+    Link, PendingMonitorChange, PendingPoolChange, Plan, PlanKind, PlanView, Pool, PoolSyncStatus,
+    Resources, State, Zone,
 };
 use rand::{distributions::Alphanumeric, Rng, RngCore};
 use serde_json::{json, Value};
@@ -64,6 +67,12 @@ struct HealthSnapshot {
     pool: Pool,
     accounts: Vec<(String, String, String, bool)>,
     cloud: Cloud,
+}
+
+struct DomainTakeover<'a> {
+    expected_path_risk: &'a PathRiskSnapshot,
+    requires_confirmation: bool,
+    acknowledged: bool,
 }
 
 fn problem(error: CloudError) -> String {
@@ -458,12 +467,24 @@ impl Backend {
         kind: PlanKind,
     ) -> PlanView {
         self.plans.retain(|p| p.expires_at > Instant::now());
+        let domain_takeover_confirmation = match &kind {
+            PlanKind::Domain {
+                host,
+                prefix,
+                requires_takeover_confirmation: true,
+                ..
+            } => Some(format!(
+                "我确认接管 {host}/{prefix}/ 及其下级网页：这些路径将改由短链接处理，未创建的短链接会返回 HTTP 404，当前探测到的内容或跳转可能不再可用。"
+            )),
+            _ => None,
+        };
         let view = PlanView {
             id: random_id(),
             title: title.into(),
             steps,
             warnings,
             expires_at: (Utc::now() + chrono::Duration::minutes(5)).to_rfc3339(),
+            domain_takeover_confirmation,
         };
         let snapshot = self.database_snapshot();
         self.plans.push(Plan {
@@ -640,44 +661,37 @@ impl Backend {
         zone_id: &str,
         host: &str,
         prefix: &str,
-    ) -> Vec<Check> {
+        planned_probe_segment: Option<&str>,
+    ) -> (Vec<DomainCheck>, Option<PathRiskSnapshot>) {
         let mut checks = Vec::new();
         let account = match self.account(account_id) {
             Ok(v) => v,
             Err(e) => {
-                checks.push(Check {
-                    label: "账号".into(),
-                    ok: false,
-                    message: e,
-                });
-                return checks;
+                checks.push(domain_check::hard_check("账号", false, e));
+                return (checks, None);
             }
         };
         let zone = account.zones.iter().find(|z| {
             z.id == zone_id && (host == z.name || host.ends_with(&format!(".{}", z.name)))
         });
         let active = zone.is_some_and(|z| z.status == "active");
-        checks.push(Check {
-            label: "域名归属状态".into(),
-            ok: active,
-            message: if active {
-                "域名所属区域已启用".into()
+        checks.push(domain_check::hard_check(
+            "域名归属状态",
+            active,
+            if active {
+                "域名所属区域已启用"
             } else {
-                "域名所属区域未启用，或不属于此账号".into()
+                "域名所属区域未启用，或不属于此账号"
             },
-        });
+        ));
         if !active {
-            return checks;
+            return (checks, None);
         }
         let token = match keyring_get(account_id, "token") {
             Ok(t) => t,
             Err(e) => {
-                checks.push(Check {
-                    label: "凭据".into(),
-                    ok: false,
-                    message: e,
-                });
-                return checks;
+                checks.push(domain_check::hard_check("凭据", false, e));
+                return (checks, None);
             }
         };
         let remote_zone = self.cloud.get(&token, &format!("zones/{zone_id}")).await;
@@ -686,17 +700,17 @@ impl Backend {
                 && v["result"]["id"].as_str() == Some(zone_id)
                 && v["result"]["account"]["id"].as_str() == Some(account_id)
         });
-        checks.push(Check {
-            label: "云端域名归属".into(),
-            ok: remote_active,
-            message: if remote_active {
-                "云端确认域名所属区域已启用".into()
+        checks.push(domain_check::hard_check(
+            "云端域名归属",
+            remote_active,
+            if remote_active {
+                "云端确认域名所属区域已启用"
             } else {
-                "无法确认域名所属区域已启用且归属此账号".into()
+                "无法确认域名所属区域已启用且归属此账号"
             },
-        });
+        ));
         if !remote_active {
-            return checks;
+            return (checks, None);
         }
         let dns_path = format!("zones/{zone_id}/dns_records?name={}", cloud::encode(host));
         let dns = self.cloud.list_pages(&token, &dns_path).await;
@@ -721,11 +735,7 @@ impl Backend {
             }
             Err(_) => (false, "无法读取 DNS 记录"),
         };
-        checks.push(Check {
-            label: "DNS".into(),
-            ok,
-            message: message.into(),
-        });
+        checks.push(domain_check::hard_check("DNS", ok, message));
         let routes = self
             .cloud
             .get(&token, &format!("zones/{zone_id}/workers/routes"))
@@ -733,12 +743,12 @@ impl Backend {
         let (ok, message) = match routes {
             Ok(v) => {
                 let Some(arr) = v["result"].as_array() else {
-                    checks.push(Check {
-                        label: "转发规则".into(),
-                        ok: false,
-                        message: "云端转发规则列表格式无效".into(),
-                    });
-                    return checks;
+                    checks.push(domain_check::hard_check(
+                        "转发规则",
+                        false,
+                        "云端转发规则列表格式无效",
+                    ));
+                    return (checks, None);
                 };
                 let found = arr.iter().any(|r| {
                     r["pattern"]
@@ -756,32 +766,40 @@ impl Backend {
             }
             Err(_) => (false, "无法读取云端转发规则"),
         };
-        checks.push(Check {
-            label: "转发规则".into(),
-            ok,
-            message: message.into(),
-        });
-        for (label, path) in [
-            ("短链接目录", format!("/{prefix}/")),
-            (
-                "随机测试链接",
-                format!("/{prefix}/{}", random_name("probe")),
-            ),
-        ] {
-            let url = format!("https://{host}{path}");
-            let result = self.cloud_probe(&url, None).await;
-            let ok = matches!(result, Ok((404, _)));
-            checks.push(Check {
-                label: label.into(),
-                ok,
-                message: if ok {
-                    "没有发现内容（HTTP 404），可使用这个前缀".into()
-                } else {
-                    "路径已有内容或无法确定，请换前缀或检查网络".into()
-                },
-            });
+        checks.push(domain_check::hard_check("转发规则", ok, message));
+        if checks
+            .iter()
+            .any(|check| check.level == DomainCheckLevel::Error)
+        {
+            return (checks, None);
         }
-        checks
+        let probe_segment = planned_probe_segment
+            .map(str::to_owned)
+            .unwrap_or_else(|| random_name("probe"));
+        let root_url = format!("https://{host}/{prefix}/");
+        let child_url = format!("https://{host}/{prefix}/{probe_segment}");
+        let (root_result, child_result) = tokio::join!(
+            self.cloud_probe(&root_url, None),
+            self.cloud_probe(&child_url, None)
+        );
+        let (root_check, root) =
+            domain_check::classify_probe("短链接目录", &root_url, None, root_result);
+        let (child_check, child) = domain_check::classify_probe(
+            "随机测试链接",
+            &child_url,
+            Some(&probe_segment),
+            child_result,
+        );
+        checks.push(root_check);
+        checks.push(child_check);
+        (
+            checks,
+            Some(PathRiskSnapshot {
+                root,
+                child,
+                probe_segment,
+            }),
+        )
     }
 
     async fn cloud_probe(
@@ -813,44 +831,64 @@ impl Backend {
         let mut checks = Vec::new();
         let mut plan = None;
         if self.db.domains.iter().any(|d| d.host == host) {
-            checks.push(Check {
-                label: "本机配置".into(),
-                ok: false,
-                message: "这个主机名已经添加".into(),
-            });
+            checks.push(domain_check::hard_check(
+                "本机配置",
+                false,
+                "这个主机名已经添加",
+            ));
         } else if candidates.is_empty() {
-            checks.push(Check {
-                label: "域名归属".into(),
-                ok: false,
-                message: "已导入的账号均不管理这个域名".into(),
-            });
+            checks.push(domain_check::hard_check(
+                "域名归属",
+                false,
+                "已导入的账号均不管理这个域名",
+            ));
         } else if selected.is_none() {
-            checks.push(Check {
-                label: "账号选择".into(),
-                ok: false,
-                message: "请选择此域名所属的账号".into(),
-            });
+            checks.push(domain_check::hard_check(
+                "账号选择",
+                false,
+                "请选择此域名所属的账号",
+            ));
         } else if let Some(c) = selected {
-            checks = self
-                .preflight(&c.account_id, &c.zone_id, &host, &prefix)
+            let (next_checks, path_risk) = self
+                .preflight(&c.account_id, &c.zone_id, &host, &prefix, None)
                 .await;
-            if checks.iter().all(|c| c.ok) {
+            checks = next_checks;
+            if !checks
+                .iter()
+                .any(|check| check.level == DomainCheckLevel::Error)
+            {
+                let path_risk = path_risk.ok_or("路径预检结果不完整")?;
+                let requires_takeover_confirmation = path_risk.requires_takeover_confirmation();
                 let has_resources = self.account(&c.account_id)?.resources.is_some();
                 let mut steps = Vec::new();
                 if !has_resources {
                     steps.push("创建此账号专用的云端转发程序和链接存储，并设置自检密钥".into());
                 }
+                steps.push(format!(
+                    "将 {host}/{prefix}/ 目录根及其所有下级网页交由短链接处理；未创建的短链接返回 HTTP 404"
+                ));
                 steps.push(format!("写入 {host} 的前缀配置"));
-                steps.push(format!("为 {} 添加转发规则", route_pattern(&host, &prefix)));
+                steps.push(format!(
+                    "仅为 {} 添加转发规则",
+                    route_pattern(&host, &prefix)
+                ));
+                let mut warnings = vec!["边缘配置传播可能需要一段时间".into()];
+                if requires_takeover_confirmation {
+                    warnings.push(
+                        "路径预检只说明当前 HTTP 响应；接入只创建指定目录的 Worker 路由，不修改 DNS、重定向规则或访问策略，也不保证绕过先于 Worker 执行的 Cloudflare 规则。配置提交后，请创建短链接并使用现有签名自检验证最终跳转。".into(),
+                    );
+                }
                 plan = Some(self.make_plan(
                     "添加域名",
                     steps,
-                    vec!["边缘配置传播可能需要一段时间".into()],
+                    warnings,
                     PlanKind::Domain {
                         account_id: c.account_id.clone(),
                         zone_id: c.zone_id.clone(),
                         host: host.clone(),
                         prefix: prefix.clone(),
+                        path_risk,
+                        requires_takeover_confirmation,
                     },
                 ));
             }
@@ -1376,7 +1414,10 @@ impl Backend {
                 if plan.snapshot != self.database_snapshot() {
                     return Err("本机配置已变化，请重新确认操作计划".into());
                 }
-                self.apply(plan.kind).await?;
+                let acknowledge_domain_takeover = payload["acknowledgeDomainTakeover"]
+                    .as_bool()
+                    .unwrap_or(false);
+                self.apply(plan.kind, acknowledge_domain_takeover).await?;
                 Ok(self.state())
             }
             "selftest_link" => Err("自检调用路径无效".into()),
@@ -1869,16 +1910,32 @@ impl Backend {
         Ok(())
     }
 
-    async fn apply(&mut self, kind: PlanKind) -> Result<(), String> {
+    async fn apply(
+        &mut self,
+        kind: PlanKind,
+        acknowledge_domain_takeover: bool,
+    ) -> Result<(), String> {
         match kind {
             PlanKind::Domain {
                 account_id,
                 zone_id,
                 host,
                 prefix,
+                path_risk,
+                requires_takeover_confirmation,
             } => {
-                self.apply_domain(&account_id, &zone_id, &host, &prefix)
-                    .await
+                self.apply_domain(
+                    &account_id,
+                    &zone_id,
+                    &host,
+                    &prefix,
+                    DomainTakeover {
+                        expected_path_risk: &path_risk,
+                        requires_confirmation: requires_takeover_confirmation,
+                        acknowledged: acknowledge_domain_takeover,
+                    },
+                )
+                .await
             }
             PlanKind::SaveLink {
                 domain_id,
@@ -1927,13 +1984,32 @@ impl Backend {
         zone_id: &str,
         host: &str,
         prefix: &str,
+        takeover: DomainTakeover<'_>,
     ) -> Result<(), String> {
+        if takeover.requires_confirmation && !takeover.acknowledged {
+            return Err("请先明确确认接管该短链接目录及其下级网页".into());
+        }
         if self.db.domains.iter().any(|d| d.host == host) {
             return Err("这个主机名已经添加".into());
         }
-        let checks = self.preflight(account_id, zone_id, host, prefix).await;
-        if checks.iter().any(|c| !c.ok) {
+        let (checks, current_path_risk) = self
+            .preflight(
+                account_id,
+                zone_id,
+                host,
+                prefix,
+                Some(&takeover.expected_path_risk.probe_segment),
+            )
+            .await;
+        if checks
+            .iter()
+            .any(|check| check.level == DomainCheckLevel::Error)
+        {
             return Err("预检状态已变化，请重新检查域名".into());
+        }
+        let current_path_risk = current_path_risk.ok_or("路径预检状态已变化，请重新检查域名")?;
+        if !current_path_risk.can_replace(takeover.expected_path_risk) {
+            return Err("路径响应状态已变化，请重新检查域名并确认接管范围".into());
         }
         let token = keyring_get(account_id, "token")?;
         let existing = self.account(account_id)?.resources.clone();
@@ -4277,6 +4353,92 @@ mod tests {
             .await;
     }
 
+    async fn mount_domain_hard_checks(server: &MockServer, dns_records: Value, routes: Value) {
+        Mock::given(method("GET"))
+            .and(path("/client/v4/zones/zone1"))
+            .respond_with(ok(json!({"id":"zone1","status":"active",
+                "account":{"id":"acct1"}})))
+            .mount(server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/client/v4/zones/zone1/dns_records"))
+            .respond_with(ok(dns_records))
+            .mount(server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/client/v4/zones/zone1/workers/routes"))
+            .respond_with(ok(routes))
+            .mount(server)
+            .await;
+    }
+
+    async fn mount_domain_probes(
+        server: &MockServer,
+        root: ResponseTemplate,
+        child: ResponseTemplate,
+    ) {
+        Mock::given(method("HEAD"))
+            .and(path("/client/v4/probe/example.com/go/"))
+            .respond_with(root)
+            .mount(server)
+            .await;
+        Mock::given(method("HEAD"))
+            .and(path_regex(r"^/client/v4/probe/example\.com/go/probe-"))
+            .respond_with(child)
+            .mount(server)
+            .await;
+    }
+
+    async fn mount_echoing_redirect_probe(
+        server: &MockServer,
+        query_version: &str,
+        fragment: &str,
+    ) {
+        Mock::given(method("HEAD"))
+            .and(path("/client/v4/probe/example.com/go/"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(server)
+            .await;
+        let query_version = query_version.to_owned();
+        let fragment = fragment.to_owned();
+        Mock::given(method("HEAD"))
+            .and(path_regex(r"^/client/v4/probe/example\.com/go/probe-"))
+            .respond_with(move |request: &wiremock::Request| {
+                let probe_segment = request.url.path().rsplit('/').next().unwrap();
+                ResponseTemplate::new(302).insert_header(
+                    "location",
+                    format!(
+                        "https://example.org/next?probe={probe_segment}&version={query_version}#{fragment}"
+                    ),
+                )
+            })
+            .mount(server)
+            .await;
+    }
+
+    async fn mount_existing_resource_domain_write(server: &MockServer) {
+        mount_resource(server, include_str!("../../edge/worker.mjs")).await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/client/v4/accounts/acct1/storage/kv/namespaces/ns1/values/c%3Aexample.com",
+            ))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path(
+                "/client/v4/accounts/acct1/storage/kv/namespaces/ns1/values/c%3Aexample.com",
+            ))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/client/v4/zones/zone1/workers/routes"))
+            .respond_with(ok(json!({"id":"route-new"})))
+            .mount(server)
+            .await;
+    }
+
     #[test]
     fn host_normalization_preserves_exact_subdomain_and_idn() {
         assert_eq!(
@@ -4369,6 +4531,504 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn domain_404_plan_keeps_original_flow_and_expires_single_use() {
+        let (server, mut backend, _dir) = fixture().await;
+        mount_domain_hard_checks(
+            &server,
+            json!([{"name":"example.com","type":"A","proxied":true}]),
+            json!([]),
+        )
+        .await;
+        mount_domain_probes(
+            &server,
+            ResponseTemplate::new(404),
+            ResponseTemplate::new(404),
+        )
+        .await;
+        let prepared = backend
+            .dispatch(
+                "prepare_domain",
+                &json!({"input":"example.com","prefix":"go"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(prepared["canApply"], true);
+        assert!(prepared["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|check| check["level"] == "pass"));
+        assert!(prepared["plan"].get("domainTakeoverConfirmation").is_none());
+        assert!(prepared["plan"]["steps"][0]
+            .as_str()
+            .unwrap()
+            .contains("所有下级网页"));
+
+        let plan_id = prepared["plan"]["id"].as_str().unwrap();
+        let plan = backend
+            .plans
+            .iter_mut()
+            .find(|plan| plan.view.id == plan_id)
+            .unwrap();
+        plan.expires_at = Instant::now() - Duration::from_secs(1);
+        let error = backend
+            .dispatch("apply_plan", &json!({"planId":plan_id}))
+            .await
+            .unwrap_err();
+        assert!(error.contains("计划已过期"));
+        assert!(backend
+            .dispatch("apply_plan", &json!({"planId":plan_id}))
+            .await
+            .unwrap_err()
+            .contains("计划不存在或已被使用"));
+    }
+
+    #[tokio::test]
+    async fn domain_http_200_requires_ack_then_completes_exact_route_write() {
+        let (server, mut backend, _dir) = fixture().await;
+        mount_domain_hard_checks(
+            &server,
+            json!([{"name":"example.com","type":"A","proxied":true}]),
+            json!([]),
+        )
+        .await;
+        mount_domain_probes(
+            &server,
+            ResponseTemplate::new(200),
+            ResponseTemplate::new(200),
+        )
+        .await;
+        mount_existing_resource_domain_write(&server).await;
+
+        let first = backend
+            .dispatch(
+                "prepare_domain",
+                &json!({"input":"example.com","prefix":"go"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first["canApply"], true);
+        assert!(first["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|check| check["level"] == "warning"
+                && check["message"].as_str().unwrap().contains("HTTP 200")));
+        let confirmation = first["plan"]["domainTakeoverConfirmation"]
+            .as_str()
+            .unwrap();
+        assert!(confirmation.contains("example.com/go/"));
+        assert!(confirmation.contains("未创建的短链接会返回 HTTP 404"));
+        let first_id = first["plan"]["id"].as_str().unwrap();
+        let error = backend
+            .dispatch("apply_plan", &json!({"planId":first_id}))
+            .await
+            .unwrap_err();
+        assert!(error.contains("明确确认接管"));
+        let requests = server.received_requests().await.unwrap();
+        assert!(!requests
+            .iter()
+            .any(|request| matches!(request.method.as_str(), "PUT" | "POST" | "DELETE")));
+
+        let second = backend
+            .dispatch(
+                "prepare_domain",
+                &json!({"input":"example.com","prefix":"go"}),
+            )
+            .await
+            .unwrap();
+        let second_id = second["plan"]["id"].as_str().unwrap();
+        let state = backend
+            .dispatch(
+                "apply_plan",
+                &json!({"planId":second_id,"acknowledgeDomainTakeover":true}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(state["domains"].as_array().unwrap().len(), 1);
+        let requests = server.received_requests().await.unwrap();
+        let route_write = requests
+            .iter()
+            .find(|request| {
+                request.method.as_str() == "POST"
+                    && request.url.path() == "/client/v4/zones/zone1/workers/routes"
+            })
+            .unwrap();
+        let body: Value = serde_json::from_slice(&route_write.body).unwrap();
+        assert_eq!(body["pattern"], "example.com/go/*");
+        assert!(backend
+            .dispatch(
+                "apply_plan",
+                &json!({"planId":second_id,"acknowledgeDomainTakeover":true}),
+            )
+            .await
+            .unwrap_err()
+            .contains("计划不存在或已被使用"));
+    }
+
+    #[tokio::test]
+    async fn domain_redirect_is_not_followed_and_origin_522_is_a_warning() {
+        let (server, mut backend, _dir) = fixture().await;
+        mount_domain_hard_checks(
+            &server,
+            json!([{"name":"example.com","type":"CNAME","proxied":true}]),
+            json!([]),
+        )
+        .await;
+        mount_domain_probes(
+            &server,
+            ResponseTemplate::new(302).insert_header("location", "https://example.org/elsewhere"),
+            ResponseTemplate::new(522),
+        )
+        .await;
+        let prepared = backend
+            .dispatch(
+                "prepare_domain",
+                &json!({"input":"example.com","prefix":"go"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(prepared["canApply"], true);
+        let checks = prepared["checks"].as_array().unwrap();
+        assert!(checks.iter().any(|check| {
+            check["level"] == "warning"
+                && check["message"].as_str().unwrap().contains("HTTP 302")
+                && check["message"].as_str().unwrap().contains("Cloudflare")
+        }));
+        assert!(checks.iter().any(|check| {
+            check["level"] == "warning"
+                && check["message"].as_str().unwrap().contains("HTTP 522")
+                && check["message"].as_str().unwrap().contains("WAF")
+        }));
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.method.as_str() == "HEAD")
+                .count(),
+            2
+        );
+        assert_eq!(requests.len(), 5);
+        assert!(requests
+            .iter()
+            .all(|request| request.url.path().starts_with("/client/v4/")));
+    }
+
+    #[tokio::test]
+    async fn domain_plan_reuses_probe_segment_when_redirect_query_echoes_it() {
+        let (server, mut backend, _dir) = fixture().await;
+        mount_domain_hard_checks(
+            &server,
+            json!([{"name":"example.com","type":"A","proxied":true}]),
+            json!([]),
+        )
+        .await;
+        mount_echoing_redirect_probe(&server, "one", "stable").await;
+        mount_existing_resource_domain_write(&server).await;
+        let prepared = backend
+            .dispatch(
+                "prepare_domain",
+                &json!({"input":"example.com","prefix":"go"}),
+            )
+            .await
+            .unwrap();
+        let plan_id = prepared["plan"]["id"].as_str().unwrap();
+        let state = backend
+            .dispatch(
+                "apply_plan",
+                &json!({"planId":plan_id,"acknowledgeDomainTakeover":true}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(state["domains"].as_array().unwrap().len(), 1);
+        let child_paths: Vec<_> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|request| {
+                request.method.as_str() == "HEAD"
+                    && request
+                        .url
+                        .path()
+                        .starts_with("/client/v4/probe/example.com/go/probe-")
+            })
+            .map(|request| request.url.path().to_owned())
+            .collect();
+        assert_eq!(child_paths.len(), 2);
+        assert_eq!(child_paths[0], child_paths[1]);
+    }
+
+    #[tokio::test]
+    async fn domain_redirect_query_and_fragment_changes_still_block_all_writes() {
+        let (server, mut backend, _dir) = fixture().await;
+        mount_domain_hard_checks(
+            &server,
+            json!([{"name":"example.com","type":"A","proxied":true}]),
+            json!([]),
+        )
+        .await;
+        mount_echoing_redirect_probe(&server, "one", "first").await;
+        let prepared = backend
+            .dispatch(
+                "prepare_domain",
+                &json!({"input":"example.com","prefix":"go"}),
+            )
+            .await
+            .unwrap();
+        let plan_id = prepared["plan"]["id"].as_str().unwrap();
+
+        server.reset().await;
+        mount_domain_hard_checks(
+            &server,
+            json!([{"name":"example.com","type":"A","proxied":true}]),
+            json!([]),
+        )
+        .await;
+        mount_echoing_redirect_probe(&server, "two", "second").await;
+        let error = backend
+            .dispatch(
+                "apply_plan",
+                &json!({"planId":plan_id,"acknowledgeDomainTakeover":true}),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.contains("路径响应状态已变化"));
+        assert!(!server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .any(|request| matches!(request.method.as_str(), "PUT" | "POST" | "DELETE")));
+    }
+
+    #[tokio::test]
+    async fn domain_access_limits_and_timeout_are_hard_errors() {
+        let (server, mut backend, _dir) = fixture().await;
+        for status in [403, 429] {
+            server.reset().await;
+            mount_domain_hard_checks(
+                &server,
+                json!([{"name":"example.com","type":"A","proxied":true}]),
+                json!([]),
+            )
+            .await;
+            mount_domain_probes(
+                &server,
+                ResponseTemplate::new(status),
+                ResponseTemplate::new(404),
+            )
+            .await;
+            let prepared = backend
+                .dispatch(
+                    "prepare_domain",
+                    &json!({"input":"example.com","prefix":"go"}),
+                )
+                .await
+                .unwrap();
+            assert_eq!(prepared["canApply"], false);
+            assert!(prepared["checks"].as_array().unwrap().iter().any(|check| {
+                check["level"] == "error"
+                    && check["message"]
+                        .as_str()
+                        .unwrap()
+                        .contains(&status.to_string())
+            }));
+        }
+        server.reset().await;
+        mount_domain_hard_checks(
+            &server,
+            json!([{"name":"example.com","type":"A","proxied":true}]),
+            json!([]),
+        )
+        .await;
+        mount_domain_probes(
+            &server,
+            ResponseTemplate::new(404).set_delay(Duration::from_secs(3)),
+            ResponseTemplate::new(404).set_delay(Duration::from_secs(3)),
+        )
+        .await;
+        let prepared = backend
+            .dispatch(
+                "prepare_domain",
+                &json!({"input":"example.com","prefix":"go"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(prepared["canApply"], false);
+        assert!(prepared["checks"].as_array().unwrap().iter().any(|check| {
+            check["level"] == "error" && check["message"].as_str().unwrap().contains("超时")
+        }));
+    }
+
+    #[tokio::test]
+    async fn domain_head_405_retries_bounded_get_without_following_redirects() {
+        let (server, mut backend, _dir) = fixture().await;
+        mount_domain_hard_checks(
+            &server,
+            json!([{"name":"example.com","type":"A","proxied":true}]),
+            json!([]),
+        )
+        .await;
+        mount_domain_probes(
+            &server,
+            ResponseTemplate::new(405),
+            ResponseTemplate::new(404),
+        )
+        .await;
+        Mock::given(method("GET"))
+            .and(path("/client/v4/probe/example.com/go/"))
+            .and(header_regex("range", r"^bytes=0-0$"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("ignored body"))
+            .mount(&server)
+            .await;
+        let prepared = backend
+            .dispatch(
+                "prepare_domain",
+                &json!({"input":"example.com","prefix":"go"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(prepared["canApply"], true);
+        assert!(prepared["checks"].as_array().unwrap().iter().any(|check| {
+            check["level"] == "warning" && check["message"].as_str().unwrap().contains("HTTP 200")
+        }));
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| { request.url.path() == "/client/v4/probe/example.com/go/" })
+                .count(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn domain_hard_gates_block_probes_and_path_risk_changes_block_writes() {
+        let (server, mut backend, _dir) = fixture().await;
+        mount_domain_hard_checks(
+            &server,
+            json!([{"name":"example.com","type":"A","proxied":false}]),
+            json!([{"id":"other","pattern":"example.com/go/*","script":"another"}]),
+        )
+        .await;
+        let blocked = backend
+            .dispatch(
+                "prepare_domain",
+                &json!({"input":"example.com","prefix":"go"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(blocked["canApply"], false);
+        assert!(blocked["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|check| { check["label"] == "DNS" && check["level"] == "error" }));
+        assert!(blocked["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|check| { check["label"] == "转发规则" && check["level"] == "error" }));
+        assert!(!server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .any(|request| request.method.as_str() == "HEAD"));
+
+        server.reset().await;
+        mount_domain_hard_checks(
+            &server,
+            json!([{"name":"example.com","type":"A","proxied":true}]),
+            json!([]),
+        )
+        .await;
+        mount_domain_probes(
+            &server,
+            ResponseTemplate::new(404),
+            ResponseTemplate::new(404),
+        )
+        .await;
+        let prepared = backend
+            .dispatch(
+                "prepare_domain",
+                &json!({"input":"example.com","prefix":"go"}),
+            )
+            .await
+            .unwrap();
+        let plan_id = prepared["plan"]["id"].as_str().unwrap();
+
+        server.reset().await;
+        mount_domain_hard_checks(
+            &server,
+            json!([{"name":"example.com","type":"A","proxied":true}]),
+            json!([]),
+        )
+        .await;
+        mount_domain_probes(
+            &server,
+            ResponseTemplate::new(200),
+            ResponseTemplate::new(404),
+        )
+        .await;
+        let error = backend
+            .dispatch("apply_plan", &json!({"planId":plan_id}))
+            .await
+            .unwrap_err();
+        assert!(error.contains("路径响应状态已变化"));
+        assert!(!server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .any(|request| matches!(request.method.as_str(), "PUT" | "POST" | "DELETE")));
+
+        server.reset().await;
+        mount_domain_hard_checks(
+            &server,
+            json!([{"name":"example.com","type":"A","proxied":true}]),
+            json!([]),
+        )
+        .await;
+        mount_domain_probes(
+            &server,
+            ResponseTemplate::new(200),
+            ResponseTemplate::new(200),
+        )
+        .await;
+        let warning_plan = backend
+            .dispatch(
+                "prepare_domain",
+                &json!({"input":"example.com","prefix":"go"}),
+            )
+            .await
+            .unwrap();
+        let warning_plan_id = warning_plan["plan"]["id"].as_str().unwrap();
+        server.reset().await;
+        mount_domain_hard_checks(
+            &server,
+            json!([{"name":"example.com","type":"A","proxied":true}]),
+            json!([]),
+        )
+        .await;
+        mount_domain_probes(
+            &server,
+            ResponseTemplate::new(204),
+            ResponseTemplate::new(200),
+        )
+        .await;
+        let error = backend
+            .dispatch(
+                "apply_plan",
+                &json!({"planId":warning_plan_id,"acknowledgeDomainTakeover":true}),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.contains("路径响应状态已变化"));
+    }
+
+    #[tokio::test]
     async fn existing_cloud_config_blocks_domain_write() {
         let (server, mut backend, _dir) = fixture().await;
         mount_resource(&server, include_str!("../../edge/worker.mjs")).await;
@@ -4407,7 +5067,21 @@ mod tests {
             .mount(&server)
             .await;
         let error = backend
-            .apply_domain("acct1", "zone1", "example.com", "go")
+            .apply_domain(
+                "acct1",
+                "zone1",
+                "example.com",
+                "go",
+                DomainTakeover {
+                    expected_path_risk: &PathRiskSnapshot {
+                        root: domain_check::ProbeRisk::Missing,
+                        child: domain_check::ProbeRisk::Missing,
+                        probe_segment: "probe-fixed".into(),
+                    },
+                    requires_confirmation: false,
+                    acknowledged: false,
+                },
+            )
             .await
             .unwrap_err();
         assert!(error.contains("已有此主机名"));
