@@ -60,7 +60,7 @@ function previewDispatch(action: Action, payload: Record<string, unknown>): unkn
     const needsTakeover = !isManaged && host.endsWith('.example.com');
     const checks = [
       { label: '域名格式', ok: true, level: 'pass' as const, message: '格式有效。' },
-      { label: '区域与代理', ok: true, level: 'pass' as const, message: '示例数据：活动区域与代理状态。' },
+      { label: '区域与代理', ok: true, level: 'pass' as const, message: '示例数据：已启用域名与代理状态。' },
       isManaged
         ? { label: '域名已接入', ok: false, level: 'error' as const, message: `示例数据：${host} 已使用 /${managedDomain?.prefix}/ 目录。一个主机名只能接入一个链接目录，请管理已有域名或更换主机名。` }
         : needsTakeover

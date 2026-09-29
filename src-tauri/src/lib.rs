@@ -682,25 +682,34 @@ impl Backend {
     }
 
     async fn refresh_accounts(&mut self) -> Result<Value, String> {
-        for i in 0..self.db.accounts.len() {
-            let id = self.db.accounts[i].id.clone();
-            let token = keyring_get(&id, "token")?;
+        let mut refreshed = self.db.accounts.clone();
+        for item in &mut refreshed {
+            let id = item.id.clone();
+            let token = keyring_get(&id, "token")
+                .map_err(|error| format!("无法刷新账户「{}」：{error}", item.label))?;
             let account = self
                 .cloud
                 .get(&token, &format!("accounts/{id}"))
                 .await
-                .map_err(problem)?;
+                .map_err(|error| format!("无法刷新账户「{}」：{}", item.label, problem(error)))?;
             let cloudflare_name = value_str(&account["result"], "name")?.trim().to_owned();
             if cloudflare_name.is_empty() || cloudflare_name.chars().count() > 256 {
                 return Err("云端账号名称无效".into());
             }
-            let zones = self.fetch_zones(&token, &id).await?;
-            self.db.accounts[i].cloudflare_name = Some(cloudflare_name);
-            self.db.accounts[i].zone_count = zones.len();
-            self.db.accounts[i].zones = zones;
-            self.db.accounts[i].checked_at = Some(now());
+            let zones = self
+                .fetch_zones(&token, &id)
+                .await
+                .map_err(|error| format!("无法刷新账户「{}」的域名：{error}", item.label))?;
+            item.cloudflare_name = Some(cloudflare_name);
+            item.zone_count = zones.len();
+            item.zones = zones;
+            item.checked_at = Some(now());
         }
-        self.persist()?;
+        let previous = std::mem::replace(&mut self.db.accounts, refreshed);
+        if let Err(error) = self.persist() {
+            self.db.accounts = previous;
+            return Err(error);
+        }
         Ok(self.state())
     }
 
@@ -730,6 +739,60 @@ impl Backend {
         let max = all.iter().map(|(n, _)| *n).max().unwrap_or(0);
         all.retain(|(n, _)| *n == max);
         all.into_iter().map(|(_, c)| c).collect()
+    }
+
+    async fn domain_candidates(
+        &mut self,
+        host: &str,
+        choice: Option<&str>,
+    ) -> Result<Vec<Candidate>, String> {
+        if let Some(id) = choice {
+            self.account(id)?;
+        }
+        let cached = self.candidates(host);
+        let selected: Vec<_> = cached
+            .iter()
+            .filter(|candidate| choice.is_none_or(|id| candidate.account_id == id))
+            .collect();
+        if !selected.is_empty()
+            && selected
+                .iter()
+                .all(|candidate| candidate.status == "active")
+        {
+            return Ok(cached);
+        }
+        // A cache miss does not prove that a newly added zone is absent. Refresh
+        // accessible zones before reporting a missing domain; never widen token access.
+        let accounts: Vec<_> = self
+            .db
+            .accounts
+            .iter()
+            .filter(|account| choice.is_none_or(|id| account.id == id))
+            .map(|account| (account.id.clone(), account.label.clone()))
+            .collect();
+        let mut refreshed = Vec::new();
+        for (id, label) in accounts {
+            let token = keyring_get(&id, "token")
+                .map_err(|error| format!("无法刷新账户「{label}」的域名：{error}"))?;
+            let zones = self.fetch_zones(&token, &id).await.map_err(|error| {
+                format!("无法刷新账户「{label}」的域名：{error}；可选择此域名所属账户后重试")
+            })?;
+            refreshed.push((id, zones));
+        }
+        // Commit the cache only after every selected account was read successfully.
+        let previous = self.db.accounts.clone();
+        for (id, zones) in refreshed {
+            if let Some(account) = self.db.accounts.iter_mut().find(|account| account.id == id) {
+                account.zone_count = zones.len();
+                account.zones = zones;
+                account.checked_at = Some(now());
+            }
+        }
+        if let Err(error) = self.persist() {
+            self.db.accounts = previous;
+            return Err(error);
+        }
+        Ok(self.candidates(host))
     }
 
     async fn confirmed_zone_token(
@@ -794,8 +857,8 @@ impl Backend {
 
     async fn prepare_domain_dns(&mut self, payload: &Value) -> Result<Value, String> {
         let host = normalize_host(field(payload, "input")?)?;
-        let candidates = self.candidates(&host);
         let choice = payload["accountId"].as_str();
+        let candidates = self.domain_candidates(&host, choice).await?;
         let selected = if candidates.len() == 1 && choice.is_none() {
             candidates.first()
         } else {
@@ -813,7 +876,7 @@ impl Backend {
             checks.push(domain_check::hard_check(
                 "域名归属",
                 false,
-                "已导入的账号均不管理这个域名",
+                "已从 Cloudflare 刷新，但当前令牌可见的域名中仍未找到它。请确认所属账户、域名已添加到 Cloudflare，以及令牌允许访问这个新域名",
             ));
         } else if selected.is_none() {
             checks.push(domain_check::hard_check(
@@ -1154,8 +1217,8 @@ impl Backend {
                 suggestions[rand::thread_rng().gen_range(0..suggestions.len())].to_string()
             });
         validate_prefix(&prefix)?;
-        let candidates = self.candidates(&host);
         let choice = payload["accountId"].as_str();
+        let candidates = self.domain_candidates(&host, choice).await?;
         let selected = if candidates.len() == 1 && choice.is_none() {
             candidates.first()
         } else {
@@ -1173,7 +1236,7 @@ impl Backend {
             checks.push(domain_check::hard_check(
                 "域名归属",
                 false,
-                "已导入的账号均不管理这个域名",
+                "已从 Cloudflare 刷新，但当前令牌可见的域名中仍未找到它。请确认所属账户、域名已添加到 Cloudflare，以及令牌允许访问这个新域名",
             ));
         } else if selected.is_none() {
             checks.push(domain_check::hard_check(
@@ -5183,6 +5246,177 @@ mod tests {
             body,
             json!({"type":"AAAA","name":"example.com","content":"100::","ttl":1,"proxied":true})
         );
+    }
+
+    #[tokio::test]
+    async fn new_domain_is_discovered_on_second_page_before_preflight() {
+        let (server, mut backend, _dir) = fixture().await;
+        backend.db.accounts[0].zones.clear();
+        let first: Vec<_> = (0..50).map(|i| json!({"id":format!("zone{i}"),"name":format!("site{i}.example.org"),"status":"active"})).collect();
+        for (page, result) in [
+            ("1", json!(first)),
+            (
+                "2",
+                json!([{"id":"zone1","name":"example.com","status":"active"}]),
+            ),
+        ] {
+            Mock::given(method("GET"))
+                .and(path("/client/v4/zones"))
+                .and(query_param("account.id", "acct1"))
+                .and(query_param("page", page))
+                .respond_with(ResponseTemplate::new(200).set_body_json(
+                    json!({"success":true,"result":result,"result_info":{"total_pages":2}}),
+                ))
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+        mount_domain_hard_checks(
+            &server,
+            json!([{"type":"A","name":"example.com","proxied":true}]),
+            json!([]),
+        )
+        .await;
+        mount_domain_probes(
+            &server,
+            ResponseTemplate::new(404),
+            ResponseTemplate::new(404),
+        )
+        .await;
+        let result = backend
+            .dispatch(
+                "prepare_domain",
+                &json!({"input":"example.com","prefix":"go"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["canApply"], true);
+        assert_eq!(result["candidates"][0]["zoneId"], "zone1");
+        assert_eq!(
+            backend.state()["accounts"][0]["zones"]
+                .as_array()
+                .unwrap()
+                .len(),
+            51
+        );
+        assert!(server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .all(|request| matches!(request.method.as_str(), "GET" | "HEAD")));
+    }
+
+    #[tokio::test]
+    async fn pending_domain_refreshes_to_active_before_dns_preparation() {
+        let (server, mut backend, _dir) = fixture().await;
+        backend.db.accounts[0].zones[0].status = "pending".into();
+        Mock::given(method("GET"))
+            .and(path("/client/v4/zones"))
+            .and(query_param("account.id", "acct1"))
+            .respond_with(ok(
+                json!([{"id":"zone1","name":"example.com","status":"active"}]),
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        mount_domain_hard_checks(&server, json!([]), json!([])).await;
+        let result = backend
+            .dispatch("prepare_domain_dns", &json!({"input":"example.com"}))
+            .await
+            .unwrap();
+        assert_eq!(result["dnsStatus"], "missing");
+        assert_eq!(result["canApply"], true);
+        assert_eq!(backend.db.accounts[0].zones[0].status, "active");
+        assert!(server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .all(|request| request.method.as_str() == "GET"));
+    }
+
+    #[tokio::test]
+    async fn refreshed_but_missing_domain_explains_token_visibility() {
+        let (server, mut backend, _dir) = fixture().await;
+        backend.db.accounts[0].zones.clear();
+        Mock::given(method("GET"))
+            .and(path("/client/v4/zones"))
+            .respond_with(ok(json!([])))
+            .expect(2)
+            .mount(&server)
+            .await;
+        for action in ["prepare_domain", "prepare_domain_dns"] {
+            let result = backend
+                .dispatch(action, &json!({"input":"example.org","prefix":"go"}))
+                .await
+                .unwrap();
+            assert_eq!(result["canApply"], false);
+            let message = result["checks"][0]["message"].as_str().unwrap();
+            assert!(message.contains("当前令牌可见") && message.contains("新域名"));
+            assert!(!message.contains("均不管理"));
+        }
+        assert!(backend.plans.is_empty());
+    }
+
+    #[tokio::test]
+    async fn domain_refresh_failure_does_not_report_missing_or_replace_cached_accounts() {
+        let (server, mut backend, _dir) = fixture().await;
+        let mut second = backend.db.accounts[0].clone();
+        second.id = "acct2".into();
+        second.label = "Second account".into();
+        backend.db.accounts.push(second);
+        keyring_set("acct2", "token", "second-test-token").unwrap();
+        let before = serde_json::to_value(&backend.db.accounts).unwrap();
+        Mock::given(method("GET"))
+            .and(path("/client/v4/zones"))
+            .and(query_param("account.id", "acct1"))
+            .respond_with(ok(json!([])))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/client/v4/zones"))
+            .and(query_param("account.id", "acct2"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&server)
+            .await;
+        let error = backend
+            .dispatch(
+                "prepare_domain",
+                &json!({"input":"example.org","prefix":"go"}),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.contains("Second account") && error.contains("无法刷新"));
+        assert!(!error.contains("均不管理"));
+        assert_eq!(serde_json::to_value(&backend.db.accounts).unwrap(), before);
+        assert!(backend.plans.is_empty());
+    }
+
+    #[tokio::test]
+    async fn selected_account_discovery_does_not_read_other_account() {
+        let (server, mut backend, _dir) = fixture().await;
+        let mut second = backend.db.accounts[0].clone();
+        second.id = "acct2".into();
+        backend.db.accounts[0].zones.clear();
+        backend.db.accounts.push(second);
+        Mock::given(method("GET"))
+            .and(path("/client/v4/zones"))
+            .and(query_param("account.id", "acct1"))
+            .respond_with(ok(
+                json!([{"id":"zone1","name":"example.com","status":"active"}]),
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let candidates = backend
+            .domain_candidates("example.com", Some("acct1"))
+            .await
+            .unwrap();
+        assert!(candidates
+            .iter()
+            .any(|candidate| candidate.account_id == "acct1"));
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
     }
 
     #[tokio::test]
