@@ -140,6 +140,8 @@ test('manual ARM reuse derives the application tree from both commits and reject
     assert.equal(isAppInput('.cargo/config.toml'), true);
     assert.equal(isAppInput('tsconfig.build.json'), true);
     assert.equal(isAppInput('.npmrc'), true);
+    assert.equal(isAppInput('public/local.tsbuildinfo'), true);
+    assert.equal(isAppInput('tsconfig.tsbuildinfo'), false);
     assert.equal(isAppInput('docs/release-only.md'), false);
     for (const target of ['aarch64-apple-darwin', 'x86_64-apple-darwin', 'x86_64-pc-windows-msvc']) {
       const base = join(dir, 'candidates', `candidate-${target}`);
@@ -187,10 +189,18 @@ test('manual ARM reuse derives the application tree from both commits and reject
     assert.throws(() => matchingAppInputs(buildSha, reviewedSha, dir), /Vite environment/);
     rmSync(join(dir, '.env.production'));
     const exclude = join(dir, '.git', 'info', 'exclude');
-    writeFileSync(exclude, `${readFileSync(exclude, 'utf8')}\n*.pem\n`);
+    writeFileSync(exclude, `${readFileSync(exclude, 'utf8')}\n*.pem\n.npmrc\n*.tsbuildinfo\n`);
     put(join(dir, 'public', 'local.pem'), 'ignored fixture');
     assert.throws(() => matchingAppInputs(buildSha, reviewedSha, dir), /Ignored files inside application inputs/);
     rmSync(join(dir, 'public', 'local.pem'));
+    put(join(dir, '.npmrc'), 'ignore-scripts=false');
+    assert.throws(() => matchingAppInputs(buildSha, reviewedSha, dir), /Ignored files inside application inputs/);
+    rmSync(join(dir, '.npmrc'));
+    put(join(dir, 'tsconfig.tsbuildinfo'), 'generated compiler metadata');
+    assert.deepEqual(matchingAppInputs(buildSha, reviewedSha, dir), expected);
+    put(join(dir, 'public', 'local.tsbuildinfo'), 'ignored public fixture');
+    assert.throws(() => matchingAppInputs(buildSha, reviewedSha, dir), /Ignored files inside application inputs/);
+    rmSync(join(dir, 'public', 'local.tsbuildinfo'));
     put(join(dir, '.cargo', 'config.toml'), '[build]\nrustflags=[]\n');
     git('add', '.cargo/config.toml'); git('commit', '-qm', 'changed Rust build configuration');
     const cargoSha = git('rev-parse', 'HEAD');

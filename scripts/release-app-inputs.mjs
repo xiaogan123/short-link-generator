@@ -10,7 +10,7 @@ const requiredInputs = new Set([
 ]);
 const releaseOnlyFiles = new Set([
   'AGENTS.md', 'README.md', 'design-qa.md', 'release-config.json',
-  'release-assets.json', 'latest.json', 'SHA256SUMS',
+  'release-assets.json', 'latest.json', 'SHA256SUMS', 'tsconfig.tsbuildinfo',
   'scripts/artifact-check.mjs', 'scripts/native-smoke.mjs', 'scripts/publish-draft.mjs',
   'scripts/release-app-inputs.mjs', 'scripts/release-config.mjs',
   'scripts/release-manifest.mjs', 'scripts/release-selective.test.mjs',
@@ -59,8 +59,7 @@ export function assertCleanAppInputs(cwd = '.') {
       throw new Error('Application inputs contain renamed local changes.');
     }
   }
-  const ignored = git(['ls-files', '--others', '--ignored', '--exclude-standard', '--directory', '-z', '--',
-    'src', 'src-tauri', 'edge', 'public', '.cargo'], cwd);
+  const ignored = git(['ls-files', '--others', '--ignored', '--exclude-standard', '--directory', '-z'], cwd);
   if (ignored.split('\0').filter(Boolean).some(path => isAppInput(path))) {
     throw new Error('Ignored files inside application inputs prevent local build reuse.');
   }
