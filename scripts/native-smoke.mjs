@@ -4,6 +4,7 @@ import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSyn
 import { tmpdir } from 'node:os';
 import { basename, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { observeWindowsWindow } from './windows-window-observer.mjs';
 
 const targets = {
   'aarch64-apple-darwin': { host: 'darwin', arch: 'arm64', binaryArch: 'arm64', updater: '.app.tar.gz' },
@@ -53,29 +54,38 @@ function running(child) {
   return child.pid && child.exitCode === null && child.signalCode === null;
 }
 
-async function observeStartup(binary, cwd, env, expectWindow) {
-  const child = spawn(binary, [], { cwd, env, stdio: 'ignore' });
+export function nativeGuiSpawnOptions(cwd, env) {
+  return { cwd, env, stdio: 'ignore', windowsHide: false };
+}
+
+export async function observeStartup(binary, cwd, env, expectWindow, args = []) {
+  const child = spawn(binary, args, nativeGuiSpawnOptions(cwd, env));
   let launchError;
   child.on('error', error => { launchError = error; });
   let windowObserved = null;
   let startupSeconds = 0;
   try {
+    if (expectWindow) {
+      const startedAt = Date.now();
+      await pause(250);
+      if (launchError || !running(child)) {
+        throw new Error(`Installed application exited during startup (${launchError?.code ?? child.exitCode ?? child.signalCode}).`);
+      }
+      await observeWindowsWindow(child.pid);
+      const remainingStableMs = Math.max(0, 3_000 - (Date.now() - startedAt));
+      if (remainingStableMs) await pause(remainingStableMs);
+      if (launchError || !running(child)) {
+        throw new Error(`Installed application exited after its window appeared (${launchError?.code ?? child.exitCode ?? child.signalCode}).`);
+      }
+      return { processAlive: true, windowObserved: true, startupSeconds: Math.ceil((Date.now() - startedAt) / 1_000) };
+    }
     for (let second = 0; second < 12; second++) {
       await pause(1_000);
       startupSeconds = second + 1;
       if (launchError || !running(child)) {
         throw new Error(`Installed application exited during startup (${launchError?.code ?? child.exitCode ?? child.signalCode}).`);
       }
-      if (expectWindow) {
-        const output = run('powershell.exe', [
-          '-NoProfile', '-NonInteractive', '-Command',
-          `$p=Get-Process -Id ${child.pid} -ErrorAction Stop; if ($p.MainWindowHandle -ne 0) { 'yes' } else { 'no' }`,
-        ], { timeout: 10_000 });
-        windowObserved = output === 'yes';
-        if (windowObserved && second >= 2) break;
-      }
     }
-    if (expectWindow && !windowObserved) throw new Error('Installed application did not show a native window.');
     return { processAlive: true, windowObserved, startupSeconds };
   } finally {
     if (running(child)) {

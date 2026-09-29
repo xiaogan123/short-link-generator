@@ -1,6 +1,6 @@
 [package]
 name = "short-link-generator"
-version = "0.1.2"
+version = "0.1.3"
 description = "短连接生成器"
 authors = ["Contributors"]
 edition = "2021"

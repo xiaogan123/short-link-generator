@@ -94,6 +94,14 @@ test('strict assembly checks source and artifact hashes and includes latest.json
       cwd: dir, encoding: 'utf8', env: { ...process.env, RELEASE_TAG: 'v0.1.1', RELEASE_SHA: sha, GITHUB_REPOSITORY: 'sample/short-link-generator' },
     });
     assert.equal(run().status, 0);
+    const windowsEvidence = join(dir, 'candidates', 'candidate-x86_64-pc-windows-msvc', 'native-smoke.json');
+    const passedWindowsEvidence = readFileSync(windowsEvidence, 'utf8');
+    rmSync(windowsEvidence);
+    assert.match(run().stderr, /Missing unique native startup evidence/);
+    put(windowsEvidence, JSON.stringify({ ...JSON.parse(passedWindowsEvidence), windowObserved: false }));
+    assert.match(run().stderr, /Native runner evidence is invalid/);
+    put(windowsEvidence, passedWindowsEvidence);
+    assert.equal(run().status, 0);
     const sums = readFileSync(join(dir, 'SHA256SUMS'), 'utf8');
     assert.match(sums, new RegExp(`${digest(join(dir, 'latest.json'))}  latest\\.json`));
     assert.equal(sums.includes('.sig'), false);
@@ -229,6 +237,10 @@ test('release workflow is manual, selective, and scans before one-day upload', (
   const scan = steps.findIndex(step => step.name?.includes('Inspect candidate'));
   const upload = steps.findIndex(step => step.uses?.startsWith('actions/upload-artifact@'));
   assert.ok(smoke >= 0 && scan > smoke && upload > scan);
+  assert.equal(steps.find(step => step.name === 'Build installers locally on native runner').id, 'package');
+  assert.equal(steps[scan].id, 'privacy');
+  assert.equal(steps[scan].if, "${{ !cancelled() && steps.package.outcome == 'success' }}");
+  assert.equal(steps[upload].if, "${{ !cancelled() && steps.privacy.outcome == 'success' }}");
   assert.equal(steps[upload].with['retention-days'], 1);
   assert.equal(existsSync('.github/workflows/release.yml'), true);
 });
