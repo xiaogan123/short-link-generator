@@ -1,4 +1,135 @@
 use crate::model::{DomainCheck, DomainCheckLevel};
+use serde_json::Value;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DnsRecordFingerprint {
+    pub id: String,
+    pub name: String,
+    pub record_type: String,
+    pub content: String,
+    pub proxied: bool,
+    pub proxiable: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DnsSnapshot {
+    Missing,
+    EnableProxy(Vec<DnsRecordFingerprint>),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DnsAssessment {
+    Ready,
+    Missing,
+    DnsOnly(Vec<DnsRecordFingerprint>),
+    Unsupported(String),
+    Conflict(String),
+}
+
+pub fn dns_fingerprint(items: &[Value], host: &str) -> Result<Vec<DnsRecordFingerprint>, String> {
+    let mut records = Vec::new();
+    for item in items
+        .iter()
+        .filter(|item| item["name"].as_str() == Some(host))
+    {
+        let id = item["id"].as_str().ok_or("DNS 记录缺少标识")?;
+        if id.is_empty()
+            || id.len() > 128
+            || !id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+        {
+            return Err("DNS 记录标识无效".into());
+        }
+        let record_type = item["type"].as_str().ok_or("DNS 记录缺少类型")?;
+        let content = item["content"].as_str().ok_or("DNS 记录缺少内容")?;
+        let proxied = item["proxied"].as_bool().unwrap_or(false);
+        let proxiable = item["proxiable"]
+            .as_bool()
+            .unwrap_or(matches!(record_type, "A" | "AAAA" | "CNAME"));
+        records.push(DnsRecordFingerprint {
+            id: id.to_owned(),
+            name: host.to_owned(),
+            record_type: record_type.to_owned(),
+            content: content.to_owned(),
+            proxied,
+            proxiable,
+        });
+    }
+    records.sort_by(|a, b| {
+        (&a.record_type, &a.id, &a.content).cmp(&(&b.record_type, &b.id, &b.content))
+    });
+    Ok(records)
+}
+
+pub fn assess_dns(records: &[DnsRecordFingerprint]) -> DnsAssessment {
+    if records.is_empty() {
+        return DnsAssessment::Missing;
+    }
+    if records.iter().any(|record| record.record_type == "NS") {
+        return DnsAssessment::Conflict("该主机名存在 NS 委派，不能由应用接管 DNS".into());
+    }
+    let address_records: Vec<_> = records
+        .iter()
+        .filter(|record| matches!(record.record_type.as_str(), "A" | "AAAA" | "CNAME"))
+        .collect();
+    if address_records.is_empty() {
+        return DnsAssessment::Unsupported(
+            "该主机名已有不可代理的 DNS 记录，应用不会添加或覆盖地址记录".into(),
+        );
+    }
+    let has_cname = address_records
+        .iter()
+        .any(|record| record.record_type == "CNAME");
+    if has_cname && address_records.len() != 1 {
+        return DnsAssessment::Conflict("同一主机名的 CNAME 与其他地址记录冲突".into());
+    }
+    if address_records.iter().any(|record| !record.proxiable) {
+        return DnsAssessment::Unsupported(
+            "云端标记至少一条地址记录不支持代理，应用不会强行修改".into(),
+        );
+    }
+    let pending: Vec<_> = address_records
+        .into_iter()
+        .filter(|record| !record.proxied)
+        .cloned()
+        .collect();
+    if pending.is_empty() {
+        DnsAssessment::Ready
+    } else {
+        DnsAssessment::DnsOnly(pending)
+    }
+}
+
+pub fn placeholder_conflict(all_records: &[Value], host: &str, zone_name: &str) -> Option<String> {
+    let host = host.trim_end_matches('.');
+    let zone_name = zone_name.trim_end_matches('.');
+    for item in all_records {
+        let Some(name) = item["name"].as_str().map(|name| name.trim_end_matches('.')) else {
+            return Some("DNS 区域记录格式无效，无法安全创建占位记录".into());
+        };
+        let Some(record_type) = item["type"].as_str() else {
+            return Some("DNS 区域记录格式无效，无法安全创建占位记录".into());
+        };
+        if name == host {
+            return Some("完整区域清单显示该主机名已有 DNS 记录，不能创建占位记录".into());
+        }
+        if record_type == "NS"
+            && name != zone_name
+            && (host == name || host.ends_with(&format!(".{name}")))
+        {
+            return Some(format!("{name} 存在 NS 子域委派，应用不会在其下创建记录"));
+        }
+        if let Some(suffix) = name.strip_prefix("*.") {
+            if host.ends_with(&format!(".{suffix}")) {
+                return Some(format!(
+                    "{name} 是覆盖该主机名的通配符记录，需先人工确认现有业务"
+                ));
+            }
+        }
+    }
+    None
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PathRiskSnapshot {
@@ -192,6 +323,72 @@ fn normalize_redirect(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn dns_record(
+        id: &str,
+        record_type: &str,
+        content: &str,
+        proxied: bool,
+        proxiable: bool,
+    ) -> Value {
+        serde_json::json!({
+            "id":id,
+            "name":"example.com",
+            "type":record_type,
+            "content":content,
+            "proxied":proxied,
+            "proxiable":proxiable
+        })
+    }
+
+    #[test]
+    fn dns_assessment_distinguishes_missing_grey_unsupported_and_conflict() {
+        assert_eq!(assess_dns(&[]), DnsAssessment::Missing);
+        let grey = dns_fingerprint(
+            &[dns_record("one", "A", "192.0.2.10", false, true)],
+            "example.com",
+        )
+        .unwrap();
+        assert!(matches!(assess_dns(&grey), DnsAssessment::DnsOnly(_)));
+        let unsupported = dns_fingerprint(
+            &[dns_record("one", "A", "192.0.2.10", false, false)],
+            "example.com",
+        )
+        .unwrap();
+        assert!(matches!(
+            assess_dns(&unsupported),
+            DnsAssessment::Unsupported(_)
+        ));
+        let conflict = dns_fingerprint(
+            &[
+                dns_record("one", "CNAME", "example.org", false, true),
+                dns_record("two", "A", "192.0.2.10", false, true),
+            ],
+            "example.com",
+        )
+        .unwrap();
+        assert!(matches!(assess_dns(&conflict), DnsAssessment::Conflict(_)));
+    }
+
+    #[test]
+    fn placeholder_guard_rejects_parent_delegation_and_wildcard() {
+        let delegated = vec![serde_json::json!({
+            "id":"ns-one","name":"child.example.com","type":"NS","content":"ns1.example.org"
+        })];
+        assert!(
+            placeholder_conflict(&delegated, "go.child.example.com", "example.com")
+                .unwrap()
+                .contains("NS")
+        );
+        let wildcard = vec![serde_json::json!({
+            "id":"wild-one","name":"*.example.com","type":"A","content":"192.0.2.20"
+        })];
+        assert!(
+            placeholder_conflict(&wildcard, "go.example.com", "example.com")
+                .unwrap()
+                .contains("通配符")
+        );
+    }
 
     #[test]
     fn only_404_is_a_path_pass() {

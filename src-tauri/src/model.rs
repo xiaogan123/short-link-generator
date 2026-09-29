@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 pub struct Account {
     pub id: String,
     pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cloudflare_name: Option<String>,
     pub zone_count: usize,
     pub checked_at: Option<String>,
     pub has_resources: bool,
@@ -26,6 +28,8 @@ pub struct Account {
 pub struct AccountView {
     pub id: String,
     pub label: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cloudflare_name: Option<String>,
     pub zone_count: usize,
     pub checked_at: Option<String>,
     pub has_resources: bool,
@@ -33,6 +37,7 @@ pub struct AccountView {
     pub monitor_enabled: bool,
     pub monitor_endpoint: Option<String>,
     pub needs_monitor_key: bool,
+    pub zones: Vec<ZoneView>,
 }
 
 impl From<&Account> for AccountView {
@@ -40,6 +45,7 @@ impl From<&Account> for AccountView {
         Self {
             id: a.id.clone(),
             label: a.label.clone(),
+            cloudflare_name: a.cloudflare_name.clone(),
             zone_count: a.zone_count,
             checked_at: a.checked_at.clone(),
             has_resources: a.has_resources,
@@ -47,6 +53,25 @@ impl From<&Account> for AccountView {
             monitor_enabled: a.monitor_enabled,
             monitor_endpoint: a.monitor_endpoint.clone(),
             needs_monitor_key: a.needs_monitor_key,
+            zones: a.zones.iter().map(ZoneView::from).collect(),
+        }
+    }
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ZoneView {
+    pub id: String,
+    pub name: String,
+    pub status: String,
+}
+
+impl From<&Zone> for ZoneView {
+    fn from(zone: &Zone) -> Self {
+        Self {
+            id: zone.id.clone(),
+            name: zone.name.clone(),
+            status: zone.status.clone(),
         }
     }
 }
@@ -292,6 +317,12 @@ pub enum PlanKind {
         path_risk: crate::domain_check::PathRiskSnapshot,
         requires_takeover_confirmation: bool,
     },
+    DomainDns {
+        account_id: String,
+        zone_id: String,
+        host: String,
+        snapshot: crate::domain_check::DnsSnapshot,
+    },
     SaveLink {
         domain_id: String,
         slug: String,
@@ -309,7 +340,7 @@ pub enum PlanKind {
     EnableMonitor {
         account_id: String,
         endpoint: String,
-        secret: String,
+        secret: zeroize::Zeroizing<String>,
     },
     DisableMonitor {
         account_id: String,
@@ -358,4 +389,52 @@ pub struct DomainPreparation {
     pub can_apply: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub plan: Option<PlanView>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DnsActionView {
+    pub kind: String,
+    pub record_type: String,
+    pub name: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DomainDnsPreparation {
+    pub host: String,
+    pub candidates: Vec<Candidate>,
+    pub checks: Vec<DomainCheck>,
+    pub dns_status: String,
+    pub actions: Vec<DnsActionView>,
+    pub can_apply: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plan: Option<PlanView>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_account_loads_and_state_exposes_only_safe_zone_fields() {
+        let account: Account = serde_json::from_value(serde_json::json!({
+            "id":"acct-example",
+            "label":"自定义备注",
+            "zoneCount":1,
+            "checkedAt":null,
+            "hasResources":false,
+            "needsSelftestKey":false,
+            "zones":[{"id":"zone-example","name":"example.com","status":"active","account_id":"acct-example"}]
+        }))
+        .unwrap();
+        assert_eq!(account.cloudflare_name, None);
+        assert_eq!(account.label, "自定义备注");
+        let value = serde_json::to_value(AccountView::from(&account)).unwrap();
+        assert!(value.get("cloudflareName").is_none());
+        assert_eq!(value["zones"][0]["id"], "zone-example");
+        assert_eq!(value["zones"][0]["name"], "example.com");
+        assert_eq!(value["zones"][0]["status"], "active");
+        assert!(value["zones"][0].get("accountId").is_none());
+    }
 }

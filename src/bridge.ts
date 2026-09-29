@@ -7,8 +7,8 @@ const now = () => new Date().toISOString();
 const uid = () => Math.random().toString(36).slice(2, 10);
 const demoState: State = {
   accounts: [
-    { id: 'demo-a', label: '示例账户 · 团队', zoneCount: 2, checkedAt: now(), hasResources: true, needsSelftestKey: false },
-    { id: 'demo-b', label: '示例账户 · 个人', zoneCount: 1, checkedAt: now(), hasResources: false, needsSelftestKey: true },
+    { id: 'demo-a', label: '示例账户 · 团队', cloudflareName: 'Example team', zones: [{id:'demo-zone-1',name:'example.com',status:'active'},{id:'demo-zone-2',name:'example.org',status:'active'}], zoneCount: 2, checkedAt: now(), hasResources: true, needsSelftestKey: false },
+    { id: 'demo-b', label: '示例账户 · 个人', cloudflareName: 'Example personal', zones: [{id:'demo-zone-3',name:'example.net',status:'active'}], zoneCount: 1, checkedAt: now(), hasResources: false, needsSelftestKey: true },
   ],
   domains: [
     { id: 'demo-d1', accountId: 'demo-a', zoneId: 'demo-zone-1', host: 'go.example.com', prefix: 'r', routeId: 'demo-route-1' },
@@ -71,6 +71,16 @@ function previewDispatch(action: Action, payload: Record<string, unknown>): unkn
     const confirmation = needsTakeover ? `确认将 ${host}/${prefix}/ 及其所有下级内容改作短链接。原该目录内网页将不能继续按原方式访问。` : undefined;
     const plan = candidate && !isManaged ? makePlan(`添加 ${host}`, [`在 ${candidate.label} 上配置 ${host}/${prefix}/*`, '保存域名与路由关系'], ['本地预览使用示例数据，不会连接云服务。'], 'add_domain', { host, prefix, accountId: candidate.accountId, zoneId: candidate.zoneId }, confirmation) : undefined;
     return { host, prefix, candidates, checks, canApply: Boolean(plan), plan } satisfies DomainPreparation;
+  }
+  if (action === 'prepare_domain_dns') {
+    const host = normalizeHost(String(payload.input || ''));
+    const candidates = local.accounts.filter(a => !payload.accountId || a.id === payload.accountId).flatMap(a => (a.zones || []).filter(zone => zone.status === 'active' && (host === zone.name || host.endsWith(`.${zone.name}`))).map(zone => ({accountId:a.id,label:a.label,zoneId:zone.id,status:zone.status})));
+    const selected = candidates.length === 1 ? candidates[0] : undefined;
+    const status = host.startsWith('missing.') ? 'missing' : host.startsWith('grey.') ? 'dnsOnly' : 'ready';
+    const actions = status === 'missing' ? [{kind:'createPlaceholder' as const,recordType:'AAAA',name:host}] : status === 'dnsOnly' ? [{kind:'enableProxy' as const,recordType:'A',name:host}] : [];
+    const checks = status === 'ready' ? [{label:'DNS 与代理',ok:true,level:'pass' as const,message:'示例数据：当前主机已使用代理。'}] : status === 'missing' ? [{label:'DNS 记录',ok:false,level:'error' as const,message:'示例数据：精确主机名没有 DNS 记录。可创建一条代理 AAAA 占位记录。'}] : [{label:'DNS 代理',ok:false,level:'error' as const,message:'示例数据：精确主机名的记录未启用代理。可保持记录内容不变，只开启代理。'}];
+    const plan = selected && status !== 'ready' ? makePlan(`修复 ${host} 的 DNS 与代理`, actions.map(item => item.kind === 'createPlaceholder' ? `为 ${item.name} 创建代理 ${item.recordType} 占位记录` : `为 ${item.name} 的 ${item.recordType} 记录开启代理`), ['这只修改此精确主机名的 DNS/代理状态，不会接入短链接目录。'], 'fix_domain_dns', {host,accountId:selected.accountId,zoneId:selected.zoneId}) : undefined;
+    return {host,candidates,checks,dnsStatus:status,actions,canApply:Boolean(plan),plan};
   }
   if (action === 'prepare_change') {
     const kind = String(payload.kind);

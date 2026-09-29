@@ -214,6 +214,10 @@ impl Cloud {
         self.send(token, Method::PUT, path, Some(body)).await
     }
 
+    pub async fn patch(&self, token: &str, path: &str, body: Value) -> CloudResult<Value> {
+        self.send(token, Method::PATCH, path, Some(body)).await
+    }
+
     pub async fn delete(&self, token: &str, path: &str) -> CloudResult<Value> {
         self.send(token, Method::DELETE, path, None).await
     }

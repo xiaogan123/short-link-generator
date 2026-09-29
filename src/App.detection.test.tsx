@@ -28,8 +28,8 @@ describe('visible local detection provenance',()=>{
     fireEvent.click(screen.getByRole('button',{name:'检测 sample'}));
     const dialog=await screen.findByRole('dialog',{name:'链接检测'});
     expect(within(dialog).getAllByText(new RegExp(message)).length).toBeGreaterThan(0);
-    expect(within(dialog).getAllByText(/来源：本机直连/)).toHaveLength(2);
-    expect(within(dialog).getByText(/不经过系统代理；与开启代理的浏览器结果可能不同，也不能证明中国大陆网络可达/)).toBeTruthy();
+    expect(within(dialog).getAllByText(/来源：本机网络/)).toHaveLength(2);
+    expect(within(dialog).getByText(/VPN、TUN 和网络策略仍会影响结果；未开启大陆监测时不能代表中国大陆网络/)).toBeTruthy();
     fireEvent.click(within(dialog).getByRole('button',{name:'完成'}));
     const row=screen.getByText(label,{exact:false});
     expect(row.classList.contains(tone)).toBe(true);

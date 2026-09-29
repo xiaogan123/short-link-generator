@@ -3,6 +3,7 @@ mod domain_check;
 mod local_check;
 mod model;
 mod pools;
+mod secret_store;
 
 use chrono::Utc;
 use cloud::{Cloud, CloudError};
@@ -10,9 +11,9 @@ use domain_check::PathRiskSnapshot;
 use futures_util::StreamExt;
 use hmac::{Hmac, Mac};
 use model::{
-    Account, Candidate, Check, Database, Domain, DomainCheck, DomainCheckLevel, DomainPreparation,
-    Link, PendingMonitorChange, PendingPoolChange, Plan, PlanKind, PlanView, Pool, PoolSyncStatus,
-    Resources, State, Zone,
+    Account, Candidate, Check, Database, DnsActionView, Domain, DomainCheck, DomainCheckLevel,
+    DomainDnsPreparation, DomainPreparation, Link, PendingMonitorChange, PendingPoolChange, Plan,
+    PlanKind, PlanView, Pool, PoolSyncStatus, Resources, State, Zone,
 };
 use rand::{distributions::Alphanumeric, Rng, RngCore};
 use serde_json::{json, Value};
@@ -26,9 +27,8 @@ use std::{
 use tauri::Manager;
 use tauri_plugin_updater::UpdaterExt;
 use tokio::sync::Mutex;
+use zeroize::Zeroizing;
 
-#[cfg(not(test))]
-const KEYRING_SERVICE: &str = "org.shortlink.generator";
 const MANIFEST_KEY: &str = "m:config";
 const SCHEMA: u32 = 1;
 fn bundled_source_hash() -> String {
@@ -59,13 +59,13 @@ struct SelftestSnapshot {
     url: String,
     cn_url: String,
     default_url: String,
-    key: Vec<u8>,
-    pool: Option<(Pool, String, String, String, String)>,
+    key: Zeroizing<Vec<u8>>,
+    pool: Option<(Pool, String, String, String, Zeroizing<String>)>,
 }
 
 struct HealthSnapshot {
     pool: Pool,
-    accounts: Vec<(String, String, String, bool)>,
+    accounts: Vec<(String, Zeroizing<String>, String, bool)>,
     cloud: Cloud,
 }
 
@@ -77,6 +77,13 @@ struct DomainTakeover<'a> {
 
 fn problem(error: CloudError) -> String {
     error.message
+}
+fn dns_write_error(error: CloudError) -> String {
+    if error.message.contains("HTTP 403") {
+        "当前令牌没有 DNS 编辑权限；请在账号管理中更新令牌。其他只读与现有功能仍可继续使用。".into()
+    } else {
+        error.message
+    }
 }
 fn now() -> String {
     Utc::now().to_rfc3339()
@@ -107,10 +114,7 @@ fn keyring_get(id: &str, kind: &str) -> Result<String, String> {
     }
     #[cfg(not(test))]
     {
-        keyring::Entry::new(KEYRING_SERVICE, &format!("{kind}:{id}"))
-            .map_err(|_| "系统凭据库不可用".to_string())?
-            .get_password()
-            .map_err(|_| "系统凭据库中找不到所需密钥".to_string())
+        secret_store::get(id, kind).map_err(|error| error.to_string())
     }
 }
 fn keyring_set(id: &str, kind: &str, value: &str) -> Result<(), String> {
@@ -124,10 +128,7 @@ fn keyring_set(id: &str, kind: &str, value: &str) -> Result<(), String> {
     }
     #[cfg(not(test))]
     {
-        keyring::Entry::new(KEYRING_SERVICE, &format!("{kind}:{id}"))
-            .map_err(|_| "系统凭据库不可用".to_string())?
-            .set_password(value)
-            .map_err(|_| "无法写入系统凭据库".to_string())
+        secret_store::set(id, kind, value).map_err(|error| error.to_string())
     }
 }
 fn keyring_delete(id: &str, kind: &str) -> Result<(), String> {
@@ -141,14 +142,33 @@ fn keyring_delete(id: &str, kind: &str) -> Result<(), String> {
     }
     #[cfg(not(test))]
     {
-        let entry = keyring::Entry::new(KEYRING_SERVICE, &format!("{kind}:{id}"))
-            .map_err(|_| "系统凭据库不可用".to_string())?;
-        match entry.delete_credential() {
-            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-            Err(_) => Err("无法从系统凭据库删除凭据".to_string()),
+        secret_store::delete(id, kind).map_err(|error| error.to_string())
+    }
+}
+fn keyring_get_optional(id: &str, kind: &str) -> Result<Option<String>, String> {
+    #[cfg(test)]
+    {
+        Ok(mock_keys()
+            .lock()
+            .expect("test key store")
+            .get(&format!("{kind}:{id}"))
+            .cloned())
+    }
+    #[cfg(not(test))]
+    {
+        match secret_store::get(id, kind) {
+            Ok(value) => Ok(Some(value)),
+            Err(secret_store::SecretError::Missing) => Ok(None),
+            Err(error) => Err(error.to_string()),
         }
     }
 }
+
+fn clear_credential_cache() {
+    #[cfg(not(test))]
+    secret_store::clear_all();
+}
+
 #[cfg(test)]
 fn mock_keys() -> &'static std::sync::Mutex<std::collections::HashMap<String, String>> {
     static KEYS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, String>>> =
@@ -517,14 +537,45 @@ impl Backend {
         self.persist()?;
         Ok(note)
     }
+    fn journal_end_dns(&mut self, host: &str, current: &str) -> Result<(), String> {
+        let prefix = format!("修复 DNS {host} (");
+        let before = self.db.pending_operations.clone();
+        self.db
+            .pending_operations
+            .retain(|entry| !journal_matches(entry, current) && !entry.starts_with(&prefix));
+        if let Err(error) = self.persist() {
+            self.db.pending_operations = before;
+            return Err(error);
+        }
+        Ok(())
+    }
 
-    async fn import_token(&mut self, token: &str, replace: bool) -> Result<Value, String> {
+    async fn import_token(
+        &mut self,
+        token: &str,
+        replace: bool,
+        expected_account_id: Option<&str>,
+    ) -> Result<Value, String> {
         if !(35..=100).contains(&token.len())
             || !token
                 .bytes()
                 .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
         {
             return Err("令牌格式不像 Cloudflare API 令牌".into());
+        }
+        if let Some(expected) = expected_account_id {
+            if !replace {
+                return Err("更新指定账号的访问令牌时必须确认替换".into());
+            }
+            if !valid_id(expected)
+                || self
+                    .db
+                    .accounts
+                    .iter()
+                    .all(|account| account.id != expected)
+            {
+                return Err("找不到要更新访问令牌的账号".into());
+            }
         }
         let verify = self
             .cloud
@@ -542,11 +593,25 @@ impl Backend {
         if accounts.is_empty() {
             return Err("令牌未列出任何可用账号".into());
         }
+        if let Some(expected) = expected_account_id {
+            if !accounts
+                .iter()
+                .any(|account| account["id"].as_str() == Some(expected))
+            {
+                return Err("这个访问令牌不属于所选账号，请为该账号创建并粘贴新令牌".into());
+            }
+        }
         let mut imported = Vec::new();
-        for remote in accounts {
+        for remote in accounts.into_iter().filter(|account| {
+            expected_account_id.is_none_or(|expected| account["id"].as_str() == Some(expected))
+        }) {
             let id = value_str(&remote, "id")?.to_owned();
+            let cloudflare_name = value_str(&remote, "name")?.trim().to_owned();
             if !valid_id(&id) {
                 return Err("云端账号标识无效".into());
+            }
+            if cloudflare_name.is_empty() || cloudflare_name.chars().count() > 256 {
+                return Err("云端账号名称无效".into());
             }
             if self.db.accounts.iter().any(|a| a.id == id) && !replace {
                 return Err("这个账号已经导入过；若要换令牌，请确认替换".into());
@@ -566,20 +631,22 @@ impl Backend {
                     .await
                     .map_err(|_| "令牌缺少 Workers 路由读取权限".to_string())?;
             }
-            imported.push((id, zones));
+            imported.push((id, cloudflare_name, zones));
         }
         // Validate every account before changing credentials or local state.
-        for (id, zones) in imported {
+        for (id, cloudflare_name, zones) in imported {
             keyring_set(&id, "token", token)?;
             if let Some(account) = self.db.accounts.iter_mut().find(|a| a.id == id) {
+                account.cloudflare_name = Some(cloudflare_name);
                 account.zone_count = zones.len();
                 account.zones = zones;
                 account.checked_at = Some(now());
             } else {
-                let count = self.db.accounts.len() + 1;
+                let label: String = cloudflare_name.chars().take(64).collect();
                 self.db.accounts.push(Account {
                     id,
-                    label: format!("账号 {count}"),
+                    label,
+                    cloudflare_name: Some(cloudflare_name),
                     zone_count: zones.len(),
                     checked_at: Some(now()),
                     has_resources: false,
@@ -618,7 +685,17 @@ impl Backend {
         for i in 0..self.db.accounts.len() {
             let id = self.db.accounts[i].id.clone();
             let token = keyring_get(&id, "token")?;
+            let account = self
+                .cloud
+                .get(&token, &format!("accounts/{id}"))
+                .await
+                .map_err(problem)?;
+            let cloudflare_name = value_str(&account["result"], "name")?.trim().to_owned();
+            if cloudflare_name.is_empty() || cloudflare_name.chars().count() > 256 {
+                return Err("云端账号名称无效".into());
+            }
             let zones = self.fetch_zones(&token, &id).await?;
+            self.db.accounts[i].cloudflare_name = Some(cloudflare_name);
             self.db.accounts[i].zone_count = zones.len();
             self.db.accounts[i].zones = zones;
             self.db.accounts[i].checked_at = Some(now());
@@ -653,6 +730,252 @@ impl Backend {
         let max = all.iter().map(|(n, _)| *n).max().unwrap_or(0);
         all.retain(|(n, _)| *n == max);
         all.into_iter().map(|(_, c)| c).collect()
+    }
+
+    async fn confirmed_zone_token(
+        &self,
+        account_id: &str,
+        zone_id: &str,
+        host: &str,
+    ) -> Result<(String, String), String> {
+        let account = self.account(account_id)?;
+        let zone = account
+            .zones
+            .iter()
+            .find(|zone| {
+                zone.id == zone_id
+                    && zone.status == "active"
+                    && (host == zone.name || host.ends_with(&format!(".{}", zone.name)))
+            })
+            .ok_or("域名所属区域未启用，或不属于此账号")?;
+        let token = keyring_get(account_id, "token")?;
+        let remote = self
+            .cloud
+            .get(&token, &format!("zones/{zone_id}"))
+            .await
+            .map_err(problem)?;
+        if remote["result"]["status"] != "active"
+            || remote["result"]["id"].as_str() != Some(zone_id)
+            || remote["result"]["account"]["id"].as_str() != Some(account_id)
+        {
+            return Err("无法确认域名所属区域已启用且归属此账号".into());
+        }
+        Ok((token, zone.name.clone()))
+    }
+
+    async fn exact_dns_records(
+        &self,
+        token: &str,
+        zone_id: &str,
+        host: &str,
+    ) -> Result<Vec<domain_check::DnsRecordFingerprint>, String> {
+        let path = format!("zones/{zone_id}/dns_records?name={}", cloud::encode(host));
+        let items = self.cloud.list_pages(token, &path).await.map_err(problem)?;
+        domain_check::dns_fingerprint(&items, host)
+    }
+
+    async fn placeholder_is_safe(
+        &self,
+        token: &str,
+        zone_id: &str,
+        zone_name: &str,
+        host: &str,
+    ) -> Result<(), String> {
+        let all = self
+            .cloud
+            .list_pages(token, &format!("zones/{zone_id}/dns_records"))
+            .await
+            .map_err(problem)?;
+        if let Some(message) = domain_check::placeholder_conflict(&all, host, zone_name) {
+            return Err(message);
+        }
+        Ok(())
+    }
+
+    async fn prepare_domain_dns(&mut self, payload: &Value) -> Result<Value, String> {
+        let host = normalize_host(field(payload, "input")?)?;
+        let candidates = self.candidates(&host);
+        let choice = payload["accountId"].as_str();
+        let selected = if candidates.len() == 1 && choice.is_none() {
+            candidates.first()
+        } else {
+            choice.and_then(|id| {
+                candidates
+                    .iter()
+                    .find(|candidate| candidate.account_id == id)
+            })
+        };
+        let mut checks = Vec::new();
+        let mut dns_status = "conflict".to_string();
+        let mut actions = Vec::new();
+        let mut plan = None;
+        if candidates.is_empty() {
+            checks.push(domain_check::hard_check(
+                "域名归属",
+                false,
+                "已导入的账号均不管理这个域名",
+            ));
+        } else if selected.is_none() {
+            checks.push(domain_check::hard_check(
+                "账号选择",
+                false,
+                "请选择此域名所属的账号",
+            ));
+        } else if let Some(candidate) = selected {
+            match self
+                .confirmed_zone_token(&candidate.account_id, &candidate.zone_id, &host)
+                .await
+            {
+                Err(message) => {
+                    checks.push(domain_check::hard_check("云端域名归属", false, message));
+                }
+                Ok((token, zone_name)) => {
+                    checks.push(domain_check::hard_check(
+                        "云端域名归属",
+                        true,
+                        "云端确认域名所属区域已启用",
+                    ));
+                    match self
+                        .exact_dns_records(&token, &candidate.zone_id, &host)
+                        .await
+                    {
+                        Err(message) => {
+                            dns_status = "readFailed".into();
+                            checks.push(domain_check::hard_check(
+                                "DNS",
+                                false,
+                                format!("无法读取 DNS 记录：{message}"),
+                            ));
+                        }
+                        Ok(records) => match domain_check::assess_dns(&records) {
+                            domain_check::DnsAssessment::Ready => {
+                                // A prior request may have succeeded despite a lost response.
+                                // Current ownership and DNS were just read from the provider;
+                                // resolve only this host's local note, without another write.
+                                let prefix = format!("修复 DNS {host} (");
+                                if self
+                                    .db
+                                    .pending_operations
+                                    .iter()
+                                    .any(|entry| entry.starts_with(&prefix))
+                                {
+                                    self.journal_end_dns(&host, "")?;
+                                }
+                                dns_status = "ready".into();
+                                checks.push(domain_check::hard_check(
+                                    "DNS",
+                                    true,
+                                    "该主机名的地址记录均已通过 Cloudflare 代理，无需修复",
+                                ));
+                            }
+                            domain_check::DnsAssessment::Missing => {
+                                match self
+                                    .placeholder_is_safe(
+                                        &token,
+                                        &candidate.zone_id,
+                                        &zone_name,
+                                        &host,
+                                    )
+                                    .await
+                                {
+                                    Ok(()) => {
+                                        dns_status = "missing".into();
+                                        checks.push(DomainCheck {
+                                            label: "DNS".into(),
+                                            ok: true,
+                                            message: "该主机名没有 DNS 记录；可确认后创建 Worker 专用橙云占位记录".into(),
+                                            level: DomainCheckLevel::Warning,
+                                        });
+                                        actions.push(DnsActionView {
+                                            kind: "createPlaceholder".into(),
+                                            record_type: "AAAA".into(),
+                                            name: host.clone(),
+                                        });
+                                        plan = Some(self.make_plan(
+                                            "创建 Worker DNS 占位记录",
+                                            vec![format!(
+                                                "仅在 {host} 仍无任何 DNS 记录且无通配符或 NS 子域委派时，创建 AAAA 记录 100:: 并开启 Cloudflare 代理"
+                                            )],
+                                            vec![format!(
+                                                "此操作会让 {host} 整个主机名的 HTTP/HTTPS 流量进入 Cloudflare；不会修改其他主机名、邮件记录或已有记录，完成后仍需单独添加短链接目录"
+                                            )],
+                                            PlanKind::DomainDns {
+                                                account_id: candidate.account_id.clone(),
+                                                zone_id: candidate.zone_id.clone(),
+                                                host: host.clone(),
+                                                snapshot: domain_check::DnsSnapshot::Missing,
+                                            },
+                                        ));
+                                    }
+                                    Err(message) => {
+                                        dns_status = "conflict".into();
+                                        checks
+                                            .push(domain_check::hard_check("DNS", false, message));
+                                    }
+                                }
+                            }
+                            domain_check::DnsAssessment::DnsOnly(pending) => {
+                                dns_status = "dnsOnly".into();
+                                checks.push(DomainCheck {
+                                    label: "DNS".into(),
+                                    ok: true,
+                                    message: format!(
+                                        "该主机名有 {} 条可代理地址记录尚未开启 Cloudflare 代理",
+                                        pending.len()
+                                    ),
+                                    level: DomainCheckLevel::Warning,
+                                });
+                                actions.extend(pending.iter().map(|record| DnsActionView {
+                                    kind: "enableProxy".into(),
+                                    record_type: record.record_type.clone(),
+                                    name: host.clone(),
+                                }));
+                                let steps = pending
+                                    .iter()
+                                    .map(|record| {
+                                        format!(
+                                            "仅为 {host} 的 {} 记录开启 Cloudflare 代理，保留现有记录内容",
+                                            record.record_type
+                                        )
+                                    })
+                                    .collect();
+                                plan = Some(self.make_plan(
+                                    "开启现有 DNS 记录代理",
+                                    steps,
+                                    vec![format!(
+                                        "此操作会让 {host} 整个主机名的 HTTP/HTTPS 流量进入 Cloudflare；不会更改记录内容、邮件记录或其他主机名，完成后仍需单独添加短链接目录"
+                                    )],
+                                    PlanKind::DomainDns {
+                                        account_id: candidate.account_id.clone(),
+                                        zone_id: candidate.zone_id.clone(),
+                                        host: host.clone(),
+                                        snapshot: domain_check::DnsSnapshot::EnableProxy(records),
+                                    },
+                                ));
+                            }
+                            domain_check::DnsAssessment::Unsupported(message) => {
+                                dns_status = "unsupported".into();
+                                checks.push(domain_check::hard_check("DNS", false, message));
+                            }
+                            domain_check::DnsAssessment::Conflict(message) => {
+                                dns_status = "conflict".into();
+                                checks.push(domain_check::hard_check("DNS", false, message));
+                            }
+                        },
+                    }
+                }
+            }
+        }
+        Ok(serde_json::to_value(DomainDnsPreparation {
+            host,
+            candidates,
+            checks,
+            dns_status,
+            actions,
+            can_apply: plan.is_some(),
+            plan,
+        })
+        .unwrap_or(Value::Null))
     }
 
     async fn preflight(
@@ -718,22 +1041,32 @@ impl Backend {
             Ok(items) => {
                 let exact: Vec<_> = items
                     .iter()
-                    .filter(|r| {
-                        r["name"].as_str() == Some(host)
-                            && matches!(r["type"].as_str(), Some("A" | "AAAA" | "CNAME"))
+                    .filter(|record| record["name"].as_str() == Some(host))
+                    .collect();
+                let address: Vec<_> = exact
+                    .iter()
+                    .filter(|record| {
+                        matches!(record["type"].as_str(), Some("A" | "AAAA" | "CNAME"))
                     })
                     .collect();
-                let ok = !exact.is_empty() && exact.iter().all(|r| r["proxied"] == true);
+                let unsupported = address.iter().any(|record| record["proxiable"] == false);
+                let ok = !address.is_empty()
+                    && !unsupported
+                    && address.iter().all(|record| record["proxied"] == true);
                 (
                     ok,
                     if ok {
                         "DNS 已代理"
+                    } else if exact.is_empty() {
+                        "该主机名缺少 DNS 记录；可先准备 DNS 修复计划"
+                    } else if address.is_empty() || unsupported {
+                        "该主机名的现有记录不支持 Cloudflare 代理，不能自动接入"
                     } else {
-                        "该主机名没有可用于访问的 DNS 记录，或其中有未代理的记录"
+                        "该主机名有地址记录尚未开启 Cloudflare 代理；可先准备 DNS 修复计划"
                     },
                 )
             }
-            Err(_) => (false, "无法读取 DNS 记录"),
+            Err(_) => (false, "无法读取 DNS 记录；未确认当前状态，不能准备接入计划"),
         };
         checks.push(domain_check::hard_check("DNS", ok, message));
         let routes = self
@@ -910,7 +1243,7 @@ impl Backend {
             {"key":"workers_kv_storage","type":"edit"},
             {"key":"workers_routes","type":"edit"},
             {"key":"zone","type":"read"},
-            {"key":"dns","type":"read"},
+            {"key":"dns","type":"edit"},
             {"key":"account_settings","type":"read"}
         ]);
         format!(
@@ -1208,9 +1541,15 @@ impl Backend {
             "get_state" => Ok(self.state()),
             "token_template" => Ok(Value::String(Self::token_template())),
             "import_token" => {
+                let expected_account_id = match payload.get("expectedAccountId") {
+                    None | Some(Value::Null) => None,
+                    Some(Value::String(value)) if !value.is_empty() => Some(value.as_str()),
+                    _ => return Err("指定账号标识无效".into()),
+                };
                 self.import_token(
                     field(payload, "token")?,
                     payload["replace"].as_bool().unwrap_or(false),
+                    expected_account_id,
                 )
                 .await
             }
@@ -1269,6 +1608,7 @@ impl Backend {
             }
             "refresh_accounts" => self.refresh_accounts().await,
             "prepare_domain" => self.prepare_domain(payload).await,
+            "prepare_domain_dns" => self.prepare_domain_dns(payload).await,
             "prepare_change" => self.prepare_change(payload),
             "prepare_monitor" => {
                 let account_id = field(payload, "accountId")?.to_owned();
@@ -1342,7 +1682,7 @@ impl Backend {
                     PlanKind::EnableMonitor {
                         account_id,
                         endpoint,
-                        secret,
+                        secret: Zeroizing::new(secret),
                     },
                 );
                 serde_json::to_value(view).map_err(|_| "无法建立监测计划".into())
@@ -1385,7 +1725,7 @@ impl Backend {
                     PlanKind::EnableMonitor {
                         account_id: account_id.into(),
                         endpoint: pending.endpoint,
-                        secret: keyring_get(account_id, "probe")?,
+                        secret: Zeroizing::new(keyring_get(account_id, "probe")?),
                     }
                 } else {
                     PlanKind::DisableMonitor {
@@ -1427,6 +1767,202 @@ impl Backend {
             "install_update" => self.check_update(true).await,
             _ => Err("不支持此操作".into()),
         }
+    }
+
+    async fn apply_domain_dns(
+        &mut self,
+        account_id: &str,
+        zone_id: &str,
+        host: &str,
+        snapshot: domain_check::DnsSnapshot,
+    ) -> Result<(), String> {
+        let (token, zone_name) = self.confirmed_zone_token(account_id, zone_id, host).await?;
+        let current = self.exact_dns_records(&token, zone_id, host).await?;
+        match &snapshot {
+            domain_check::DnsSnapshot::Missing => {
+                if !current.is_empty() {
+                    return Err("DNS 记录已变化，请重新准备修复计划".into());
+                }
+                self.placeholder_is_safe(&token, zone_id, &zone_name, host)
+                    .await?;
+            }
+            domain_check::DnsSnapshot::EnableProxy(expected) => {
+                if &current != expected {
+                    return Err("DNS 记录已变化，请重新准备修复计划".into());
+                }
+                if !matches!(
+                    domain_check::assess_dns(&current),
+                    domain_check::DnsAssessment::DnsOnly(_)
+                ) {
+                    return Err("DNS 代理状态已变化，请重新准备修复计划".into());
+                }
+            }
+        }
+
+        let journal = format!("修复 DNS {host} ({})", random_id());
+        self.journal_start(&journal)?;
+        match snapshot {
+            domain_check::DnsSnapshot::Missing => {
+                let result = self
+                    .cloud
+                    .post(
+                        &token,
+                        &format!("zones/{zone_id}/dns_records"),
+                        json!({"type":"AAAA","name":host,"content":"100::","ttl":1,"proxied":true}),
+                    )
+                    .await;
+                let response = match result {
+                    Ok(value) => value,
+                    Err(error) => {
+                        if error.uncertain {
+                            self.journal_note(
+                                &journal,
+                                "创建占位记录的结果不确定，请重新读取 DNS 后处理",
+                            )?;
+                        } else {
+                            self.journal_end(&journal)?;
+                        }
+                        return Err(dns_write_error(error));
+                    }
+                };
+                let result = &response["result"];
+                if result["name"].as_str() != Some(host)
+                    || result["type"] != "AAAA"
+                    || result["content"] != "100::"
+                    || result["proxied"] != true
+                {
+                    self.journal_note(
+                        &journal,
+                        "占位记录已提交但响应无法核实，请重新读取 DNS 后处理",
+                    )?;
+                    return Err("DNS 占位记录已提交，但云端响应无法核实；请检查待处理操作".into());
+                }
+                self.journal_end_dns(host, &journal)?;
+            }
+            domain_check::DnsSnapshot::EnableProxy(expected) => {
+                let pending: Vec<_> = expected
+                    .into_iter()
+                    .filter(|record| {
+                        matches!(record.record_type.as_str(), "A" | "AAAA" | "CNAME")
+                            && !record.proxied
+                    })
+                    .collect();
+                let total = pending.len();
+                for (index, record) in pending.iter().enumerate() {
+                    let latest = self
+                        .cloud
+                        .get(
+                            &token,
+                            &format!("zones/{zone_id}/dns_records/{}", record.id),
+                        )
+                        .await;
+                    let latest = match latest {
+                        Ok(value) => value,
+                        Err(error) => {
+                            if index == 0 {
+                                self.journal_end(&journal)?;
+                            } else {
+                                self.journal_note(
+                                    &journal,
+                                    &format!("已开启 {index}/{total} 条记录，读取后续记录失败；请重新准备计划"),
+                                )?;
+                            }
+                            return Err(problem(error));
+                        }
+                    };
+                    let fingerprint = match domain_check::dns_fingerprint(
+                        &[latest["result"].clone()],
+                        host,
+                    ) {
+                        Ok(value) => value,
+                        Err(message) => {
+                            if index == 0 {
+                                self.journal_end(&journal)?;
+                            } else {
+                                self.journal_note(
+                                    &journal,
+                                    &format!("已开启 {index}/{total} 条记录，后续记录响应无效；请重新准备计划"),
+                                )?;
+                            }
+                            return Err(message);
+                        }
+                    };
+                    if fingerprint.len() != 1 || fingerprint[0] != *record {
+                        if index == 0 {
+                            self.journal_end(&journal)?;
+                        } else {
+                            self.journal_note(
+                                &journal,
+                                &format!("已开启 {index}/{total} 条记录，后续记录状态变化；请重新准备计划完成其余记录"),
+                            )?;
+                        }
+                        return Err("DNS 记录在应用过程中发生变化；已完成的代理设置保持不变，请重新准备计划".into());
+                    }
+                    let result = self
+                        .cloud
+                        .patch(
+                            &token,
+                            &format!("zones/{zone_id}/dns_records/{}", record.id),
+                            json!({"proxied":true}),
+                        )
+                        .await;
+                    let response = match result {
+                        Ok(value) => value,
+                        Err(error) => {
+                            if error.uncertain || index > 0 {
+                                self.journal_note(
+                                    &journal,
+                                    &format!("已开启 {index}/{total} 条记录，后续写入失败或结果不确定；请重新读取 DNS 后完成其余记录"),
+                                )?;
+                            } else {
+                                self.journal_end(&journal)?;
+                            }
+                            return Err(dns_write_error(error));
+                        }
+                    };
+                    let updated =
+                        match domain_check::dns_fingerprint(&[response["result"].clone()], host) {
+                            Ok(value) => value,
+                            Err(_) => {
+                                self.journal_note(
+                                    &journal,
+                                    &format!(
+                                        "已提交第 {} 条记录但响应格式无效，请重新读取 DNS 后处理",
+                                        index + 1
+                                    ),
+                                )?;
+                                return Err(
+                                    "DNS 代理设置已提交，但云端响应无法核实；请检查待处理操作"
+                                        .into(),
+                                );
+                            }
+                        };
+                    if updated.len() != 1
+                        || updated[0].id != record.id
+                        || updated[0].record_type != record.record_type
+                        || updated[0].content != record.content
+                        || !updated[0].proxied
+                    {
+                        self.journal_note(
+                            &journal,
+                            &format!(
+                                "已提交第 {} 条记录但响应无法核实，请重新读取 DNS 后处理",
+                                index + 1
+                            ),
+                        )?;
+                        return Err(
+                            "DNS 代理设置已提交，但云端响应无法核实；请检查待处理操作".into()
+                        );
+                    }
+                    self.journal_note(
+                        &journal,
+                        &format!("已开启 {}/{} 条记录，正在处理其余记录", index + 1, total),
+                    )?;
+                }
+                self.journal_end_dns(host, &journal)?;
+            }
+        }
+        Ok(())
     }
 
     fn export_config(&self) -> Result<Value, String> {
@@ -1936,6 +2472,15 @@ impl Backend {
                     },
                 )
                 .await
+            }
+            PlanKind::DomainDns {
+                account_id,
+                zone_id,
+                host,
+                snapshot,
+            } => {
+                self.apply_domain_dns(&account_id, &zone_id, &host, snapshot)
+                    .await
             }
             PlanKind::SaveLink {
                 domain_id,
@@ -3450,6 +3995,7 @@ impl Backend {
         let new_hex = hex::encode(key);
         let journal = format!("重置自检密钥 {} ({})", account_id, random_id());
         self.journal_start(&journal)?;
+        clear_credential_cache();
         if let Err(e) = self
             .cloud
             .rotate_secret(&token, account_id, &resources.script, &new_hex)
@@ -3731,6 +4277,9 @@ impl Backend {
             }
             (false, None)
         };
+        let key_missing = keyring_get_optional(account_id, "selftest")?.is_none();
+        let monitor_key_missing =
+            monitor_enabled && keyring_get_optional(account_id, "probe")?.is_none();
         let old_ids: HashSet<_> = self
             .db
             .domains
@@ -3743,14 +4292,13 @@ impl Backend {
         self.db.domains.extend(recovered_domains);
         self.db.links.extend(recovered_links);
         self.db.pools = recovered_pools;
-        let key_missing = keyring_get(account_id, "selftest").is_err();
         if let Some(a) = self.db.accounts.iter_mut().find(|a| a.id == account_id) {
             a.resources = Some(resources);
             a.has_resources = true;
             a.needs_selftest_key = key_missing;
             a.monitor_enabled = monitor_enabled;
             a.monitor_endpoint = monitor_endpoint;
-            a.needs_monitor_key = monitor_enabled && keyring_get(account_id, "probe").is_err();
+            a.needs_monitor_key = monitor_key_missing;
         }
         self.persist()
     }
@@ -3768,11 +4316,11 @@ impl Backend {
             .iter()
             .find(|l| l.domain_id == domain_id && l.slug == slug)
             .ok_or("找不到此链接")?;
-        let key_hex = match keyring_get(&domain.account_id, "selftest") {
-            Ok(v) => v,
-            Err(_) => return Ok(None),
+        let Some(key_hex) = keyring_get_optional(&domain.account_id, "selftest")? else {
+            return Ok(None);
         };
-        let bytes = hex::decode(key_hex).map_err(|_| "自检密钥格式无效".to_string())?;
+        let key_hex = Zeroizing::new(key_hex);
+        let bytes = hex::decode(key_hex.as_str()).map_err(|_| "自检密钥格式无效".to_string())?;
         if bytes.len() != 32 {
             return Err("自检密钥长度无效".into());
         }
@@ -3798,7 +4346,7 @@ impl Backend {
                 code.clone(),
                 domain.account_id.clone(),
                 namespace,
-                keyring_get(&domain.account_id, "token")?,
+                Zeroizing::new(keyring_get(&domain.account_id, "token")?),
             ))
         } else {
             None
@@ -3823,7 +4371,7 @@ impl Backend {
             url,
             cn_url,
             default_url,
-            key: bytes,
+            key: Zeroizing::new(bytes),
             pool,
         }))
     }
@@ -3842,7 +4390,7 @@ impl Backend {
             if let Some(resources) = &account.resources {
                 accounts.push((
                     id.clone(),
-                    keyring_get(id, "token")?,
+                    Zeroizing::new(keyring_get(id, "token")?),
                     resources.namespace.clone(),
                     account.monitor_enabled,
                 ));
@@ -3873,21 +4421,21 @@ impl Backend {
                 .iter()
                 .find(|p| &p.id == pool_id)
                 .ok_or("找不到平台地址")?;
-            let mut targets = vec![(
-                "其他地区官方目标".into(),
-                pools::compose(&pool.official, code)?,
-            )];
+            let mut targets = vec![("官网链接".into(), pools::compose(&pool.official, code)?)];
             for c in pool.candidates.iter().filter(|c| c.enabled) {
                 targets.push((
-                    format!("大陆备用地址 {}", c.id),
+                    format!("大陆访问地址 {}", c.id),
                     pools::compose(&model::Template::from(c), code)?,
                 ));
             }
             Ok(targets)
         } else {
             Ok(vec![
-                ("中国大陆目标".into(), link.cn_url.clone()),
-                ("其他地区目标".into(), link.default_url.clone()),
+                ("大陆访问地址".into(), link.cn_url.clone()),
+                (
+                    "默认链接（中国大陆以外访客）".into(),
+                    link.default_url.clone(),
+                ),
             ])
         }
     }
@@ -4208,18 +4756,60 @@ pub fn run() {
             let backend = Backend::load(dir.join("state.json"), app.handle().clone())
                 .map_err(std::io::Error::other)?;
             app.manage(AppState(Mutex::new(backend)));
+            let handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                let mut timer = tokio::time::interval(Duration::from_secs(30));
+                loop {
+                    timer.tick().await;
+                    #[cfg(not(test))]
+                    secret_store::purge_expired();
+                    let state = handle.state::<AppState>();
+                    let mut backend = state.0.lock().await;
+                    backend
+                        .plans
+                        .retain(|plan| plan.expires_at > Instant::now());
+                }
+            });
             Ok(())
         })
+        .on_window_event(|window, event| {
+            if matches!(
+                event,
+                tauri::WindowEvent::CloseRequested { .. } | tauri::WindowEvent::Destroyed
+            ) {
+                clear_credential_cache();
+                let handle = window.app_handle().clone();
+                // Finish a current cloud operation safely before clearing its plans.
+                tauri::async_runtime::spawn(async move {
+                    let state = handle.state::<AppState>();
+                    state.0.lock().await.plans.clear();
+                    clear_credential_cache();
+                });
+            }
+        })
         .invoke_handler(tauri::generate_handler![dispatch])
-        .run(tauri::generate_context!())
-        .expect("application failed to start");
+        .build(tauri::generate_context!())
+        .expect("application failed to start")
+        .run(|handle, event| {
+            if matches!(
+                event,
+                tauri::RunEvent::Exit | tauri::RunEvent::ExitRequested { .. }
+            ) {
+                clear_credential_cache();
+                if let Some(state) = handle.try_state::<AppState>() {
+                    if let Ok(mut backend) = state.0.try_lock() {
+                        backend.plans.clear();
+                    }
+                }
+            }
+        });
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use wiremock::{
-        matchers::{header_regex, method, path, path_regex},
+        matchers::{header_regex, method, path, path_regex, query_param, query_param_is_missing},
         Mock, MockServer, ResponseTemplate,
     };
 
@@ -4245,6 +4835,7 @@ mod tests {
         let account = Account {
             id: "acct1".into(),
             label: "账号 1".into(),
+            cloudflare_name: Some("Example Account".into()),
             zone_count: 1,
             checked_at: Some(now()),
             has_resources: true,
@@ -4291,6 +4882,31 @@ mod tests {
     }
     async fn mount_resource(server: &MockServer, source: &str) {
         mount_resource_with_probe(server, source, false).await;
+    }
+    async fn mount_zone_owner(server: &MockServer) {
+        Mock::given(method("GET"))
+            .and(path("/client/v4/zones/zone1"))
+            .respond_with(ok(
+                json!({"id":"zone1","status":"active","account":{"id":"acct1"}}),
+            ))
+            .mount(server)
+            .await;
+    }
+    async fn mount_exact_dns(server: &MockServer, records: Value) {
+        Mock::given(method("GET"))
+            .and(path("/client/v4/zones/zone1/dns_records"))
+            .and(query_param("name", "example.com"))
+            .respond_with(ok(records))
+            .mount(server)
+            .await;
+    }
+    async fn mount_full_dns(server: &MockServer, records: Value) {
+        Mock::given(method("GET"))
+            .and(path("/client/v4/zones/zone1/dns_records"))
+            .and(query_param_is_missing("name"))
+            .respond_with(ok(records))
+            .mount(server)
+            .await;
     }
     async fn mount_resource_with_probe(server: &MockServer, source: &str, with_probe: bool) {
         let manifest = json!({"schema":SCHEMA,"accountId":"acct1","script":"edge-one",
@@ -4528,6 +5144,379 @@ mod tests {
         assert!(pending[0].ends_with("结果不确定"));
         assert_eq!(pending[1], other);
         assert!(clear_journal(&mut pending, "missing").is_err());
+    }
+
+    #[tokio::test]
+    async fn missing_dns_requires_reviewed_placeholder_plan_and_never_overwrites() {
+        let (server, mut backend, _dir) = fixture().await;
+        mount_zone_owner(&server).await;
+        mount_exact_dns(&server, json!([])).await;
+        mount_full_dns(&server, json!([])).await;
+        Mock::given(method("POST"))
+            .and(path("/client/v4/zones/zone1/dns_records"))
+            .respond_with(ok(
+                json!({"id":"placeholder","name":"example.com","type":"AAAA",
+                "content":"100::","proxied":true,"proxiable":true}),
+            ))
+            .mount(&server)
+            .await;
+        let prepared = backend
+            .dispatch("prepare_domain_dns", &json!({"input":"example.com"}))
+            .await
+            .unwrap();
+        assert_eq!(prepared["dnsStatus"], "missing");
+        assert_eq!(prepared["actions"][0]["kind"], "createPlaceholder");
+        assert_eq!(prepared["canApply"], true);
+        let plan_id = prepared["plan"]["id"].as_str().unwrap();
+        backend
+            .dispatch("apply_plan", &json!({"planId":plan_id}))
+            .await
+            .unwrap();
+        assert!(backend.db.pending_operations.is_empty());
+        let requests = server.received_requests().await.unwrap();
+        let write = requests
+            .iter()
+            .find(|request| request.method.as_str() == "POST")
+            .unwrap();
+        let body: Value = serde_json::from_slice(&write.body).unwrap();
+        assert_eq!(
+            body,
+            json!({"type":"AAAA","name":"example.com","content":"100::","ttl":1,"proxied":true})
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_updates_cloudflare_identity_and_zones_but_preserves_custom_label() {
+        let (server, mut backend, _dir) = fixture().await;
+        backend.db.accounts[0].label = "我的备注".into();
+        Mock::given(method("GET"))
+            .and(path("/client/v4/accounts/acct1"))
+            .respond_with(ok(json!({"id":"acct1","name":"Cloud Example"})))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/client/v4/zones"))
+            .and(query_param("account.id", "acct1"))
+            .respond_with(ok(
+                json!([{"id":"zone-new","name":"example.org","status":"active"}]),
+            ))
+            .mount(&server)
+            .await;
+        let state = backend
+            .dispatch("refresh_accounts", &json!({}))
+            .await
+            .unwrap();
+        assert_eq!(state["accounts"][0]["label"], "我的备注");
+        assert_eq!(state["accounts"][0]["cloudflareName"], "Cloud Example");
+        assert_eq!(state["accounts"][0]["zones"][0]["id"], "zone-new");
+        assert!(state["accounts"][0]["zones"][0].get("accountId").is_none());
+    }
+
+    #[tokio::test]
+    async fn expected_account_token_replace_updates_only_that_account_after_full_validation() {
+        let (server, mut backend, _dir) = fixture().await;
+        let token = "n".repeat(35);
+        Mock::given(method("GET"))
+            .and(path("/client/v4/user/tokens/verify"))
+            .respond_with(ok(json!({"status":"active"})))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/client/v4/accounts"))
+            .respond_with(ok(json!([
+                {"id":"acct2","name":"Other Account"},
+                {"id":"acct1","name":"Updated Cloud Name"}
+            ])))
+            .mount(&server)
+            .await;
+        for path_value in [
+            "/client/v4/accounts/acct1/workers/scripts",
+            "/client/v4/accounts/acct1/storage/kv/namespaces",
+        ] {
+            Mock::given(method("GET"))
+                .and(path(path_value))
+                .respond_with(ok(json!([])))
+                .mount(&server)
+                .await;
+        }
+        Mock::given(method("GET"))
+            .and(path("/client/v4/zones"))
+            .and(query_param("account.id", "acct1"))
+            .respond_with(ok(
+                json!([{"id":"zone1","name":"example.com","status":"active"}]),
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/client/v4/zones/zone1/workers/routes"))
+            .respond_with(ok(json!([])))
+            .mount(&server)
+            .await;
+
+        let state = backend
+            .dispatch(
+                "import_token",
+                &json!({"token":token,"replace":true,"expectedAccountId":"acct1"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(backend.db.accounts.len(), 1);
+        assert_eq!(state["accounts"][0]["label"], "账号 1");
+        assert_eq!(state["accounts"][0]["cloudflareName"], "Updated Cloud Name");
+        assert_eq!(keyring_get("acct1", "token").unwrap(), token);
+        assert!(!server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .any(|request| { request.url.path().contains("/accounts/acct2/") }));
+    }
+
+    #[tokio::test]
+    async fn expected_account_token_mismatch_changes_neither_keyring_nor_state() {
+        let (server, mut backend, _dir) = fixture().await;
+        let before_state = backend.database_snapshot();
+        let before_token = keyring_get("acct1", "token").unwrap();
+        let token = "m".repeat(35);
+        Mock::given(method("GET"))
+            .and(path("/client/v4/user/tokens/verify"))
+            .respond_with(ok(json!({"status":"active"})))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/client/v4/accounts"))
+            .respond_with(ok(json!([{"id":"acct2","name":"Other Account"}])))
+            .mount(&server)
+            .await;
+        let error = backend
+            .dispatch(
+                "import_token",
+                &json!({"token":token,"replace":true,"expectedAccountId":"acct1"}),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.contains("不属于所选账号"));
+        assert_eq!(keyring_get("acct1", "token").unwrap(), before_token);
+        assert_eq!(backend.database_snapshot(), before_state);
+    }
+
+    #[tokio::test]
+    async fn dns_only_record_enables_proxy_without_changing_content() {
+        let (server, mut backend, _dir) = fixture().await;
+        let grey = json!({"id":"dns-one","name":"example.com","type":"A",
+            "content":"192.0.2.10","proxied":false,"proxiable":true});
+        mount_zone_owner(&server).await;
+        mount_exact_dns(&server, json!([grey.clone()])).await;
+        Mock::given(method("GET"))
+            .and(path("/client/v4/zones/zone1/dns_records/dns-one"))
+            .respond_with(ok(grey.clone()))
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path("/client/v4/zones/zone1/dns_records/dns-one"))
+            .respond_with(ok(json!({"id":"dns-one","name":"example.com","type":"A",
+                "content":"192.0.2.10","proxied":true,"proxiable":true})))
+            .mount(&server)
+            .await;
+        let prepared = backend
+            .dispatch("prepare_domain_dns", &json!({"input":"example.com"}))
+            .await
+            .unwrap();
+        assert_eq!(prepared["dnsStatus"], "dnsOnly");
+        let plan_id = prepared["plan"]["id"].as_str().unwrap();
+        backend
+            .dispatch("apply_plan", &json!({"planId":plan_id}))
+            .await
+            .unwrap();
+        let requests = server.received_requests().await.unwrap();
+        let patch = requests
+            .iter()
+            .find(|request| request.method.as_str() == "PATCH")
+            .unwrap();
+        let body: Value = serde_json::from_slice(&patch.body).unwrap();
+        assert_eq!(body, json!({"proxied":true}));
+    }
+
+    #[tokio::test]
+    async fn dns_record_change_blocks_write_and_existing_non_address_record_is_not_overwritten() {
+        let (server, mut backend, _dir) = fixture().await;
+        let original = json!({"id":"dns-one","name":"example.com","type":"A",
+            "content":"192.0.2.10","proxied":false,"proxiable":true});
+        mount_zone_owner(&server).await;
+        mount_exact_dns(&server, json!([original])).await;
+        let prepared = backend
+            .dispatch("prepare_domain_dns", &json!({"input":"example.com"}))
+            .await
+            .unwrap();
+        let plan_id = prepared["plan"]["id"].as_str().unwrap().to_owned();
+        server.reset().await;
+        mount_zone_owner(&server).await;
+        mount_exact_dns(
+            &server,
+            json!([{"id":"dns-one","name":"example.com","type":"A",
+            "content":"192.0.2.20","proxied":false,"proxiable":true}]),
+        )
+        .await;
+        let error = backend
+            .dispatch("apply_plan", &json!({"planId":plan_id}))
+            .await
+            .unwrap_err();
+        assert!(error.contains("已变化"));
+        assert!(!server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .any(|request| { matches!(request.method.as_str(), "PATCH" | "POST" | "DELETE") }));
+
+        server.reset().await;
+        mount_zone_owner(&server).await;
+        mount_exact_dns(
+            &server,
+            json!([{"id":"txt-one","name":"example.com","type":"TXT",
+            "content":"verification=example","proxied":false,"proxiable":false}]),
+        )
+        .await;
+        let blocked = backend
+            .dispatch("prepare_domain_dns", &json!({"input":"example.com"}))
+            .await
+            .unwrap();
+        assert_eq!(blocked["dnsStatus"], "unsupported");
+        assert_eq!(blocked["canApply"], false);
+        assert!(blocked.get("plan").is_none());
+    }
+
+    #[tokio::test]
+    async fn dns_write_permission_error_is_specific_and_does_not_disable_account() {
+        let (server, mut backend, _dir) = fixture().await;
+        let grey = json!({"id":"dns-one","name":"example.com","type":"A",
+            "content":"192.0.2.10","proxied":false,"proxiable":true});
+        mount_zone_owner(&server).await;
+        mount_exact_dns(&server, json!([grey.clone()])).await;
+        Mock::given(method("GET"))
+            .and(path("/client/v4/zones/zone1/dns_records/dns-one"))
+            .respond_with(ok(grey))
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path("/client/v4/zones/zone1/dns_records/dns-one"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&server)
+            .await;
+        let prepared = backend
+            .dispatch("prepare_domain_dns", &json!({"input":"example.com"}))
+            .await
+            .unwrap();
+        let error = backend
+            .dispatch(
+                "apply_plan",
+                &json!({"planId":prepared["plan"]["id"].as_str().unwrap()}),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.contains("没有 DNS 编辑权限"));
+        assert_eq!(backend.db.accounts.len(), 1);
+        assert!(backend.db.pending_operations.is_empty());
+    }
+
+    #[tokio::test]
+    async fn dns_read_failure_is_distinct_and_never_offers_a_plan() {
+        let (server, mut backend, _dir) = fixture().await;
+        mount_zone_owner(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/client/v4/zones/zone1/dns_records"))
+            .and(query_param("name", "example.com"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&server)
+            .await;
+        let prepared = backend
+            .dispatch("prepare_domain_dns", &json!({"input":"example.com"}))
+            .await
+            .unwrap();
+        assert_eq!(prepared["dnsStatus"], "readFailed");
+        assert_eq!(prepared["canApply"], false);
+        assert!(prepared.get("plan").is_none());
+        assert!(prepared["checks"][1]["message"]
+            .as_str()
+            .unwrap()
+            .contains("无法读取 DNS"));
+    }
+
+    #[tokio::test]
+    async fn partial_dns_proxy_failure_is_journaled_and_retry_clears_resolved_history() {
+        let (server, mut backend, _dir) = fixture().await;
+        let one = json!({"id":"dns-one","name":"example.com","type":"A",
+            "content":"192.0.2.10","proxied":false,"proxiable":true});
+        let two = json!({"id":"dns-two","name":"example.com","type":"AAAA",
+            "content":"2001:db8::10","proxied":false,"proxiable":true});
+        mount_zone_owner(&server).await;
+        mount_exact_dns(&server, json!([one.clone(), two.clone()])).await;
+        Mock::given(method("GET"))
+            .and(path("/client/v4/zones/zone1/dns_records/dns-one"))
+            .respond_with(ok(one.clone()))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/client/v4/zones/zone1/dns_records/dns-two"))
+            .respond_with(ok(two.clone()))
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path("/client/v4/zones/zone1/dns_records/dns-one"))
+            .respond_with(ok(json!({"id":"dns-one","name":"example.com","type":"A",
+                "content":"192.0.2.10","proxied":true,"proxiable":true})))
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path("/client/v4/zones/zone1/dns_records/dns-two"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let prepared = backend
+            .dispatch("prepare_domain_dns", &json!({"input":"example.com"}))
+            .await
+            .unwrap();
+        let error = backend
+            .dispatch(
+                "apply_plan",
+                &json!({"planId":prepared["plan"]["id"].as_str().unwrap()}),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.contains("500"));
+        assert_eq!(backend.db.pending_operations.len(), 1);
+        assert!(backend.db.pending_operations[0].contains("已开启 1/2"));
+
+        server.reset().await;
+        mount_zone_owner(&server).await;
+        let one_done = json!({"id":"dns-one","name":"example.com","type":"A",
+            "content":"192.0.2.10","proxied":true,"proxiable":true});
+        mount_exact_dns(&server, json!([one_done, two.clone()])).await;
+        Mock::given(method("GET"))
+            .and(path("/client/v4/zones/zone1/dns_records/dns-two"))
+            .respond_with(ok(two))
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path("/client/v4/zones/zone1/dns_records/dns-two"))
+            .respond_with(ok(
+                json!({"id":"dns-two","name":"example.com","type":"AAAA",
+                "content":"2001:db8::10","proxied":true,"proxiable":true}),
+            ))
+            .mount(&server)
+            .await;
+        let retry = backend
+            .dispatch("prepare_domain_dns", &json!({"input":"example.com"}))
+            .await
+            .unwrap();
+        backend
+            .dispatch(
+                "apply_plan",
+                &json!({"planId":retry["plan"]["id"].as_str().unwrap()}),
+            )
+            .await
+            .unwrap();
+        assert!(backend.db.pending_operations.is_empty());
     }
 
     #[tokio::test]
@@ -5746,13 +6735,13 @@ mod tests {
             url: "https://example.com/go/short".into(),
             cn_url: String::new(),
             default_url: "https://official.example/path/abc".into(),
-            key: vec![0xa1; 32],
+            key: Zeroizing::new(vec![0xa1; 32]),
             pool: Some((
                 pool,
                 "abc".into(),
                 "acct1".into(),
                 "ns1".into(),
-                "test-token-value".into(),
+                Zeroizing::new("test-token-value".into()),
             )),
         };
         let report = run_selftest(snapshot).await.unwrap();
@@ -5792,5 +6781,50 @@ mod tests {
         assert!(
             validate_monitor_config(&json!({"endpoint":endpoint,"poolIds":["p1","p2"]})).is_ok()
         );
+    }
+    #[tokio::test]
+    async fn unknown_dns_success_recheck_clears_only_resolved_host_without_writes() {
+        let (server, mut backend, _dir) = fixture().await;
+        mount_zone_owner(&server).await;
+        mount_exact_dns(&server, json!([])).await;
+        mount_full_dns(&server, json!([])).await;
+        Mock::given(method("POST"))
+            .and(path("/client/v4/zones/zone1/dns_records"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("invalid-json"))
+            .mount(&server)
+            .await;
+        let prepared = backend
+            .dispatch("prepare_domain_dns", &json!({"input":"example.com"}))
+            .await
+            .unwrap();
+        assert!(backend
+            .dispatch("apply_plan", &json!({"planId":prepared["plan"]["id"]}))
+            .await
+            .is_err());
+        assert_eq!(backend.db.pending_operations.len(), 1);
+        backend
+            .db
+            .pending_operations
+            .push("修复 DNS example.org (other-operation)".into());
+        server.reset().await;
+        mount_zone_owner(&server).await;
+        mount_exact_dns(&server, json!([{"id":"placeholder","name":"example.com","type":"AAAA","content":"100::","proxied":true,"proxiable":true}])).await;
+        let checked = backend
+            .dispatch("prepare_domain_dns", &json!({"input":"example.com"}))
+            .await
+            .unwrap();
+        assert_eq!(checked["dnsStatus"], "ready");
+        assert_eq!(checked["canApply"], false);
+        assert!(checked.get("plan").is_none());
+        assert_eq!(
+            backend.db.pending_operations,
+            vec!["修复 DNS example.org (other-operation)"]
+        );
+        assert!(server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .all(|r| r.method.as_str() == "GET"));
     }
 }
