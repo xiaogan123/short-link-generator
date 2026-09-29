@@ -25,7 +25,7 @@ GITHUB_REPOSITORY="xiaogan123/short-link-generator" RELEASE_TAG="v$(node -p 'req
 
 `release-manifest.mjs` 遇到不同提交、缺少原生启动证据、更新签名文件或文件散列不符时会拒绝汇总。检查 `release-assets/`、`latest.json`、`SHA256SUMS` 和发版说明后，再决定是否建立或公开 Release；本地汇总命令本身不会上传或发布。本机若自行重建同一候选包，构建进程还须显式导出与正式渠道一致的 `SLG_UPDATER_PUBLIC_KEY` 和 `SLG_UPDATER_ENDPOINT`，并使用 `release-config.json`；仅有配置文件不足以设置编译时环境变量。
 
-本机 Apple 芯片候选包若早于最终发版脚本构建，可以使用 `schema: 2`、`method: "manual-local"` 的人工验收记录复用。记录分别保留实际构建提交 `buildSha` 和最终 tag 提交 `reviewedSha`，不能把后者写成构建来源。运行 `node scripts/release-app-inputs.mjs <buildSha> <reviewedSha>` 得到应用输入清单的 SHA-256 与文件数；汇总时会从两个 Git 提交重新生成并逐项比较。清单默认包含全部已跟踪文件，包括 `src/`、`src-tauri/`、`edge/`、`public/`、`.cargo/`、构建配置与工具链配置；只排除已明确列出的发版工作流、脚本、说明和生成物。未提交的应用文件、应用目录内被忽略的文件及本机 `.env*` 文件会拒绝复用。此证明只比较仓库输入，不证明外部工具链或本机环境完全一致。
+本机 Apple 芯片候选包可以使用 `schema: 2`、`method: "manual-local"` 的人工验收记录复用。记录分别保留实际构建提交 `buildSha` 和最终 tag 提交 `reviewedSha`，必须按实际构建记录填写；直接从最终提交构建时，两者相同。运行 `node scripts/release-app-inputs.mjs <buildSha> <reviewedSha>` 得到应用输入清单的 SHA-256 与文件数；汇总时会从两个 Git 提交重新生成并逐项比较。清单默认包含全部已跟踪文件，包括 `src/`、`src-tauri/`、`edge/`、`public/`、`.cargo/`、构建配置与工具链配置；只排除已明确列出的发版工作流、脚本、说明和生成物。未提交的应用文件、应用目录内被忽略的文件及本机 `.env*` 文件会拒绝复用。此证明只比较仓库输入，不证明外部工具链或本机环境完全一致。
 
 人工记录还需包含实际系统版本、GUI 与进程观察结果、安装包和更新包散列、架构及签名检查结果、生成的 `release-config.json` 散列、更新公钥散列与发布地址、原始构建参数的散列及不含本机路径的参数类别。填写者应依据私有的实际验证记录填写；汇总器只能核对 Git 输入、字段格式和制品散列，不能替代人工 GUI 观察或独立的更新签名验签。最低系统版本 `11.0` 是包内元数据，不能写成在 macOS 11 上实际启动过。本机候选证据不能用于 Intel Mac 或 Windows 平台。
 

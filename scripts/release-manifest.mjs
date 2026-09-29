@@ -27,7 +27,7 @@ function exactArtifact(candidateRoot,subdir,name,suffix,digest){
 }
 function validateManualLocal(evidence,reviewedSha,target){
   if(target!=='aarch64-apple-darwin'||evidence.schema!==2||evidence.method!=='manual-local'||
-     evidence.reviewedSha!==reviewedSha||!/^[0-9a-f]{40}$/.test(evidence.buildSha??'')||evidence.buildSha===reviewedSha||
+     evidence.reviewedSha!==reviewedSha||!/^[0-9a-f]{40}$/.test(evidence.buildSha??'')||
      evidence.osVersion!=='26.5.2'||evidence.guiObserved!==true||evidence.processAlive!==true||
      evidence.architectureVerified!==true||evidence.signatureVerified!==true||evidence.updaterSignatureVerified!==true||
      evidence.updaterSignaturePresent!==true||evidence.minimumSystemVersionMetadata!=='11.0'||

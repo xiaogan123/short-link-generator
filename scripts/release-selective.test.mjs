@@ -176,6 +176,10 @@ test('manual ARM reuse derives the application tree from both commits and reject
     const assembled = run();
     assert.equal(assembled.status, 0, assembled.stderr);
     const valid = JSON.parse(readFileSync(evidenceFile, 'utf8'));
+    // A freshly built and manually verified local package can use the reviewed commit itself.
+    put(evidenceFile, JSON.stringify({ ...valid, buildSha: reviewedSha }));
+    const sameCommit = run();
+    assert.equal(sameCommit.status, 0, sameCommit.stderr);
     put(evidenceFile, JSON.stringify({ ...valid, buildSha: 'b'.repeat(40) }));
     assert.notEqual(run().status, 0);
     put(evidenceFile, JSON.stringify({ ...valid, reviewedSha: buildSha }));
