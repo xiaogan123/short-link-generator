@@ -52,3 +52,15 @@ it('shows ready DNS as a pass and refreshes local state without applying a domai
   expect(control.calls.filter(call=>call.action==='get_state').length).toBeGreaterThan(1);
   expect(within(form).queryByRole('button',{name:/查看.*计划/})).toBeNull();
 });
+
+it('refreshes cached zones after a DNS result that still needs repair',async()=>{
+  render(<App/>); await screen.findByText('先连接一个域名');
+  fireEvent.click(screen.getByRole('button',{name:/^域名管理$/}));
+  fireEvent.click(screen.getAllByRole('button',{name:'添加域名'})[0]);
+  const form=screen.getByRole('dialog',{name:'添加域名'});
+  fireEvent.change(within(form).getByPlaceholderText('go.example.com'),{target:{value:'repair.example.com'}});
+  fireEvent.click(within(form).getByRole('button',{name:'检查并接入'}));
+  fireEvent.click(await within(form).findByRole('button',{name:'检查 DNS 与代理'}));
+  expect(await within(form).findByText('缺少 DNS 记录')).toBeTruthy();
+  expect(control.calls.filter(call=>call.action==='get_state').length).toBeGreaterThan(2);
+});
