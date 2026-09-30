@@ -82,7 +82,7 @@ struct SelftestSnapshot {
 
 struct HealthSnapshot {
     pool: Pool,
-    accounts: Vec<(String, Zeroizing<String>, String, bool)>,
+    accounts: Vec<(String, Option<Zeroizing<String>>, String)>,
     cloud: Cloud,
 }
 
@@ -5346,12 +5346,14 @@ impl Backend {
         for id in &pool.account_ids {
             let account = self.account(id)?;
             if let Some(resources) = &account.resources {
-                accounts.push((
-                    id.clone(),
-                    Zeroizing::new(keyring_get(id, "token")?),
-                    resources.namespace.clone(),
-                    account.monitor_enabled,
-                ));
+                // Disabled monitoring produces a local status row, so it must
+                // not require access to this account's system credential item.
+                let token = if account.monitor_enabled {
+                    Some(Zeroizing::new(keyring_get(id, "token")?))
+                } else {
+                    None
+                };
+                accounts.push((id.clone(), token, resources.namespace.clone()));
             }
         }
         Ok(HealthSnapshot {
@@ -5380,9 +5382,9 @@ impl Backend {
                 .find(|p| &p.id == pool_id)
                 .ok_or("找不到平台地址")?;
             let mut targets = vec![("官网链接".into(), pools::compose(&pool.official, code)?)];
-            for c in pool.candidates.iter().filter(|c| c.enabled) {
+            for (index, c) in pool.candidates.iter().filter(|c| c.enabled).enumerate() {
                 targets.push((
-                    format!("大陆访问地址 {}", c.id),
+                    format!("大陆访问地址 {}", index + 1),
                     pools::compose(&model::Template::from(c), code)?,
                 ));
             }
@@ -5402,10 +5404,10 @@ impl Backend {
 async fn run_pool_health(snapshot: HealthSnapshot) -> Result<Value, String> {
     let mut accounts = Vec::new();
     for id in &snapshot.pool.account_ids {
-        let Some((_, token, namespace, monitor_enabled)) = snapshot
+        let Some((_, token, namespace)) = snapshot
             .accounts
             .iter()
-            .find(|(account, _, _, _)| account == id)
+            .find(|(account, _, _)| account == id)
         else {
             accounts.push(
                 json!({"accountId":id,"source":"unconfigured","checkedAt":null,
@@ -5413,13 +5415,13 @@ async fn run_pool_health(snapshot: HealthSnapshot) -> Result<Value, String> {
             );
             continue;
         };
-        if !monitor_enabled {
+        let Some(token) = token else {
             accounts.push(json!({"accountId":id,"source":"unconfigured","checkedAt":null,
                 "status":"unknown","candidates":snapshot.pool.candidates.iter().map(|c|
                     json!({"id":c.id,"status":"unknown","checkedAt":null,"message":"未启用大陆监测"}))
                     .collect::<Vec<_>>() }));
             continue;
-        }
+        };
         let remote_pool = snapshot
             .cloud
             .read_value(token, id, namespace, &format!("p:{}", snapshot.pool.id))
@@ -9704,5 +9706,152 @@ mod tests {
                 2
             );
         }
+    }
+
+    #[tokio::test]
+    async fn pool_health_disabled_accounts_never_read_credentials_or_cloud() {
+        for missing_token in [false, true] {
+            let (server, mut backend, _dir) = fixture().await;
+            backend.db.pools.push(sample_pool());
+            if missing_token {
+                keyring_delete("acct1", "token").unwrap();
+            }
+            mock_key_reads().lock().unwrap().clear();
+            let snapshot = backend.health_snapshot("pool1");
+            let reads = mock_key_reads().lock().unwrap().clone();
+            assert!(
+                reads.is_empty(),
+                "disabled monitoring must not access any credential"
+            );
+            let result = run_pool_health(snapshot.unwrap()).await.unwrap();
+            assert_eq!(result["accounts"][0]["accountId"], "acct1");
+            assert_eq!(result["accounts"][0]["source"], "unconfigured");
+            assert_eq!(result["accounts"][0]["status"], "unknown");
+            assert_eq!(
+                result["accounts"][0]["candidates"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                2
+            );
+            assert!(result["accounts"][0]["candidates"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|candidate| candidate["status"] == "unknown"
+                    && candidate["message"] == "未启用大陆监测"));
+            assert!(server.received_requests().await.unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn pool_health_reads_only_enabled_account_and_preserves_monitor_results() {
+        let (server, mut backend, _dir) = fixture().await;
+        let mut disabled = backend.db.accounts[0].clone();
+        disabled.id = "acct2".into();
+        disabled.resources = Some(Resources {
+            script: "edge-two".into(),
+            namespace: "ns2".into(),
+        });
+        backend.db.accounts.push(disabled);
+        backend.db.accounts[0].monitor_enabled = true;
+        let mut pool = sample_pool();
+        pool.account_ids.push("acct2".into());
+        let checked_at = Utc::now().timestamp();
+        Mock::given(method("GET"))
+            .and(path(
+                "/client/v4/accounts/acct1/storage/kv/namespaces/ns1/values/p%3Apool1",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(pools::cloud_value(&pool)))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/client/v4/accounts/acct1/storage/kv/namespaces/ns1/values/h%3Apool1",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "revision":pool.updated,"checkedAt":checked_at,
+                "targets":{
+                    "first":{"state":"healthy","failures":0,"successes":1,"checkedAt":checked_at},
+                    "second":{"state":"healthy","failures":0,"successes":1,"checkedAt":checked_at}
+                }
+            })))
+            .mount(&server)
+            .await;
+        backend.db.pools.push(pool);
+        mock_key_reads().lock().unwrap().clear();
+        let snapshot = backend.health_snapshot("pool1");
+        let reads = mock_key_reads().lock().unwrap().clone();
+        assert_eq!(reads, vec!["token:acct1"]);
+        let result = run_pool_health(snapshot.unwrap()).await.unwrap();
+        assert_eq!(result["accounts"][0]["source"], "mainland_provider");
+        assert_eq!(result["accounts"][0]["status"], "healthy");
+        assert_eq!(result["accounts"][1]["source"], "unconfigured");
+        assert_eq!(result["accounts"][1]["status"], "unknown");
+        assert_eq!(
+            result["accounts"][1]["candidates"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests
+            .iter()
+            .all(|request| request.method.as_str() == "GET"
+                && request.url.path().contains("/acct1/")));
+        keyring_delete("acct1", "token").unwrap();
+        mock_key_reads().lock().unwrap().clear();
+        assert!(backend.health_snapshot("pool1").is_err());
+        let reads = mock_key_reads().lock().unwrap().clone();
+        assert_eq!(reads, vec!["token:acct1"]);
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn target_snapshot_labels_enabled_candidates_by_display_order() {
+        let (server, mut backend, _dir) = fixture().await;
+        let mut pool = sample_pool();
+        pool.candidates[0].enabled = false;
+        pool.candidates[1].id = "internal-candidate-a".into();
+        pool.candidates.push(model::PoolCandidate {
+            id: "internal-candidate-b".into(),
+            prefix: "https://third.example/path/".into(),
+            suffix: "".into(),
+            enabled: true,
+        });
+        backend.db.pools.push(pool);
+        backend.db.links.push(Link {
+            domain_id: "domain1".into(),
+            slug: "short".into(),
+            cn_url: String::new(),
+            default_url: String::new(),
+            updated: now(),
+            pool_id: Some("pool1".into()),
+            code: Some("DEMO".into()),
+        });
+        let before = serde_json::to_value(&backend.db).unwrap();
+        let targets = backend.target_snapshot("domain1", "short").unwrap();
+        assert_eq!(
+            targets,
+            vec![
+                (
+                    "官网链接".into(),
+                    "https://official.example/path/DEMO".into()
+                ),
+                (
+                    "大陆访问地址 1".into(),
+                    "https://second.example/path/DEMO".into()
+                ),
+                (
+                    "大陆访问地址 2".into(),
+                    "https://third.example/path/DEMO".into()
+                ),
+            ]
+        );
+        assert_eq!(serde_json::to_value(&backend.db).unwrap(), before);
+        assert!(mock_key_reads().lock().unwrap().is_empty());
+        assert!(server.received_requests().await.unwrap().is_empty());
     }
 }

@@ -40,13 +40,48 @@ GITHUB_REPOSITORY="xiaogan123/short-link-generator" RELEASE_TAG="v$(node -p 'req
 | `minimumSystemVersionMetadata` | 候选包实际元数据中的最低系统版本，须与已审查 Git 提交的 `src-tauri/tauri.conf.json` 一致；当前为 `11.0`。 |
 | `minimumSystemRuntimeTested` | 只有同一候选确实在声明最低版本上完成原生启动和 GUI 验证，才能填 `true`。 |
 | `minimumSystemRuntime` | 实际 `osVersion`、`host: "darwin-arm64"`、均为 `true` 的 `architectureVerified` / `processAlive` / `guiObserved`、与外层一致的 `installerSha256` / `updaterSha256`，以及私有验证报告的 `reportSha256`。 |
-| `nativeSigning` | `identity` 为实际核实的 `ad-hoc` 或 `developer-id`，`identityVerified: true`，`notarization` 为实际核实的 `not-notarized` 或 `verified`，并保留私有签名核查报告的 `reportSha256`。临时签名不能同时声称公证已通过。 |
+| `nativeSigning` | 当前候选必须为实际核实的固定证书 `self-signed`，`identityVerified: true`、`notarization: "not-notarized"`，并包含下述证书和 DR 验证字段；人工本机证据还须保留私有签名核查报告的 `reportSha256`。历史 `ad-hoc` 或其他身份记录不能代替当前固定身份闸。 |
 | `environmentVerification` | `differencesReviewed: true`、`compatibleWithRelease: true` 以及私有环境核查报告的 `reportSha256`。报告应绑定本次构建提交及候选散列，核对实际 Node / Rust / Xcode / SDK、依赖和构建参数与发行流程的差异，说明相关差异为何不影响本次制品。 |
 
 最低版本比较允许等价的零补丁写法，如 `11.0` 与 `11.0.0`；在更高版本（包括更高补丁版本）启动不构成最低版本运行证据。包内最低版本元数据、较新 macOS 上的成功启动、Git 输入一致，都不能代替该验证。缺少能运行声明最低版本的原生或已验证等价环境时，保留缺口，本机包只能作为候选，不能填造验证记录或通过调高最低系统需求逃避验证。
 
-现有发行策略允许临时签名且未公证的 macOS 包；如实核实并记录 `ad-hoc` / `not-notarized` 即可满足签名状态核查，不额外要求 Developer ID 或 Apple 公证。`signatureVerified: true` 仍须来自候选应用的实际完整性验签；独立的更新签名不证明 Apple 签名或公证。若实际使用 Developer ID 或声明公证通过，必须留存相应真实证据。
+历史发行曾允许临时签名且未公证的 macOS 包；当前候选改为下述固定证书自签身份，旧 `ad-hoc` 记录不再满足当前汇总闸。仍不要求购买 Developer ID 或 Apple 公证。`signatureVerified: true` 必须来自实际候选应用的完整性验签；独立的更新签名不证明原生签名或公证。将来更换为 Developer ID 或声明公证通过，须单独审查身份迁移并更新策略与真实证据。
 
-填写者应依据私有实际记录填写，原始日志、路径、截图和环境报告留在私有位置，候选 JSON 只保存上述结果与报告散列。汇总器核对 Git 输入、声明的最低版本、字段约束与制品散列，并重新验证更新签名；报告散列不是运行测试或身份核验的替代品，仍须审查其对应记录。托管 runner 的 `schema: 1` 验收流程保持原样；它的启动结果同样不能被表述为最低系统运行或 Apple 公证已通过。三平台汇总成功只说明已通过脚本规定的证据检查，公开发行仍须完成当前候选的其他验收与隐私检查。
+填写者应依据私有实际记录填写，原始日志、路径、截图和环境报告留在私有位置，候选 JSON 只保存上述结果与报告散列。汇总器核对 Git 输入、声明的最低版本、字段约束与制品散列，并重新验证更新签名；报告散列不是运行测试或身份核验的替代品，仍须审查其对应记录。托管 runner 保留 `schema: 1` 并补充实际自签名核查证据；启动结果同样不能被表述为最低系统运行或 Apple 公证已通过。三平台汇总成功只说明已通过脚本规定的证据检查，公开发行仍须完成当前候选的其他验收与隐私检查。
+
+## 稳定的 macOS 自签身份
+
+后续正式 macOS 构建使用 `scripts/stable-macos-sign.mjs` 包装构建命令；开发配置仍可使用 `signingIdentity: "-"`。发行 wrapper 缺证书、口令或预期指纹即失败，不退回临时签名。现有临时签名记录仍只能据实标注；不能拿它证明稳定身份。自签名保持未经过 Apple 公证的发行政策，不要求购买 Developer ID，也不使 Gatekeeper 自动认可发布者。
+
+长期使用同一份加密 P12 和私钥，固定应用标识 `org.shortlink.generator`。加密 P12、独立口令文件及离线备份保存在仓库和应用用户数据之外的私有目录；输入文件权限必须为仅所有者可读写。证书公开 SHA-256 指纹单独固定，名称相同不能替代指纹匹配。不要每次构建重新生成证书。
+
+| 构建输入 | 用途 |
+| --- | --- |
+| `SLG_MACOS_SIGNING_P12_PATH` 或 `SLG_MACOS_SIGNING_P12_BASE64` | 本地加密 P12 的绝对私有路径，或 CI 进程中的 base64；二选一。 |
+| `SLG_MACOS_SIGNING_P12_PASSWORD_FILE` 或 `SLG_MACOS_SIGNING_P12_PASSWORD` | 私有口令文件或进程环境；二选一，不把口令写进命令行。 |
+| `SLG_MACOS_CERT_SHA256` | 预期公开证书 DER 的 SHA-256；本地、原生验收和汇总必须相同。 |
+| `SLG_MACOS_OPENSSL` | 可选 OpenSSL 程序路径，默认使用系统 OpenSSL。 |
+
+设置好这些进程输入后，本地构建命令为：
+
+```sh
+node scripts/stable-macos-sign.mjs -- npm run tauri -- build --config release-config.json --bundles app,dmg
+```
+
+wrapper 在进程内核对 P12 口令、证书自签名、用途、私钥匹配及公开指纹，再用一次性随机口令重封装到私有临时目录。未加密私钥不落盘，长期口令不进入 argv。专用临时签名库的随机口令和临时 P12 随机口令需要传给 `security` 的 argv，同用户高权限进程可能在短暂窗口观察它们；这不包含长期口令。构建输出不打印这些命令或原始密钥工具错误。失败只报告 `material` / `import` / `build` / `verify` / `cleanup` / `searchlist` / `interrupted` 等阶段。
+
+签名 shim 固定指定临时库和精确证书指纹，对外层应用嵌入“固定 identifier 且固定证书指纹”的 designated requirement（DR）。不设置默认库、搜索列表或全局根信任，不调整真实用户凭据 ACL；导入授权和 partition list 仅限本次临时签名私钥。构建前后只读比较搜索列表与默认库，若出现差异则失败且不整表覆盖恢复，以免覆盖其他进程的修改。正常完成、构建失败和可处理的中断都会清理临时库；若系统拒绝删除，保留私有目录中的 `cleanup-required.json` 并拒绝候选。强制终止或断电也可能留下该私有目录，需单独确认后清理，不能声称所有异常都已清理。
+
+GitHub 的 `release` 环境需新增 `MACOS_SIGNING_P12_BASE64`、`MACOS_SIGNING_P12_PASSWORD` 两个 secret，以及公开变量 `MACOS_SIGNING_CERT_SHA256`。只有 macOS 构建步骤取得签名秘密；Windows 构建保持原方式。不新增 Apple ID、公证秘密或完整平台矩阵。先在本机测量签名增量时间，再按既有额度纪律估算所选 macOS runner 分钟数；此流程本身不授权触发 CI。
+
+原生验收从实际候选应用导出公开证书，核实自签名与预期 SHA-256，执行完整性验签，并检查与求值实际 DR。`nativeSigning` 记录 `identity: "self-signed"`、`notarization: "not-notarized"`、证书 `certificateSha256` / `certificateSha1`、固定 `identifier`、`designatedRequirement` 及其 SHA-256，并记录均为 `true` 的 `identityVerified` / `signatureVerified` / `requirementVerified` / `certificateSelfSignatureVerified`。汇总提供相同 `SLG_MACOS_CERT_SHA256`，才接受这些记录；只有 identifier、CN、cdhash 或替代证书的记录均拒绝。安装包和更新包仍须各自绑定实际散列与独立更新签名。
+
+当前 macOS 候选还必须提供 `macArtifacts`（`schema: 1`）：`updaterBundleVerified`、`contentMatchVerified`、`modesMatchVerified` 均为 `true`，`bundleManifestSha256`、`entryCount`、`fileCount` 绑定包内完整目录、文件字节与 SHA-256、权限和链接目标。原生检查安全解包更新 tar，分别对 DMG、tar 和构建目录中的 app 核实固定证书与实际 DR，并比较三者清单；`updaterSigning` 和 `buildSigning` 保存对应的真实签名结果。托管 runner 必须记录 `buildBundleCompared: true`；人工本机核查若已无构建目录，可记录 `false` 并省略 `buildSigning`，仍须完成 DMG 与 tar 比较。清单不包含本机绝对路径。汇总器重新读取实际 tar、重算清单并核对以上证据；缺失稳定证书指纹、旧临时签名记录、缺少比较记录、字节或权限不一致均拒绝当前候选。历史临时签名记录只能作为历史证据，不能代替此闸。
+
+归档解析先验证整个路径与链接图，再写入新的私有目录；支持普通 USTAR、GNU 长名称、受限 PAX 元数据和应用内部链接，拒绝路径穿越、大小写/Unicode 重复路径、链接父目录、越界或循环链接、硬链接、设备、稀疏文件及不支持的扩展元数据。压缩输入最多 256 MiB、展开数据最多 512 MiB、头记录最多 20,000 条；超过限制须调整并重新审查，不能跳过检查。隐私检查使用同一解包器，并在提取前扫描完整展开字节，覆盖不进入文件清单的头部、元数据和填充区；原始字节不写入公开证据。外层 Minisign 验签本身不证明内部原生签名。
+
+首次采用该身份前，必须用同一证书签两个确实不同的二进制，确认代码哈希不同、固定 DR 一致，并让 A 满足 B 的 DR、B 满足 A 的 DR。自动工具测试的合成证书和 mock OS 命令仅验证逻辑，不代表原生签名或真实用户钥匙串验收。旧临时签名迁移到自签名仍是一次身份改变，可能按受保护条目再次询问授权；尊重系统提示与用户选择，不静默改 ACL、删除重建条目或承诺所有弹框消失。以后保持证书与 identifier 可稳定身份，但锁定钥匙串、自定义 ACL 等仍可能要求用户授权。证书丢失、轮换或将来换成 Developer ID 都需要单独处理迁移。
+
+身份稳定与钥匙串跟踪的依据见 [Apple TN2206](https://developer.apple.com/library/archive/technotes/tn2206/_index.html)；证书指纹和 identifier 约束见 [Apple Code Signing Requirement Language](https://developer.apple.com/library/archive/documentation/Security/Conceptual/CodeSigningGuide/RequirementLang/RequirementLang.html)。
 
 GitHub 的手动触发输入、原生 runner 标签与 artifact 保留期以 [workflow_dispatch 文档](https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/trigger-a-workflow)、[runner 参考](https://docs.github.com/en/actions/reference/runners/github-hosted-runners)和[artifact 文档](https://docs.github.com/en/actions/tutorials/store-and-share-data)为准。Windows 静默安装使用 Tauri 所述的 NSIS `/S` 参数；见 [Tauri Windows 安装包说明](https://v2.tauri.app/distribute/windows-installer/)。

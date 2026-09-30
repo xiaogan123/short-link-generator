@@ -4,6 +4,8 @@ import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { matchingAppInputs } from './release-app-inputs.mjs';
 import { updaterPublicKeySha256, verifyUpdaterSignatureFile } from './updater-signature.mjs';
+import { validateMacSigningEvidence } from './macos-signature.mjs';
+import { readMacUpdater, validateMacArtifactEvidence } from './macos-artifact.mjs';
 const version=JSON.parse(readFileSync('package.json','utf8')).version;
 const repository=process.env.GITHUB_REPOSITORY;
 if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repository??''))throw new Error('Invalid repository.');
@@ -60,9 +62,9 @@ function validateManualLocal(evidence,reviewedSha,target){
     throw new Error('Manual local ARM minimum-system runtime evidence is incomplete or does not match this candidate.');
   }
   const signing=evidence.nativeSigning;
-  if(!signing||!['ad-hoc','developer-id'].includes(signing.identity)||signing.identityVerified!==true||
+  if(!signing||!['ad-hoc','developer-id','self-signed'].includes(signing.identity)||signing.identityVerified!==true||
      !['not-notarized','verified'].includes(signing.notarization)||!hex(signing.reportSha256)||
-     (signing.identity==='ad-hoc'&&signing.notarization!=='not-notarized')){
+     (['ad-hoc','self-signed'].includes(signing.identity)&&signing.notarization!=='not-notarized')){
     throw new Error('Manual local ARM native signing and notarization status must be verified explicitly.');
   }
   const environment=evidence.environmentVerification;
@@ -97,11 +99,18 @@ if(requireEvidence){
             (target.includes('windows')&&evidence.windowObserved!==true)){
       throw new Error(`Native runner evidence is invalid for ${target}.`);
     }
+    if(target.includes('apple')){
+      validateMacSigningEvidence(evidence.nativeSigning,process.env.SLG_MACOS_CERT_SHA256);
+    }
     const installer=exactArtifact(candidateRoot,config.installerDir,evidence.installer,config.installerSuffix,evidence.installerSha256);
     const updater=exactArtifact(candidateRoot,config.updaterDir,evidence.updater,config.updaterSuffix,evidence.updaterSha256);
     const signature=`${updater}.sig`;
     if(!files.includes(signature)||lstatSync(signature).isSymbolicLink()||!readFileSync(signature,'utf8').trim())throw new Error(`Missing updater signature for ${target}.`);
     verifyUpdaterSignatureFile(updater,signature,updaterPublicKey,version);
+    if(target.includes('apple')){
+      validateMacArtifactEvidence(evidence.macArtifacts,process.env.SLG_MACOS_CERT_SHA256,readMacUpdater(updater).manifest,evidence.nativeSigning);
+      if(evidence.method!=='manual-local'&&evidence.macArtifacts.buildBundleCompared!==true)throw new Error('Native macOS build comparison evidence is required.');
+    }
     verifiedSignatures.add(signature);
     if(evidence.method!=='manual-local'&&(
        evidence.updaterSignature!==basename(signature)||evidence.updaterSignatureSha256!==sha256(signature)||

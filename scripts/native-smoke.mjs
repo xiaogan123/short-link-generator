@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { execFileSync, spawn } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -8,6 +8,7 @@ import {
   updaterPublicKeySha256, verifyUpdaterSignatureFile,
 } from './updater-signature.mjs';
 import { observeWindowsWindow } from './windows-window-observer.mjs';
+import { bundleManifest, verifyMacArtifactSet } from './macos-artifact.mjs';
 
 const targets = {
   'aarch64-apple-darwin': { host: 'darwin', arch: 'arm64', binaryArch: 'arm64', updater: '.app.tar.gz' },
@@ -23,11 +24,13 @@ const run = (command, args, options = {}) => execFileSync(command, args, {
 function walk(dir) {
   return readdirSync(dir, { withFileTypes: true }).flatMap(entry => {
     const path = join(dir, entry.name);
-    return entry.isDirectory() ? walk(path) : [path];
+    if (entry.isSymbolicLink()) throw new Error('Native artifacts must not contain filesystem links.');
+    return entry.isDirectory() ? (entry.name.endsWith('.app') ? [] : walk(path)) : [path];
   });
 }
 
 export function selectArtifacts(bundle, target) {
+  if (!lstatSync(bundle).isDirectory()) throw new Error('Native artifact root must be a real directory.');
   const config = targets[target];
   if (!config) throw new Error('Unsupported native target.');
   const files = walk(bundle);
@@ -40,7 +43,8 @@ export function selectArtifacts(bundle, target) {
   const [installer] = installerMatches;
   const [updater] = updaterMatches;
   const signature = `${updater}.sig`;
-  if (!files.includes(signature) || !readFileSync(signature, 'utf8').trim()) {
+  if (![installer, updater].every(path => lstatSync(path).isFile())) throw new Error('Native artifacts must be regular files.');
+  if (!files.includes(signature) || !lstatSync(signature).isFile() || !readFileSync(signature, 'utf8').trim()) {
     throw new Error('Signed updater package is missing its nonempty signature.');
   }
   return { installer, updater, signature, config };
@@ -105,7 +109,7 @@ export async function observeStartup(binary, cwd, env, expectWindow, args = []) 
   }
 }
 
-async function smokeMac(installer, config, temp) {
+async function smokeMac(installer, updater, bundle, config, temp) {
   const mount = join(temp, 'mount');
   mkdirSync(mount);
   let attached = false;
@@ -113,17 +117,22 @@ async function smokeMac(installer, config, temp) {
     run('hdiutil', ['attach', '-readonly', '-nobrowse', '-mountpoint', mount, installer]);
     attached = true;
     const apps = readdirSync(mount).filter(name => name.endsWith('.app'));
-    if (apps.length !== 1) throw new Error('DMG must contain exactly one application.');
+    if (apps.length !== 1 || !lstatSync(join(mount, apps[0])).isDirectory()) throw new Error('DMG must contain exactly one real application directory.');
+    const mountedManifest = bundleManifest(join(mount, apps[0]));
     const app = join(temp, 'installed.app');
     run('ditto', [join(mount, apps[0]), app]);
-    run('codesign', ['--verify', '--deep', '--strict', app]);
+    if (bundleManifest(app).sha256 !== mountedManifest.sha256) throw new Error('Copied application differs from the mounted DMG.');
+    const builtApps = readdirSync(join(bundle, 'macos')).filter(name => name.endsWith('.app'));
+    if (builtApps.length !== 1) throw new Error('Expected exactly one built macOS application.');
+    const { nativeSigning, macArtifacts } = verifyMacArtifactSet({ updater, installedApp: app,
+      builtApp: join(bundle, 'macos', builtApps[0]), destination: join(temp, 'updater'), pin: process.env.SLG_MACOS_CERT_SHA256 });
     const binary = join(app, 'Contents', 'MacOS', 'short-link-generator');
     const archs = run('lipo', ['-archs', binary]).split(/\s+/);
     if (archs.length !== 1 || archs[0] !== config.binaryArch) {
       throw new Error('Installed application architecture does not match the native runner.');
     }
     const startup = await observeStartup(binary, join(app, 'Contents', 'MacOS'), process.env, false);
-    return { installation: 'read-only DMG mount and copied app', signatureVerified: true,
+    return { installation: 'read-only DMG mount and copied app', signatureVerified: true, nativeSigning, macArtifacts,
       architectureVerified: true, ...startup };
   } finally {
     if (attached) run('hdiutil', ['detach', mount]);
@@ -175,7 +184,7 @@ export async function main(args = process.argv.slice(2)) {
   const temp = mkdtempSync(join(process.env.RUNNER_TEMP ?? tmpdir(), 'slg-native-smoke-'));
   try {
     const result = config.host === 'darwin'
-      ? await smokeMac(installer, config, temp)
+      ? await smokeMac(installer, updater, bundle, config, temp)
       : await smokeWindows(installer, temp);
     const evidence = { schema: 1, tag, sha, target,
       host: `${process.platform}-${process.arch}`, checkedAt: new Date().toISOString(),
