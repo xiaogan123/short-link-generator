@@ -31,6 +31,22 @@ GITHUB_REPOSITORY="xiaogan123/short-link-generator" RELEASE_TAG="v$(node -p 'req
 
 本机 Apple 芯片候选包可以使用 `schema: 2`、`method: "manual-local"` 的人工验收记录复用。记录分别保留实际构建提交 `buildSha` 和最终 tag 提交 `reviewedSha`，必须按实际构建记录填写；直接从最终提交构建时，两者相同。运行 `node scripts/release-app-inputs.mjs <buildSha> <reviewedSha>` 得到应用输入清单的 SHA-256 与文件数；汇总时会从两个 Git 提交重新生成并逐项比较。清单默认包含全部已跟踪文件，包括 `src/`、`src-tauri/`、`edge/`、`public/`、`.cargo/`、构建配置与工具链配置；只排除已明确列出的发版工作流、脚本、说明和生成物。未提交的应用文件、应用目录内被忽略的文件及本机 `.env*` 文件会拒绝复用。此证明只比较仓库输入，不证明外部工具链或本机环境完全一致。
 
-人工记录还需包含实际系统版本、GUI 与进程观察结果、安装包和更新包散列、架构及签名检查结果、生成的 `release-config.json` 散列、更新公钥散列与发布地址、原始构建参数的散列及不含本机路径的参数类别。填写者应依据私有的实际验证记录填写；汇总器核对 Git 输入、字段格式、制品散列，并重新验证更新签名；它不能替代人工 GUI 观察。最低系统版本 `11.0` 是包内元数据，不能写成在 macOS 11 上实际启动过。本机候选证据不能用于 Intel Mac 或 Windows 平台。
+人工记录还需包含实际系统版本、GUI 与进程观察结果、安装包和更新包散列、架构及签名检查结果、生成的 `release-config.json` 散列、更新公钥散列与发布地址、原始构建参数的散列及不含本机路径的参数类别。`osVersion` 填实际测试系统版本，不固定为某次本机快照。本机候选证据不能用于 Intel Mac 或 Windows 平台。
+
+本机候选作为正式发行物复用前，最低系统、原生签名及公证状态、本机环境差异都必须完成核实。`manual-local` 记录还必须具备下列字段；缺失或仍为旧记录中的 `minimumSystemRuntimeTested: false` 时，严格汇总会拒绝该候选：
+
+| 字段 | 必须据实记录的内容 |
+| --- | --- |
+| `minimumSystemVersionMetadata` | 候选包实际元数据中的最低系统版本，须与已审查 Git 提交的 `src-tauri/tauri.conf.json` 一致；当前为 `11.0`。 |
+| `minimumSystemRuntimeTested` | 只有同一候选确实在声明最低版本上完成原生启动和 GUI 验证，才能填 `true`。 |
+| `minimumSystemRuntime` | 实际 `osVersion`、`host: "darwin-arm64"`、均为 `true` 的 `architectureVerified` / `processAlive` / `guiObserved`、与外层一致的 `installerSha256` / `updaterSha256`，以及私有验证报告的 `reportSha256`。 |
+| `nativeSigning` | `identity` 为实际核实的 `ad-hoc` 或 `developer-id`，`identityVerified: true`，`notarization` 为实际核实的 `not-notarized` 或 `verified`，并保留私有签名核查报告的 `reportSha256`。临时签名不能同时声称公证已通过。 |
+| `environmentVerification` | `differencesReviewed: true`、`compatibleWithRelease: true` 以及私有环境核查报告的 `reportSha256`。报告应绑定本次构建提交及候选散列，核对实际 Node / Rust / Xcode / SDK、依赖和构建参数与发行流程的差异，说明相关差异为何不影响本次制品。 |
+
+最低版本比较允许等价的零补丁写法，如 `11.0` 与 `11.0.0`；在更高版本（包括更高补丁版本）启动不构成最低版本运行证据。包内最低版本元数据、较新 macOS 上的成功启动、Git 输入一致，都不能代替该验证。缺少能运行声明最低版本的原生或已验证等价环境时，保留缺口，本机包只能作为候选，不能填造验证记录或通过调高最低系统需求逃避验证。
+
+现有发行策略允许临时签名且未公证的 macOS 包；如实核实并记录 `ad-hoc` / `not-notarized` 即可满足签名状态核查，不额外要求 Developer ID 或 Apple 公证。`signatureVerified: true` 仍须来自候选应用的实际完整性验签；独立的更新签名不证明 Apple 签名或公证。若实际使用 Developer ID 或声明公证通过，必须留存相应真实证据。
+
+填写者应依据私有实际记录填写，原始日志、路径、截图和环境报告留在私有位置，候选 JSON 只保存上述结果与报告散列。汇总器核对 Git 输入、声明的最低版本、字段约束与制品散列，并重新验证更新签名；报告散列不是运行测试或身份核验的替代品，仍须审查其对应记录。托管 runner 的 `schema: 1` 验收流程保持原样；它的启动结果同样不能被表述为最低系统运行或 Apple 公证已通过。三平台汇总成功只说明已通过脚本规定的证据检查，公开发行仍须完成当前候选的其他验收与隐私检查。
 
 GitHub 的手动触发输入、原生 runner 标签与 artifact 保留期以 [workflow_dispatch 文档](https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/trigger-a-workflow)、[runner 参考](https://docs.github.com/en/actions/reference/runners/github-hosted-runners)和[artifact 文档](https://docs.github.com/en/actions/tutorials/store-and-share-data)为准。Windows 静默安装使用 Tauri 所述的 NSIS `/S` 参数；见 [Tauri Windows 安装包说明](https://v2.tauri.app/distribute/windows-installer/)。

@@ -1,0 +1,18 @@
+import {cleanup,fireEvent,render,screen,waitFor,within} from '@testing-library/react';
+import {afterEach,expect,it,vi} from 'vitest';
+import App from './App';
+const c=vi.hoisted(()=>({path:null as null|string, readError:false,writeError:false,importError:false,installError:false,calls:[] as string[]}));
+const state={appVersion:'0.1.7',accounts:[],domains:[],links:[],pools:[],pendingOperations:[],pendingActions:[]};
+vi.mock('@tauri-apps/plugin-dialog',()=>({save:async()=>{c.calls.push('save');return c.path;},open:async()=>{c.calls.push('open');return c.path;}}));
+vi.mock('@tauri-apps/plugin-fs',()=>({writeTextFile:async()=>{c.calls.push('write');if(c.writeError)throw Error('磁盘不可写');},readTextFile:async()=>{c.calls.push('read');if(c.readError)throw Error('文件不可读');return '{"example":true}';}}));
+vi.mock('./bridge',()=>({preview:false,errorMessage:(e:unknown)=>String(e),dispatch:async(action:string)=>{
+ c.calls.push(action);if(action==='get_state')return state;if(action==='export_config')return '{}';if(action==='import_config'){if(c.importError)throw Error('备份验证不通过');return state;}if(action==='check_update')return {status:'available',currentVersion:'0.1.7',version:'0.1.8'};if(action==='install_update'){if(c.installError)throw Error('更新下载失败');return null;}throw Error(action);
+}}));
+afterEach(()=>{cleanup();c.path=null;c.readError=false;c.writeError=false;c.importError=false;c.installError=false;c.calls=[];});
+async function start(){render(<App/>);await waitFor(()=>expect(screen.queryByText('正在读取本机配置…')).toBeNull());fireEvent.click(screen.getByRole('button',{name:'Cloudflare 账户'}));}
+it('export dialog cancellation performs no disk write and emits no false saved notice',async()=>{await start();fireEvent.click(screen.getByRole('button',{name:'导出配置'}));await waitFor(()=>expect(c.calls).toContain('save'));expect(c.calls).not.toContain('write');expect(screen.queryByText('备份已保存。')).toBeNull();});
+it('export file write failure surfaces a useful error',async()=>{c.path='/synthetic/config.json';c.writeError=true;await start();fireEvent.click(screen.getByRole('button',{name:'导出配置'}));await waitFor(()=>expect(screen.getByRole('alert').textContent).toContain('磁盘不可写'));expect(screen.queryByText('备份已保存。')).toBeNull();});
+it('import cancellation performs no read or import',async()=>{await start();fireEvent.click(screen.getByRole('button',{name:'导入配置'}));await waitFor(()=>expect(c.calls).toContain('open'));expect(c.calls).not.toContain('read');expect(c.calls).not.toContain('import_config');});
+it('import read failure never dispatches import',async()=>{c.path='/synthetic/config.json';c.readError=true;await start();fireEvent.click(screen.getByRole('button',{name:'导入配置'}));await waitFor(()=>expect(screen.getByRole('alert').textContent).toContain('文件不可读'));expect(c.calls).not.toContain('import_config');});
+it('import validation failure never announces success',async()=>{c.path='/synthetic/config.json';c.importError=true;await start();fireEvent.click(screen.getByRole('button',{name:'导入配置'}));await waitFor(()=>expect(screen.getByRole('alert').textContent).toContain('备份验证不通过'));expect(screen.queryByText('备份已导入并验证。')).toBeNull();});
+it('update installation rejection remains visible in update dialog',async()=>{c.installError=true;await start();fireEvent.click(screen.getByRole('button',{name:'检查更新'}));const d=await screen.findByRole('dialog',{name:'应用更新'});expect(d.textContent).toContain('0.1.7');expect(d.textContent).toContain('0.1.8');fireEvent.click(within(d).getByRole('button',{name:'确认安装更新'}));await waitFor(()=>expect(within(d).getByRole('alert').textContent).toContain('更新下载失败'));});

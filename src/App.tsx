@@ -168,7 +168,10 @@ export default function App() {
   const [state, setState] = useState<State>(emptyState);
   const [loading, setLoading] = useState(true);
   const [loadFailed, setLoadFailed] = useState(false);
-  const [busy, setBusy] = useState(false);
+  const [working, setWorking] = useState(false);
+  const [mutation, setMutation] = useState<string | null>(null);
+  const mutationRef = useRef<string | null>(null);
+  const busy = working || mutation !== null;
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const [search, setSearch] = useState("");
@@ -214,6 +217,7 @@ export default function App() {
     Record<string, { fingerprint: string; report: PoolHealth }>
   >({});
   const [poolSavedRevision, setPoolSavedRevision] = useState(0);
+  const [poolError, setPoolError] = useState("");
   const [monitorAccount, setMonitorAccount] = useState<Account | null>(null);
   const [monitorEndpoint, setMonitorEndpoint] = useState("");
   const [monitorSecret, setMonitorSecret] = useState("");
@@ -225,6 +229,7 @@ export default function App() {
   const stateRef = useRef(state);
   const linkDraftRef = useRef(linkDraft);
   const linkPrepareSequence = useRef(0);
+  const monitorPrepareSequence = useRef(0);
   const domainDraftRef = useRef(domainDraft);
   const detectionSequence = useRef(0);
   const domainCheckSequence = useRef(0);
@@ -276,33 +281,57 @@ export default function App() {
     return () => clearTimeout(id);
   }, [notice]);
 
+  async function withMutation(kind: string, work: () => Promise<void>) {
+    if (mutationRef.current) return;
+    mutationRef.current = kind;
+    setMutation(kind);
+    try {
+      await work();
+    } finally {
+      mutationRef.current = null;
+      setMutation(null);
+    }
+  }
+  function closeMonitor() {
+    monitorPrepareSequence.current += 1;
+    setMonitorAccount(null);
+    setMonitorSecret("");
+  }
+
   async function run<T>(
     work: () => Promise<T>,
     success?: string,
     shouldAccept: () => boolean = () => true,
+    onFailure?: (message: string) => void,
   ): Promise<T | undefined> {
-    setBusy(true);
+    setWorking(true);
     setError("");
     try {
       const value = await work();
       if (success && shouldAccept()) setNotice(success);
       return value;
     } catch (e) {
-      if (shouldAccept()) setError(errorMessage(e));
+      if (shouldAccept()) {
+        const message = errorMessage(e);
+        setError(message);
+        onFailure?.(message);
+      }
       return undefined;
     } finally {
-      setBusy(false);
+      setWorking(false);
     }
   }
   async function prepare(
     kind: string,
     fields: Record<string, unknown>,
     shouldAccept: () => boolean = () => true,
+    onFailure?: (message: string) => void,
   ) {
     const next = await run(
       () => dispatch<Plan>("prepare_change", { kind, ...fields }),
       undefined,
       shouldAccept,
+      onFailure,
     );
     if (next && shouldAccept()) {
       setPlanKind(kind);
@@ -373,66 +402,70 @@ export default function App() {
     return Boolean(next && shouldAccept());
   }
   async function apply() {
-    if (!plan) return;
-    const appliedKind = planKind;
-    const savedLink =
-      planKind === "save_link" && linkDraft ? { ...linkDraft } : null;
-    const dnsSnapshot =
-      appliedKind === "fix_domain_dns" ? { ...domainDraftRef.current } : null;
-    const takeover = Boolean(plan.domainTakeoverConfirmation);
-    const next = await run(
-      () =>
-        dispatch<State>("apply_plan", {
-          planId: plan.id,
-          ...(takeover ? { acknowledgeDomainTakeover: true } : {}),
-        }),
-      appliedKind === "add_domain"
-        ? "域名已接入。现在可以创建第一条短链接；云端配置可能需要稍等片刻才生效。"
-        : appliedKind === "fix_domain_dns"
-          ? "解析设置已提交，正在继续检查域名。"
-          : "已提交修改。云端更新可能需要一点时间生效。",
-    );
-    if (next) {
-      stateRef.current = next;
-      setState(next);
-      setPoolHealth({});
-      if (appliedKind === "save_pool") setPoolSavedRevision((n) => n + 1);
-      setPlan(null);
-      if (appliedKind === "save_link") closeLink();
-      setDomainOpen(appliedKind === "fix_domain_dns");
-      setPreflight(null);
-      setDnsPreflight(null);
-      if (
-        appliedKind === "fix_domain_dns" &&
-        dnsSnapshot &&
-        domainDraftRef.current.input === dnsSnapshot.input &&
-        domainDraftRef.current.prefix === dnsSnapshot.prefix &&
-        domainDraftRef.current.accountId === dnsSnapshot.accountId
-      )
-        void refreshDomainPreparation(dnsSnapshot, {
-          openPlanWhenReady: true,
-          repairAlreadyApplied: true,
-        });
-      if (savedLink) {
-        const domain = next.domains.find((d) => d.id === savedLink.domainId);
-        const link = next.links.find(
-          (l) => l.domainId === savedLink.domainId && l.slug === savedLink.slug,
-        );
-        if (domain && link) void selftest(link, domain);
-      }
-    } else {
-      setPlan(null);
-      setDomainOpen(
-        appliedKind === "add_domain" || appliedKind === "fix_domain_dns",
+    await withMutation("apply", async () => {
+      if (!plan) return;
+      const appliedKind = planKind;
+      const savedLink =
+        planKind === "save_link" && linkDraft ? { ...linkDraft } : null;
+      const dnsSnapshot =
+        appliedKind === "fix_domain_dns" ? { ...domainDraftRef.current } : null;
+      const takeover = Boolean(plan.domainTakeoverConfirmation);
+      const next = await run(
+        () =>
+          dispatch<State>("apply_plan", {
+            planId: plan.id,
+            ...(takeover ? { acknowledgeDomainTakeover: true } : {}),
+          }),
+        appliedKind === "add_domain"
+          ? "域名已接入。现在可以创建第一条短链接；云端配置可能需要稍等片刻才生效。"
+          : appliedKind === "fix_domain_dns"
+            ? "解析设置已提交，正在继续检查域名。"
+            : "已提交修改。云端更新可能需要一点时间生效。",
+        undefined,
+        appliedKind === "save_pool" ? setPoolError : undefined,
       );
-      try {
-        const latest = await dispatch<State>("get_state");
-        stateRef.current = latest;
-        setState(latest);
-      } catch {
-        /* Preserve the original operation error. */
+      if (next) {
+        stateRef.current = next;
+        setState(next);
+        setPoolHealth({});
+        if (appliedKind === "save_pool") setPoolSavedRevision((n) => n + 1);
+        setPlan(null);
+        if (appliedKind === "save_link") closeLink();
+        setDomainOpen(appliedKind === "fix_domain_dns");
+        setPreflight(null);
+        setDnsPreflight(null);
+        if (
+          appliedKind === "fix_domain_dns" &&
+          dnsSnapshot &&
+          domainDraftRef.current.input === dnsSnapshot.input &&
+          domainDraftRef.current.prefix === dnsSnapshot.prefix &&
+          domainDraftRef.current.accountId === dnsSnapshot.accountId
+        )
+          void refreshDomainPreparation(dnsSnapshot, {
+            openPlanWhenReady: true,
+            repairAlreadyApplied: true,
+          });
+        if (savedLink) {
+          const domain = next.domains.find((d) => d.id === savedLink.domainId);
+          const link = next.links.find(
+            (l) => l.domainId === savedLink.domainId && l.slug === savedLink.slug,
+          );
+          if (domain && link) void selftest(link, domain);
+        }
+      } else {
+        setPlan(null);
+        setDomainOpen(
+          appliedKind === "add_domain" || appliedKind === "fix_domain_dns",
+        );
+        try {
+          const latest = await dispatch<State>("get_state");
+          stateRef.current = latest;
+          setState(latest);
+        } catch {
+          /* Preserve the original operation error. */
+        }
       }
-    }
+    });
   }
   async function copy(value: string) {
     await run(async () => {
@@ -881,7 +914,7 @@ export default function App() {
     setDomainOpen(false);
   }
   function returnFromPlan() {
-    if (busy && planKind === "fix_domain_dns") return;
+    if (mutationRef.current === "apply") return;
     setPlan(null);
     if (planKind === "add_domain" || planKind === "fix_domain_dns")
       setDomainOpen(true);
@@ -946,37 +979,39 @@ export default function App() {
   }
   async function importToken(event: FormEvent) {
     event.preventDefault();
-    if (!token.trim()) {
-      setError("请先粘贴令牌。");
-      return;
-    }
-    const next = await run(
-      () =>
-        dispatch<State>("import_token", {
-          token: token.trim(),
-          replace: replaceToken,
-          ...(updateTokenAccount
-            ? { expectedAccountId: updateTokenAccount.id }
-            : {}),
-        }),
-      updateTokenAccount ? "账户访问令牌已更新。" : "账户已导入。",
-    );
-    if (next) {
-      const shouldResumeDomain = resumeDomainAfterToken.current;
-      resumeDomainAfterToken.current = false;
-      setClipboardToClear(await tokenDigest(token.trim()));
-      stateRef.current = next;
-      setState(next);
-      setToken("");
-      setClipboardOffer("");
-      setReplaceToken(false);
-      setUpdateTokenAccount(null);
-      setTokenOpen(false);
-      if (shouldResumeDomain) {
-        setDomainOpen(true);
-        void refreshDomainPreparation(domainDraftRef.current);
+    await withMutation("token", async () => {
+      if (!token.trim()) {
+        setError("请先粘贴令牌。");
+        return;
       }
-    }
+      const next = await run(
+        () =>
+          dispatch<State>("import_token", {
+            token: token.trim(),
+            replace: replaceToken,
+            ...(updateTokenAccount
+              ? { expectedAccountId: updateTokenAccount.id }
+              : {}),
+          }),
+        updateTokenAccount ? "账户访问令牌已更新。" : "账户已导入。",
+      );
+      if (next) {
+        const shouldResumeDomain = resumeDomainAfterToken.current;
+        resumeDomainAfterToken.current = false;
+        setClipboardToClear(await tokenDigest(token.trim()));
+        stateRef.current = next;
+        setState(next);
+        setToken("");
+        setClipboardOffer("");
+        setReplaceToken(false);
+        setUpdateTokenAccount(null);
+        setTokenOpen(false);
+        if (shouldResumeDomain) {
+          setDomainOpen(true);
+          void refreshDomainPreparation(domainDraftRef.current);
+        }
+      }
+    });
   }
   async function exportBackup() {
     const json = await run(() => dispatch<string>("export_config"));
@@ -1041,44 +1076,51 @@ export default function App() {
       });
   }
   async function installUpdate() {
-    const result = await run(async () => {
-      await dispatch<unknown>("install_update");
-      return true;
+    await withMutation("update", async () => {
+      const result = await run(async () => {
+        await dispatch<unknown>("install_update");
+        return true;
+      });
+      if (result) {
+        setUpdateStatus(null);
+        setNotice("更新已安装，请退出并重新打开软件。");
+      }
     });
-    if (result) {
-      setUpdateStatus(null);
-      setNotice("更新已安装，请退出并重新打开软件。");
-    }
   }
   async function doRename(event: FormEvent) {
     event.preventDefault();
-    if (!renameAccount || !renameValue.trim()) return;
-    const next = await run(
-      () =>
-        dispatch<State>("rename_account", {
-          accountId: renameAccount.id,
-          label: renameValue.trim(),
-        }),
-      "账户名称已更新。",
-    );
-    if (next) {
-      setState(next);
-      setRenameAccount(null);
-    }
+    await withMutation("rename", async () => {
+      if (!renameAccount || !renameValue.trim()) return;
+      const next = await run(
+        () =>
+          dispatch<State>("rename_account", {
+            accountId: renameAccount.id,
+            label: renameValue.trim(),
+          }),
+        "账户名称已更新。",
+      );
+      if (next) {
+        setState(next);
+        setRenameAccount(null);
+      }
+    });
   }
   async function doRemove() {
-    if (!removeAccount) return;
-    const next = await run(
-      () => dispatch<State>("remove_account", { accountId: removeAccount.id }),
-      "本机账户记录已移除。",
-    );
-    if (next) {
-      setState(next);
-      setRemoveAccount(null);
-    }
+    await withMutation("remove", async () => {
+      if (!removeAccount) return;
+      const next = await run(
+        () => dispatch<State>("remove_account", { accountId: removeAccount.id }),
+        "本机账户记录已移除。",
+      );
+      if (next) {
+        setState(next);
+        setRemoveAccount(null);
+      }
+    });
   }
   async function savePool(pool: Pool, shouldAccept?: () => boolean) {
-    return prepare("save_pool", { pool }, shouldAccept);
+    setPoolError("");
+    return prepare("save_pool", { pool }, shouldAccept, setPoolError);
   }
   async function prepareMonitor(event: FormEvent) {
     event.preventDefault();
@@ -1096,7 +1138,9 @@ export default function App() {
       setError("服务密钥须为 32–256 个无空白的可打印 ASCII 字符。");
       return;
     }
-    setBusy(true);
+    const requestSequence = ++monitorPrepareSequence.current;
+    const shouldAccept = () => requestSequence === monitorPrepareSequence.current;
+    setWorking(true);
     setError("");
     let next: Plan | undefined;
     try {
@@ -1106,10 +1150,12 @@ export default function App() {
         secret: monitorSecret,
       });
     } catch (e) {
-      setError(errorMessage(e).replaceAll(monitorSecret, "[已隐藏]"));
+      if (shouldAccept())
+        setError(errorMessage(e).replaceAll(monitorSecret, "[已隐藏]"));
     } finally {
-      setBusy(false);
+      setWorking(false);
     }
+    if (!shouldAccept()) return;
     setMonitorSecret("");
     if (next) {
       setPlanKind("enable_monitor");
@@ -1926,6 +1972,8 @@ export default function App() {
               onCheckHealth={(id) => void inspectPool(id)}
               planOpen={Boolean(plan && planKind === "save_pool")}
               savedRevision={poolSavedRevision}
+              serverError={poolError}
+              onDraftChange={() => setPoolError("")}
             />
           ) : page === "domains" ? (
             <>
@@ -2645,13 +2693,13 @@ export default function App() {
           eyebrow="REVIEW & CONFIRM"
           error={error}
           onClose={returnFromPlan}
-          dismissDisabled={busy && planKind === "fix_domain_dns"}
+          dismissDisabled={mutation === "apply"}
           footer={
             <>
               <button
                 className="button ghost"
                 onClick={returnFromPlan}
-                disabled={busy && planKind === "fix_domain_dns"}
+                disabled={mutation === "apply"}
               >
                 返回
               </button>
@@ -2711,6 +2759,7 @@ export default function App() {
       {tokenOpen && (
         <Dialog
           title={updateTokenAccount ? "更新访问令牌" : "导入访问令牌"}
+          dismissDisabled={mutation === "token"}
           eyebrow="ACCOUNT ACCESS"
           error={error}
           onClose={() => {
@@ -2724,6 +2773,7 @@ export default function App() {
             <>
               <button
                 className="button ghost"
+                disabled={mutation === "token"}
                 onClick={() => {
                   resumeDomainAfterToken.current = false;
                   setTokenOpen(false);
@@ -2785,6 +2835,7 @@ export default function App() {
                 type="password"
                 autoComplete="off"
                 value={token}
+                disabled={mutation === "token"}
                 onChange={(e) => setToken(e.target.value)}
                 onFocus={() => void checkClipboard()}
                 placeholder="在此粘贴令牌"
@@ -2797,6 +2848,7 @@ export default function App() {
                 <span>检测到可能的访问令牌，是否填入？</span>
                 <button
                   type="button"
+                  disabled={mutation === "token"}
                   onClick={() => {
                     setToken(clipboardOffer);
                     setClipboardOffer("");
@@ -2818,7 +2870,7 @@ export default function App() {
                 type="checkbox"
                 checked={replaceToken}
                 onChange={(e) => setReplaceToken(e.target.checked)}
-                disabled={Boolean(updateTokenAccount)}
+                disabled={Boolean(updateTokenAccount) || mutation === "token"}
               />
               <span>
                 {updateTokenAccount
@@ -2832,12 +2884,14 @@ export default function App() {
       {renameAccount && (
         <Dialog
           title="重命名账户"
+          dismissDisabled={mutation === "rename"}
           error={error}
           onClose={() => setRenameAccount(null)}
           footer={
             <>
               <button
                 className="button ghost"
+                disabled={mutation === "rename"}
                 onClick={() => setRenameAccount(null)}
               >
                 取消
@@ -2862,6 +2916,7 @@ export default function App() {
               账户名称
               <input
                 value={renameValue}
+                disabled={mutation === "rename"}
                 onChange={(e) => setRenameValue(e.target.value)}
                 maxLength={60}
                 required
@@ -2874,12 +2929,14 @@ export default function App() {
       {removeAccount && (
         <Dialog
           title="从本机移除账户"
+          dismissDisabled={mutation === "remove"}
           error={error}
           onClose={() => setRemoveAccount(null)}
           footer={
             <>
               <button
                 className="button ghost"
+                disabled={mutation === "remove"}
                 onClick={() => setRemoveAccount(null)}
               >
                 取消
@@ -2957,6 +3014,8 @@ export default function App() {
                 <button
                   className="button secondary"
                   onClick={() => {
+                    monitorPrepareSequence.current += 1;
+                    setError("");
                     setMonitorAccount(manageAccount);
                     setMonitorEndpoint(manageAccount.monitorEndpoint || "");
                     setMonitorSecret("");
@@ -3035,18 +3094,12 @@ export default function App() {
           title="配置检测服务"
           eyebrow="OPTIONAL MONITOR"
           error={error}
-          onClose={() => {
-            setMonitorAccount(null);
-            setMonitorSecret("");
-          }}
+          onClose={closeMonitor}
           footer={
             <>
               <button
                 className="button ghost"
-                onClick={() => {
-                  setMonitorAccount(null);
-                  setMonitorSecret("");
-                }}
+                onClick={closeMonitor}
               >
                 取消
               </button>
@@ -3074,7 +3127,10 @@ export default function App() {
               <input
                 type="url"
                 value={monitorEndpoint}
-                onChange={(e) => setMonitorEndpoint(e.target.value)}
+                onChange={(e) => {
+                  monitorPrepareSequence.current += 1;
+                  setMonitorEndpoint(e.target.value);
+                }}
                 placeholder="https://probe.example.com/check"
                 required
               />
@@ -3085,7 +3141,10 @@ export default function App() {
                 type="password"
                 autoComplete="off"
                 value={monitorSecret}
-                onChange={(e) => setMonitorSecret(e.target.value)}
+                onChange={(e) => {
+                  monitorPrepareSequence.current += 1;
+                  setMonitorSecret(e.target.value);
+                }}
                 required
               />
               <small>32–256 个无空白的可打印 ASCII 字符。</small>
@@ -3181,6 +3240,7 @@ export default function App() {
       {updateStatus && (
         <Dialog
           title="应用更新"
+          dismissDisabled={mutation === "update"}
           eyebrow="DESKTOP UPDATE"
           error={error}
           onClose={() => setUpdateStatus(null)}
@@ -3188,6 +3248,7 @@ export default function App() {
             <>
               <button
                 className="button ghost"
+                disabled={mutation === "update"}
                 onClick={() => setUpdateStatus(null)}
               >
                 {updateStatus.status === "available" ? "稍后再说" : "关闭"}

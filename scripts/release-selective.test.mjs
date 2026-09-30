@@ -158,7 +158,8 @@ test('manual ARM reuse derives the application tree from both commits and reject
     const inputs = {
       'index.html': '<html></html>', 'package-lock.json': '{}', 'vite.config.ts': 'export default {};',
       'tsconfig.json': '{}', 'LICENSE': 'fixture', 'THIRD-PARTY-NOTICES.md': 'fixture',
-      'src/App.tsx': 'export default null;', 'src-tauri/tauri.conf.json': '{}',
+      'src/App.tsx': 'export default null;',
+      'src-tauri/tauri.conf.json': JSON.stringify({ bundle: { macOS: { minimumSystemVersion: '11.0' } } }),
       'edge/worker.mjs': 'export default {};', 'public/app-icon.svg': '<svg/>',
     };
     for (const [path, content] of Object.entries(inputs)) put(join(dir, path), content);
@@ -193,9 +194,20 @@ test('manual ARM reuse derives the application tree from both commits and reject
         installer: installer.split('/').at(-1), installerSha256: digest(installer),
         updater: updater.split('/').at(-1), updaterSha256: digest(updater) };
       if (target === 'aarch64-apple-darwin') Object.assign(evidence, {
-        schema: 2, method: 'manual-local', reviewedSha, buildSha, osVersion: '26.5.2',
+        schema: 2, method: 'manual-local', reviewedSha, buildSha, osVersion: '26.5.3',
         guiObserved: true, updaterSignatureVerified: true,
-        minimumSystemVersionMetadata: '11.0', minimumSystemRuntimeTested: false,
+        minimumSystemVersionMetadata: '11.0', minimumSystemRuntimeTested: true,
+        minimumSystemRuntime: {
+          osVersion: '11.0.0', host: 'darwin-arm64', architectureVerified: true,
+          processAlive: true, guiObserved: true, reportSha256: 'd'.repeat(64),
+          installerSha256: digest(installer), updaterSha256: digest(updater),
+        },
+        nativeSigning: {
+          identity: 'ad-hoc', identityVerified: true, notarization: 'not-notarized', reportSha256: 'e'.repeat(64),
+        },
+        environmentVerification: {
+          differencesReviewed: true, compatibleWithRelease: true, reportSha256: 'f'.repeat(64),
+        },
         appInputManifestSha256: expected.sha256, appInputFileCount: expected.fileCount,
         buildConfiguration: {
           releaseConfigSha256: 'a'.repeat(64), updaterPublicKeySha256: TEST_PUBLIC_KEY_SHA256,
@@ -207,13 +219,64 @@ test('manual ARM reuse derives the application tree from both commits and reject
       put(join(base, 'native-smoke.json'), JSON.stringify(evidence));
     }
     const evidenceFile = join(dir, 'candidates', 'candidate-aarch64-apple-darwin', 'native-smoke.json');
-    const run = () => spawnSync(process.execPath, [join(root, 'scripts/release-manifest.mjs'), 'candidates', '--require-evidence'], {
-      cwd: dir, encoding: 'utf8', env: { ...process.env, RELEASE_TAG: 'v0.1.1', RELEASE_SHA: reviewedSha,
+    const run = (releaseSha = reviewedSha) => spawnSync(process.execPath, [join(root, 'scripts/release-manifest.mjs'), 'candidates', '--require-evidence'], {
+      cwd: dir, encoding: 'utf8', env: { ...process.env, RELEASE_TAG: 'v0.1.1', RELEASE_SHA: releaseSha,
         GITHUB_REPOSITORY: 'sample/short-link-generator', SLG_UPDATER_PUBLIC_KEY: TEST_PUBLIC_KEY },
     });
     const assembled = run();
     assert.equal(assembled.status, 0, assembled.stderr);
     const valid = JSON.parse(readFileSync(evidenceFile, 'utf8'));
+    // These are synthetic attestations only; no test here proves real macOS compatibility or signing.
+    for (const [label, patch, expectedError] of [
+      ['malformed host OS', { osVersion: 'unknown' }, /Manual local ARM evidence is incomplete/],
+      ['host older than minimum', { osVersion: '10.15.7' }, /minimum-system runtime evidence/],
+      ['wrong metadata minimum', { minimumSystemVersionMetadata: '12.0' }, /minimum-system runtime evidence/],
+      ['metadata-only historical evidence', { osVersion: '26.5.2', minimumSystemRuntimeTested: false }, /minimum-system runtime evidence/],
+      ['missing runtime record', { minimumSystemRuntime: undefined }, /minimum-system runtime evidence/],
+      ...[
+        ['newer runtime OS', { osVersion: '11.1' }],
+        ['newer runtime patch', { osVersion: '11.0.1' }],
+        ['older runtime OS', { osVersion: '10.15.7' }],
+        ['wrong native host', { host: 'darwin-x64' }],
+        ['unverified architecture', { architectureVerified: false }],
+        ['unobserved minimum-system GUI', { guiObserved: false }],
+        ['failed minimum-system startup', { processAlive: false }],
+        ['missing runtime report', { reportSha256: undefined }],
+        ['non-string runtime report hash', { reportSha256: ['d'.repeat(64)] }],
+        ['different installer', { installerSha256: 'a'.repeat(64) }],
+        ['different updater', { updaterSha256: 'a'.repeat(64) }],
+      ].map(([label, patch]) => [label, { minimumSystemRuntime: { ...valid.minimumSystemRuntime, ...patch } }, /minimum-system runtime evidence/]),
+      ['missing signing record', { nativeSigning: undefined }, /native signing and notarization status/],
+      ...[
+        ['unknown signing identity', { identity: 'unknown' }],
+        ['unverified signing identity', { identityVerified: false }],
+        ['unknown notarization status', { notarization: 'unknown' }],
+        ['contradictory notarization claim', { notarization: 'verified' }],
+        ['missing signing report', { reportSha256: undefined }],
+      ].map(([label, patch]) => [label, { nativeSigning: { ...valid.nativeSigning, ...patch } }, /native signing and notarization status/]),
+      ['missing environment record', { environmentVerification: undefined }, /build-environment differences/],
+      ...[
+        ['unreviewed environment differences', { differencesReviewed: false }],
+        ['incompatible environment', { compatibleWithRelease: false }],
+        ['missing environment report', { reportSha256: undefined }],
+      ].map(([label, patch]) => [label, { environmentVerification: { ...valid.environmentVerification, ...patch } }, /build-environment differences/]),
+    ]) {
+      put(evidenceFile, JSON.stringify({ ...valid, ...patch }));
+      const rejected = run();
+      assert.notEqual(rejected.status, 0, label);
+      assert.match(rejected.stderr, expectedError, label);
+    }
+    // Host OS snapshots may change. Equivalent zero-patch metadata remains the same minimum.
+    for (const patch of [
+      { osVersion: '15.7', minimumSystemVersionMetadata: '11.0.0' },
+      { minimumSystemRuntime: { ...valid.minimumSystemRuntime, osVersion: '11.0' } },
+      { nativeSigning: { ...valid.nativeSigning, identity: 'developer-id' } },
+      { nativeSigning: { ...valid.nativeSigning, identity: 'developer-id', notarization: 'verified' } },
+    ]) {
+      put(evidenceFile, JSON.stringify({ ...valid, ...patch }));
+      const accepted = run();
+      assert.equal(accepted.status, 0, accepted.stderr);
+    }
     // A freshly built and manually verified local package can use the reviewed commit itself.
     put(evidenceFile, JSON.stringify({ ...valid, buildSha: reviewedSha }));
     const sameCommit = run();
@@ -252,6 +315,28 @@ test('manual ARM reuse derives the application tree from both commits and reject
     const changedSha = git('rev-parse', 'HEAD');
     assert.throws(() => matchingAppInputs(buildSha, changedSha, dir), /changed between/);
     assert.throws(() => matchingAppInputs('b'.repeat(40), reviewedSha, dir));
+    // A synthetic future policy proves that the gate reads the reviewed config, not a fixed OS floor.
+    // The application's real minimum remains unchanged by this fixture.
+    put(join(dir, 'src-tauri', 'tauri.conf.json'), JSON.stringify({ bundle: { macOS: { minimumSystemVersion: '12.3' } } }));
+    git('add', 'src-tauri/tauri.conf.json'); git('commit', '-qm', 'synthetic minimum-system policy');
+    const policySha = git('rev-parse', 'HEAD');
+    git('tag', '-d', 'v0.1.1'); git('tag', 'v0.1.1');
+    const policyInputs = matchingAppInputs(policySha, policySha, dir);
+    const policyEvidence = { ...valid, buildSha: policySha, reviewedSha: policySha,
+      appInputManifestSha256: policyInputs.sha256, appInputFileCount: policyInputs.fileCount,
+      minimumSystemVersionMetadata: '12.3', minimumSystemRuntime: { ...valid.minimumSystemRuntime, osVersion: '12.3' },
+    };
+    put(evidenceFile, JSON.stringify(policyEvidence));
+    for (const target of ['x86_64-apple-darwin', 'x86_64-pc-windows-msvc']) {
+      const path = join(dir, 'candidates', `candidate-${target}`, 'native-smoke.json');
+      put(path, JSON.stringify({ ...JSON.parse(readFileSync(path, 'utf8')), sha: policySha }));
+    }
+    const configuredMinimum = run(policySha);
+    assert.equal(configuredMinimum.status, 0, configuredMinimum.stderr);
+    put(evidenceFile, JSON.stringify({ ...policyEvidence,
+      minimumSystemVersionMetadata: '11.0', minimumSystemRuntime: valid.minimumSystemRuntime,
+    }));
+    assert.match(run(policySha).stderr, /minimum-system runtime evidence/);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 

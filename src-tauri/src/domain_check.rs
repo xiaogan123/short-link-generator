@@ -215,6 +215,67 @@ pub fn placeholder_conflict(all_records: &[Value], host: &str, zone_name: &str) 
     None
 }
 
+// Enabling the HTTP proxy also changes address answers used by non-HTTP
+// services. Inspect reverse CNAME dependencies across the entire zone before
+// allowing an MX/SRV target to become proxied.
+pub fn proxy_conflict(all_records: &[Value], host: &str, zone_name: &str) -> Option<String> {
+    let normalize = |name: &str| name.trim_end_matches('.').to_ascii_lowercase();
+    let host = normalize(host);
+    let zone_name = normalize(zone_name);
+    let mut aliases = std::collections::HashSet::from([host.clone()]);
+    let mut cnames = Vec::new();
+    let mut services = Vec::new();
+    for item in all_records {
+        let Some(name) = item["name"].as_str().map(normalize) else {
+            return Some("DNS 区域记录格式无效，无法安全开启代理".into());
+        };
+        let Some(kind) = item["type"].as_str() else {
+            return Some("DNS 区域记录格式无效，无法安全开启代理".into());
+        };
+        if kind == "NS"
+            && (name == host || (name != zone_name && host.ends_with(&format!(".{name}"))))
+        {
+            return Some(format!("{name} 存在 NS 子域委派，不能安全开启代理"));
+        }
+        if matches!(kind, "CNAME" | "MX" | "SRV") {
+            let target = if kind == "SRV" {
+                item["data"]["target"].as_str().or_else(|| {
+                    item["content"]
+                        .as_str()
+                        .and_then(|value| value.split_whitespace().last())
+                })
+            } else {
+                item["content"].as_str()
+            };
+            let Some(target) = target.filter(|target| !target.is_empty()) else {
+                return Some(format!("{name} 的 {kind} 目标无法核实，停止开启代理"));
+            };
+            let target = normalize(target);
+            if kind == "CNAME" {
+                cnames.push((name, target));
+            } else {
+                services.push((name, kind, target));
+            }
+        }
+    }
+    loop {
+        let before = aliases.len();
+        for (name, target) in &cnames {
+            if aliases.contains(target) {
+                aliases.insert(name.clone());
+            }
+        }
+        if aliases.len() == before {
+            break;
+        }
+    }
+    services.into_iter().find_map(|(name, kind, target)| {
+        aliases.contains(&target).then(|| format!(
+            "{name} 的 {kind} 记录直接或通过 CNAME 使用 {host}；开启代理可能中断邮件或其他服务，请使用独立短链接主机名"
+        ))
+    })
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PathRiskSnapshot {
     pub root: ProbeRisk,
@@ -732,5 +793,34 @@ mod tests {
         };
         assert!(!changed.can_replace(&warning));
         assert!(!warning.can_replace(&safer));
+    }
+    #[test]
+    fn proxy_blocks_mail_and_srv_targets_through_aliases_and_delegation() {
+        let aliases = vec![
+            serde_json::json!({"name":"alias.example.com","type":"CNAME","content":"MAIL.EXAMPLE.COM."}),
+            serde_json::json!({"name":"other.example.com","type":"CNAME","content":"alias.example.com"}),
+        ];
+        for service in [
+            serde_json::json!({"name":"example.com","type":"MX","content":"mail.example.com"}),
+            serde_json::json!({"name":"example.com","type":"MX","content":"other.example.com"}),
+            serde_json::json!({"name":"_sip._tcp.example.com","type":"SRV","content":"0 5 5060 other.example.com"}),
+            serde_json::json!({"name":"_sip._tcp.example.com","type":"SRV","data":{"target":"other.example.com."}}),
+            serde_json::json!({"name":"mail.example.com","type":"NS","content":"ns.example.org"}),
+        ] {
+            let mut all = aliases.clone();
+            all.push(service);
+            assert!(proxy_conflict(&all, "mail.example.com", "example.com").is_some());
+        }
+        let mut unrelated = aliases;
+        unrelated.push(
+            serde_json::json!({"name":"example.com","type":"MX","content":"unrelated.example.org"}),
+        );
+        assert!(proxy_conflict(&unrelated, "mail.example.com", "example.com").is_none());
+        assert!(proxy_conflict(
+            &[serde_json::json!({"name":"_sip._tcp.example.com","type":"SRV"})],
+            "mail.example.com",
+            "example.com"
+        )
+        .is_some());
     }
 }

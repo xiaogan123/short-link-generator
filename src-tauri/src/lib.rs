@@ -334,6 +334,30 @@ fn validate_monitor_config(value: &Value) -> Result<(), String> {
     }
     Ok(())
 }
+fn valid_cleanup_metadata(key: &str, raw: &str) -> bool {
+    if key == "m:monitor:cursor" {
+        return raw
+            .parse::<u64>()
+            .is_ok_and(|value| value <= 9_007_199_254_740_991 && value.to_string() == raw);
+    }
+    if !key.strip_prefix("h:").is_some_and(pools::valid_id) || raw.len() > 16_384 {
+        return false;
+    }
+    let Ok(value) = serde_json::from_str::<Value>(raw) else {
+        return false;
+    };
+    pools::valid_health(&value)
+        && value.as_object().is_some_and(|o| o.len() == 3)
+        && value["revision"]
+            .as_str()
+            .is_some_and(|revision| chrono::DateTime::parse_from_rfc3339(revision).is_ok())
+        && value["targets"].as_object().is_some_and(|targets| {
+            targets
+                .values()
+                .all(|target| target.as_object().is_some_and(|o| o.len() == 4))
+        })
+}
+
 fn normalize_host(input: &str) -> Result<String, String> {
     let value = input.trim();
     let url = url::Url::parse(
@@ -1046,6 +1070,28 @@ impl Backend {
         Ok(())
     }
 
+    async fn proxy_is_safe(
+        &self,
+        token: &str,
+        zone_id: &str,
+        zone_name: &str,
+        host: &str,
+        expected: &[domain_check::DnsRecordFingerprint],
+    ) -> Result<(), String> {
+        let all = self
+            .cloud
+            .list_pages(token, &format!("zones/{zone_id}/dns_records"))
+            .await
+            .map_err(problem)?;
+        if domain_check::dns_fingerprint(&all, host)? != expected {
+            return Err("DNS 记录已变化，请重新检查并生成新计划".into());
+        }
+        if let Some(message) = domain_check::proxy_conflict(&all, host, zone_name) {
+            return Err(message);
+        }
+        Ok(())
+    }
+
     async fn prepare_domain_dns(&mut self, payload: &Value) -> Result<Value, String> {
         let host = normalize_host(field(payload, "input")?)?;
         let choice = payload["accountId"].as_str();
@@ -1170,22 +1216,40 @@ impl Backend {
                                 }
                             }
                             domain_check::DnsAssessment::DnsOnly(pending) => {
-                                dns_status = "dnsOnly".into();
-                                checks.push(DomainCheck {
-                                    label: "DNS".into(),
-                                    ok: true,
-                                    message: format!(
+                                match self
+                                    .proxy_is_safe(
+                                        &token,
+                                        &candidate.zone_id,
+                                        &zone_name,
+                                        &host,
+                                        &records,
+                                    )
+                                    .await
+                                {
+                                    Err(message) => {
+                                        dns_status = "conflict".into();
+                                        checks
+                                            .push(domain_check::hard_check("DNS", false, message));
+                                    }
+                                    Ok(()) => {
+                                        dns_status = "dnsOnly".into();
+                                        checks.push(DomainCheck {
+                                            label: "DNS".into(),
+                                            ok: true,
+                                            message: format!(
                                         "该主机名有 {} 条可代理地址记录尚未开启 Cloudflare 代理",
                                         pending.len()
                                     ),
-                                    level: DomainCheckLevel::Warning,
-                                });
-                                actions.extend(pending.iter().map(|record| DnsActionView {
-                                    kind: "enableProxy".into(),
-                                    record_type: record.record_type.clone(),
-                                    name: host.clone(),
-                                }));
-                                let steps = pending
+                                            level: DomainCheckLevel::Warning,
+                                        });
+                                        actions.extend(pending.iter().map(|record| {
+                                            DnsActionView {
+                                                kind: "enableProxy".into(),
+                                                record_type: record.record_type.clone(),
+                                                name: host.clone(),
+                                            }
+                                        }));
+                                        let steps = pending
                                     .iter()
                                     .map(|record| {
                                         format!(
@@ -1194,7 +1258,7 @@ impl Backend {
                                         )
                                     })
                                     .collect();
-                                plan = Some(self.make_plan(
+                                        plan = Some(self.make_plan(
                                     "开启现有 DNS 记录代理",
                                     steps,
                                     vec![format!(
@@ -1207,6 +1271,8 @@ impl Backend {
                                         snapshot: domain_check::DnsSnapshot::EnableProxy(records),
                                     },
                                 ));
+                                    }
+                                }
                             }
                             domain_check::DnsAssessment::Unsupported(message) => {
                                 dns_status = "unsupported".into();
@@ -1777,6 +1843,7 @@ impl Backend {
                 (
                     "清理账号资源",
                     vec![
+                        "确认没有域名、业务记录、监测任务或未知数据后，清理已验证的遗留检测结果和轮转位置".into(),
                         format!("删除专用转发程序 Worker：{}", resources.script),
                         format!("删除专用链接存储 KV：{}", resources.namespace),
                     ],
@@ -2157,6 +2224,8 @@ impl Backend {
                 ) {
                     return Err("DNS 代理状态已变化，请重新准备修复计划".into());
                 }
+                self.proxy_is_safe(&token, zone_id, &zone_name, host, expected)
+                    .await?;
             }
         }
 
@@ -4365,6 +4434,21 @@ impl Backend {
         if self.has_selftest_rotation(account_id) {
             return Err("此账号的自检密钥轮换尚未完成，请先从待处理操作恢复".into());
         }
+        if self.account(account_id)?.monitor_enabled
+            || self
+                .db
+                .pending_monitor_changes
+                .iter()
+                .any(|p| p.account_id == account_id)
+            || self.db.pending_pool_changes.iter().any(|p| {
+                p.pool.account_ids.iter().any(|id| id == account_id)
+                    || p.previous
+                        .as_ref()
+                        .is_some_and(|p| p.account_ids.iter().any(|id| id == account_id))
+            })
+        {
+            return Err("请先关闭监测并恢复此账号未完成的平台或监测操作".into());
+        }
         if self.db.domains.iter().any(|d| d.account_id == account_id) {
             return Err("此账号仍有域名".into());
         }
@@ -4395,8 +4479,38 @@ impl Backend {
             .list_keys(&token, account_id, &resources.namespace, "")
             .await
             .map_err(problem)?;
-        if keys.iter().any(|k| k != MANIFEST_KEY) {
-            return Err("KV 仍有配置记录，停止清理".into());
+        if keys.iter().collect::<HashSet<_>>().len() != keys.len()
+            || keys.iter().any(|key| {
+                key != MANIFEST_KEY
+                    && key != "m:monitor:cursor"
+                    && !key.strip_prefix("h:").is_some_and(pools::valid_id)
+            })
+        {
+            return Err("KV 仍有业务或未知配置记录，停止清理".into());
+        }
+        let mut metadata = Vec::new();
+        for key in keys.iter().filter(|key| key.as_str() != MANIFEST_KEY) {
+            let raw = self
+                .cloud
+                .read_value(&token, account_id, &resources.namespace, key)
+                .await
+                .map_err(problem)?
+                .ok_or("检测记录在核对中消失，请重新准备清理")?;
+            if !valid_cleanup_metadata(key, &raw) {
+                return Err("遗留检测数据格式无法确认，停止清理".into());
+            }
+            metadata.push((key.clone(), raw));
+        }
+        let schedule = self
+            .cloud
+            .schedules(&token, account_id, &resources.script)
+            .await
+            .map_err(problem)?;
+        if !schedule["result"]["schedules"]
+            .as_array()
+            .is_some_and(|items| items.is_empty())
+        {
+            return Err("Worker 仍有计划任务或状态无法确认，停止清理".into());
         }
         let fresh_zones = self.fetch_zones(&token, account_id).await?;
         for zone in &fresh_zones {
@@ -4413,8 +4527,79 @@ impl Backend {
                 return Err("仍有路由指向此 Worker，停止清理".into());
             }
         }
-        let journal = format!("清理账号 {} ({})", account_id, random_id());
-        self.journal_start(&journal)?;
+        let latest_keys = self
+            .cloud
+            .list_keys(&token, account_id, &resources.namespace, "")
+            .await
+            .map_err(problem)?;
+        if latest_keys.iter().collect::<HashSet<_>>() != keys.iter().collect::<HashSet<_>>()
+            || latest_keys.len() != keys.len()
+        {
+            return Err("云端记录清单在核对中变化，停止清理".into());
+        }
+        // Recheck the entire reviewed set before the first mutation, then each
+        // record immediately before its scoped deletion. Provider writes are
+        // still not a cross-resource atomic transaction.
+        for (key, expected) in &metadata {
+            if self
+                .cloud
+                .read_value(&token, account_id, &resources.namespace, key)
+                .await
+                .map_err(problem)?
+                .as_ref()
+                != Some(expected)
+            {
+                return Err("检测记录在核对中变化，停止清理".into());
+            }
+        }
+        let prefix = format!("清理账号 {account_id} (");
+        let pending = self
+            .db
+            .pending_operations
+            .iter()
+            .find(|entry| entry.starts_with(&prefix))
+            .map(|entry| entry.split('：').next().unwrap_or(entry).to_owned());
+        let journal = pending
+            .clone()
+            .unwrap_or_else(|| format!("清理账号 {} ({})", account_id, random_id()));
+        if pending.is_none() {
+            let previous = self.db.pending_operations.clone();
+            if let Err(error) = self.journal_start(&journal) {
+                self.db.pending_operations = previous;
+                return Err(error);
+            }
+        } else {
+            // An earlier persistence failure may have left only an in-memory
+            // journal. Every retry must make its intent durable before DELETE.
+            self.persist()?;
+        }
+        for (key, expected) in &metadata {
+            let latest = self
+                .cloud
+                .read_value(&token, account_id, &resources.namespace, key)
+                .await;
+            match latest {
+                Ok(Some(raw)) if &raw == expected => {}
+                _ => {
+                    self.journal_note(
+                        &journal,
+                        "遗留检测数据读取失败或已变化；尚未删除 Worker/KV，请重新核对",
+                    )?;
+                    return Err("遗留检测数据无法再次核实，停止清理".into());
+                }
+            }
+            if let Err(error) = self
+                .cloud
+                .delete_value(&token, account_id, &resources.namespace, key)
+                .await
+            {
+                self.journal_note(
+                    &journal,
+                    "遗留检测数据删除未完成或结果不确定；尚未删除 Worker/KV，可重新核对后继续清理",
+                )?;
+                return Err(error.message);
+            }
+        }
         if let Err(e) = self
             .cloud
             .delete(
@@ -4423,11 +4608,14 @@ impl Backend {
             )
             .await
         {
-            if e.uncertain {
-                self.journal_note(&journal, "Worker 删除结果不确定")?;
-            } else {
-                self.journal_end(&journal)?;
-            }
+            self.journal_note(
+                &journal,
+                if e.uncertain {
+                    "Worker 删除结果不确定，请核对后继续清理"
+                } else {
+                    "Worker 删除被拒绝，账号清理尚未完成"
+                },
+            )?;
             return Err(e.message);
         }
         self.journal_note(&journal, "Worker 已删，正在删除 KV")?;
@@ -4449,13 +4637,22 @@ impl Backend {
             ));
         }
         keyring_delete(account_id, "selftest")?;
+        let before_finish = self.db.clone();
+        for pool in &mut self.db.pools {
+            pool.account_ids.retain(|id| id != account_id);
+            pool.sync_status
+                .retain(|status| status.account_id != account_id);
+        }
         if let Some(a) = self.db.accounts.iter_mut().find(|a| a.id == account_id) {
             a.resources = None;
             a.has_resources = false;
             a.needs_selftest_key = false;
         }
-        self.persist()?;
-        self.journal_end(&journal)
+        if let Err(error) = self.journal_end(&journal) {
+            self.db = before_finish;
+            return Err(error);
+        }
+        Ok(())
     }
 
     async fn apply_rotate(&mut self, account_id: &str) -> Result<(), String> {
@@ -4738,7 +4935,7 @@ impl Backend {
             return Err("请先恢复未完成的云端操作再找回账号".into());
         }
         let token = keyring_get(account_id, "token")?;
-        let account = self.account(account_id)?.clone();
+        self.account(account_id)?;
         let namespaces = self
             .cloud
             .list_pages(
@@ -4804,8 +5001,38 @@ impl Backend {
             return Err("未找到唯一且已验证的 Worker/KV 资源组合".into());
         }
         let resources = matches.remove(0);
+        // Cached zones are only UI hints. Recovery replaces this account's
+        // domain/link records, so discovery must use the current visible zones.
+        let fresh_zones = self.fetch_zones(&token, account_id).await?;
+        let mut zone_ids = HashSet::new();
+        let mut zone_names = HashSet::new();
+        for zone in &fresh_zones {
+            if !valid_id(&zone.id)
+                || normalize_host(&zone.name).as_deref() != Ok(zone.name.as_str())
+                || !zone_ids.insert(zone.id.as_str())
+                || !zone_names.insert(zone.name.as_str())
+            {
+                return Err("云端域名区域清单无效或重复，停止找回".into());
+            }
+        }
+        if self.db.domains.iter().any(|domain| {
+            domain.account_id == account_id && !zone_ids.contains(domain.zone_id.as_str())
+        }) {
+            return Err("当前令牌可见的区域未覆盖本机已登记域名，停止找回以保留现有记录".into());
+        }
         let mut recovered_domains = Vec::new();
-        for zone in &account.zones {
+        let mut recovered_hosts = HashSet::new();
+        for zone in &fresh_zones {
+            let owner = self
+                .cloud
+                .get(&token, &format!("zones/{}", zone.id))
+                .await
+                .map_err(problem)?;
+            if owner["result"]["id"].as_str() != Some(zone.id.as_str())
+                || owner["result"]["account"]["id"].as_str() != Some(account_id)
+            {
+                return Err("无法确认找回域名区域归属此账号".into());
+            }
             let routes = self
                 .cloud
                 .get(&token, &format!("zones/{}/workers/routes", zone.id))
@@ -4818,20 +5045,23 @@ impl Backend {
                 if route["script"].as_str() != Some(resources.script.as_str()) {
                     continue;
                 }
-                let Some(pattern) = route["pattern"].as_str() else {
-                    continue;
-                };
-                let Some((host, path)) = pattern.split_once('/') else {
-                    continue;
-                };
-                let Some(prefix) = path.strip_suffix("/*") else {
-                    continue;
-                };
+                let pattern = route["pattern"]
+                    .as_str()
+                    .ok_or("此 Worker 的路由格式无法确认，停止找回")?;
+                let (host, path) = pattern
+                    .split_once('/')
+                    .ok_or("此 Worker 的路由格式无法确认，停止找回")?;
+                let prefix = path
+                    .strip_suffix("/*")
+                    .ok_or("此 Worker 的路由格式无法确认，停止找回")?;
+                let route_id = value_str(route, "id")?;
                 if normalize_host(host).as_deref() != Ok(host)
                     || validate_prefix(prefix).is_err()
                     || !(host == zone.name || host.ends_with(&format!(".{}", zone.name)))
+                    || !valid_id(route_id)
+                    || !recovered_hosts.insert(host.to_owned())
                 {
-                    continue;
+                    return Err("此 Worker 的路由无效或主机名重复，停止找回以保留现有记录".into());
                 }
                 let raw = self
                     .cloud
@@ -4855,11 +5085,17 @@ impl Backend {
                     zone_id: zone.id.clone(),
                     host: host.into(),
                     prefix: prefix.into(),
-                    route_id: value_str(route, "id")?.into(),
+                    route_id: route_id.into(),
                 });
             }
         }
         let mut recovered_pools = self.db.pools.clone();
+        for pool in &mut recovered_pools {
+            pool.account_ids.retain(|id| id != account_id);
+            pool.sync_status
+                .retain(|status| status.account_id != account_id);
+        }
+        let mut remote_pool_ids = HashSet::new();
         let pool_keys = self
             .cloud
             .list_keys(&token, account_id, &resources.namespace, "p:")
@@ -4867,7 +5103,7 @@ impl Backend {
             .map_err(problem)?;
         for key in pool_keys {
             let id = key.strip_prefix("p:").ok_or("平台地址键无效")?;
-            if !pools::valid_id(id) {
+            if !pools::valid_id(id) || !remote_pool_ids.insert(id.to_owned()) {
                 return Err("平台地址键无效".into());
             }
             let raw = self
@@ -4939,10 +5175,7 @@ impl Backend {
                 let data: Value =
                     serde_json::from_str(&raw).map_err(|_| "链接记录格式无效".to_string())?;
                 if let Some(pool_id) = data["poolId"].as_str() {
-                    if !recovered_pools
-                        .iter()
-                        .any(|p| p.id == pool_id && p.account_ids.contains(&account_id.to_string()))
-                    {
+                    if !remote_pool_ids.contains(pool_id) {
                         return Err("云端链接使用的平台地址不属于此账号".into());
                     }
                 }
@@ -4994,6 +5227,7 @@ impl Backend {
         let key_missing = keyring_get_optional(account_id, "selftest")?.is_none();
         let monitor_key_missing =
             monitor_enabled && keyring_get_optional(account_id, "probe")?.is_none();
+        let before_finish = self.db.clone();
         let old_ids: HashSet<_> = self
             .db
             .domains
@@ -5007,6 +5241,9 @@ impl Backend {
         self.db.links.extend(recovered_links);
         self.db.pools = recovered_pools;
         if let Some(a) = self.db.accounts.iter_mut().find(|a| a.id == account_id) {
+            a.zone_count = fresh_zones.len();
+            a.zones = fresh_zones;
+            a.checked_at = Some(now());
             a.resources = Some(resources);
             a.has_resources = true;
             a.needs_selftest_key = key_missing;
@@ -5014,7 +5251,11 @@ impl Backend {
             a.monitor_endpoint = monitor_endpoint;
             a.needs_monitor_key = monitor_key_missing;
         }
-        self.persist()
+        if let Err(error) = self.persist() {
+            self.db = before_finish;
+            return Err(error);
+        }
+        Ok(())
     }
 
     fn selftest_snapshot(
@@ -5614,6 +5855,13 @@ mod tests {
             .await;
     }
     async fn mount_exact_dns(server: &MockServer, records: Value) {
+        Mock::given(method("GET"))
+            .and(path("/client/v4/zones/zone1/dns_records"))
+            .and(query_param_is_missing("name"))
+            .respond_with(ok(records.clone()))
+            .with_priority(100)
+            .mount(server)
+            .await;
         Mock::given(method("GET"))
             .and(path("/client/v4/zones/zone1/dns_records"))
             .and(query_param("name", "example.com"))
@@ -8767,5 +9015,694 @@ mod tests {
             .unwrap()
             .iter()
             .all(|r| r.method.as_str() == "GET"));
+    }
+    #[tokio::test]
+    async fn dns_proxy_mail_dependency_blocks_prepare_and_new_dependency_blocks_apply() {
+        for present_during_prepare in [true, false] {
+            let (server, mut backend, _dir) = fixture().await;
+            let grey = json!({"id":"dns-one","name":"example.com","type":"A","content":"192.0.2.10","proxied":false,"proxiable":true});
+            let mx = json!({"id":"mail-mx","name":"child.example.com","type":"MX","content":"example.com","priority":10});
+            mount_zone_owner(&server).await;
+            mount_exact_dns(&server, json!([grey.clone()])).await;
+            if present_during_prepare {
+                mount_full_dns(&server, json!([grey.clone(), mx.clone()])).await;
+            }
+            let prepared = backend
+                .prepare_domain_dns(&json!({"input":"example.com"}))
+                .await
+                .unwrap();
+            if present_during_prepare {
+                assert_eq!(prepared["canApply"], false);
+                assert_eq!(prepared["dnsStatus"], "conflict");
+            } else {
+                assert_eq!(prepared["canApply"], true);
+                mount_full_dns(&server, json!([grey, mx])).await;
+                let error = backend
+                    .dispatch("apply_plan", &json!({"planId":prepared["plan"]["id"]}))
+                    .await
+                    .unwrap_err();
+                assert!(error.contains("MX"), "{error}");
+            }
+            assert!(server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .all(|r| r.method.as_str() == "GET"));
+            assert!(backend.db.pending_operations.is_empty());
+        }
+    }
+
+    fn cleanup_health() -> String {
+        json!({"revision":"2026-09-30T00:00:00Z","checkedAt":123,
+            "targets":{"first":{"state":"unknown","failures":0,"successes":0,"checkedAt":123}}})
+        .to_string()
+    }
+
+    async fn mount_cleanup_cloud(
+        server: &MockServer,
+        entries: Vec<(&str, String)>,
+    ) -> std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<String, String>>> {
+        let store = std::sync::Arc::new(std::sync::Mutex::new(
+            entries
+                .into_iter()
+                .map(|(key, value)| (key.to_owned(), value))
+                .collect::<std::collections::BTreeMap<_, _>>(),
+        ));
+        mount_resource(server, include_str!("../../edge/worker.mjs")).await;
+        Mock::given(method("GET")).and(path("/client/v4/zones"))
+            .respond_with(ok(json!([{"id":"zone1","name":"example.com","status":"active","account":{"id":"acct1"}}])))
+            .with_priority(100)
+            .mount(server).await;
+        Mock::given(method("GET"))
+            .and(path("/client/v4/zones/zone1/workers/routes"))
+            .respond_with(ok(json!([])))
+            .with_priority(100)
+            .mount(server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/client/v4/accounts/acct1/workers/scripts/edge-one/schedules",
+            ))
+            .respond_with(ok(json!({"schedules":[]})))
+            .with_priority(100)
+            .mount(server)
+            .await;
+        let list_store = store.clone();
+        Mock::given(method("GET"))
+            .and(path(
+                "/client/v4/accounts/acct1/storage/kv/namespaces/ns1/keys",
+            ))
+            .respond_with(move |_: &wiremock::Request| {
+                let mut keys = vec![json!({"name":MANIFEST_KEY})];
+                keys.extend(
+                    list_store
+                        .lock()
+                        .unwrap()
+                        .keys()
+                        .map(|key| json!({"name":key})),
+                );
+                ok(json!(keys))
+            })
+            .with_priority(100)
+            .mount(server)
+            .await;
+        let read_store = store.clone();
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/client/v4/accounts/acct1/storage/kv/namespaces/ns1/values/(h%3A[^/]+|m%3Amonitor%3Acursor)$"))
+            .respond_with(move |request: &wiremock::Request| {
+                let encoded=request.url.path().rsplit('/').next().unwrap();
+                let key=url::form_urlencoded::parse(encoded.as_bytes()).next().unwrap().0.into_owned();
+                match read_store.lock().unwrap().get(&key) {
+                    Some(raw)=>ResponseTemplate::new(200).set_body_string(raw.clone()),
+                    None=>ResponseTemplate::new(404)
+                }
+            }).with_priority(100)
+            .mount(server).await;
+        let delete_store = store.clone();
+        Mock::given(method("DELETE"))
+            .and(path_regex(r"^/client/v4/accounts/acct1/storage/kv/namespaces/ns1/values/(h%3A[^/]+|m%3Amonitor%3Acursor)$"))
+            .respond_with(move |request: &wiremock::Request| {
+                let encoded=request.url.path().rsplit('/').next().unwrap();
+                let key=url::form_urlencoded::parse(encoded.as_bytes()).next().unwrap().0.into_owned();
+                delete_store.lock().unwrap().remove(&key); ok(json!({}))
+            }).with_priority(100)
+            .mount(server).await;
+        for target in [
+            "/client/v4/accounts/acct1/workers/scripts/edge-one",
+            "/client/v4/accounts/acct1/storage/kv/namespaces/ns1",
+        ] {
+            Mock::given(method("DELETE"))
+                .and(path(target))
+                .respond_with(ok(json!({})))
+                .with_priority(100)
+                .mount(server)
+                .await;
+        }
+        store
+    }
+
+    #[tokio::test]
+    async fn cleanup_removes_only_valid_orphan_monitor_metadata_and_account_receipts() {
+        let (server, mut backend, _dir) = fixture().await;
+        let mut pool = sample_pool();
+        pool.account_ids.push("acct2".into());
+        pool.sync_status = vec!["acct1", "acct2"]
+            .into_iter()
+            .map(|id| PoolSyncStatus {
+                account_id: id.into(),
+                status: "synced".into(),
+                message: "old receipt".into(),
+            })
+            .collect();
+        backend.db.pools.push(pool);
+        let store = mount_cleanup_cloud(
+            &server,
+            vec![
+                ("h:pool1", cleanup_health()),
+                ("m:monitor:cursor", "2".into()),
+            ],
+        )
+        .await;
+        let plan = backend
+            .prepare_change(&json!({"kind":"cleanup_account","accountId":"acct1"}))
+            .unwrap();
+        assert!(plan["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|step| step.as_str().unwrap().contains("遗留检测")));
+        backend
+            .dispatch("apply_plan", &json!({"planId":plan["id"]}))
+            .await
+            .unwrap();
+        assert!(store.lock().unwrap().is_empty());
+        assert!(backend.db.accounts[0].resources.is_none());
+        assert_eq!(backend.db.pools[0].account_ids, vec!["acct2"]);
+        assert_eq!(backend.db.pools[0].sync_status.len(), 1);
+        assert_eq!(backend.db.pools[0].sync_status[0].account_id, "acct2");
+        assert!(backend.db.pending_operations.is_empty());
+        let deletes: Vec<_> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.method.as_str() == "DELETE")
+            .map(|r| r.url.path().to_owned())
+            .collect();
+        assert_eq!(deletes.len(), 4);
+        assert!(deletes[0].contains("h%3A"));
+        assert!(deletes[1].contains("cursor"));
+        assert!(deletes[2].ends_with("/edge-one"));
+        assert!(deletes[3].ends_with("/ns1"));
+    }
+
+    #[tokio::test]
+    async fn cleanup_unknown_metadata_and_active_cron_block_all_deletes() {
+        for case in 0..5 {
+            let (server, mut backend, _dir) = fixture().await;
+            let mut health: Value = serde_json::from_str(&cleanup_health()).unwrap();
+            health["unexpected"] = json!(true);
+            let entries = match case {
+                0 => vec![("p:pool1", "{}".into())],
+                1 => vec![("h:pool1", health.to_string())],
+                2 => vec![("m:monitor:cursor", "-1".into())],
+                _ => vec![("h:pool1", cleanup_health())],
+            };
+            mount_cleanup_cloud(&server, entries).await;
+            if case == 3 {
+                Mock::given(method("GET"))
+                    .and(path(
+                        "/client/v4/accounts/acct1/workers/scripts/edge-one/schedules",
+                    ))
+                    .respond_with(ok(json!({"schedules":[{"cron":"*/15 * * * *"}]})))
+                    .mount(&server)
+                    .await;
+            }
+            if case == 4 {
+                Mock::given(method("GET"))
+                    .and(path("/client/v4/zones/zone1/workers/routes"))
+                    .respond_with(ok(json!([{"id":"route-one","script":"edge-one"}])))
+                    .mount(&server)
+                    .await;
+            }
+            assert!(backend.apply_cleanup("acct1").await.is_err());
+            assert!(backend.db.accounts[0].resources.is_some());
+            assert!(server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .all(|r| r.method.as_str() == "GET"));
+            assert!(backend.db.pending_operations.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn cleanup_changed_metadata_blocks_before_first_delete() {
+        let (server, mut backend, _dir) = fixture().await;
+        mount_cleanup_cloud(&server, vec![("h:pool1", cleanup_health())]).await;
+        let reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        Mock::given(method("GET"))
+            .and(path(
+                "/client/v4/accounts/acct1/storage/kv/namespaces/ns1/values/h%3Apool1",
+            ))
+            .respond_with(move |_: &wiremock::Request| {
+                let mut value: Value = serde_json::from_str(&cleanup_health()).unwrap();
+                if reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 0 {
+                    value["checkedAt"] = json!(456);
+                }
+                ResponseTemplate::new(200).set_body_string(value.to_string())
+            })
+            .mount(&server)
+            .await;
+        let error = backend.apply_cleanup("acct1").await.unwrap_err();
+        assert!(error.contains("变化"));
+        assert!(server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .all(|r| r.method.as_str() == "GET"));
+        assert!(backend.db.pending_operations.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cleanup_metadata_failure_reuses_journal_and_skips_already_deleted_keys() {
+        let (server, mut backend, _dir) = fixture().await;
+        let store = mount_cleanup_cloud(
+            &server,
+            vec![
+                ("h:pool1", cleanup_health()),
+                ("m:monitor:cursor", "2".into()),
+            ],
+        )
+        .await;
+        Mock::given(method("DELETE"))
+            .and(path(
+                "/client/v4/accounts/acct1/storage/kv/namespaces/ns1/values/m%3Amonitor%3Acursor",
+            ))
+            .respond_with(ResponseTemplate::new(503))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        assert!(backend
+            .apply_cleanup("acct1")
+            .await
+            .unwrap_err()
+            .contains("503"));
+        assert!(backend.db.accounts[0].resources.is_some());
+        assert_eq!(backend.db.pending_operations.len(), 1);
+        assert!(!store.lock().unwrap().contains_key("h:pool1"));
+        backend.db = serde_json::from_slice(&std::fs::read(&backend.path).unwrap()).unwrap();
+        backend.apply_cleanup("acct1").await.unwrap();
+        assert!(backend.db.pending_operations.is_empty());
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|r| r.method.as_str() == "DELETE" && r.url.path().ends_with("h%3Apool1"))
+                .count(),
+            1
+        );
+    }
+    async fn mount_recovery_without_pool(server: &MockServer, with_link: bool) {
+        mount_resource(server, include_str!("../../edge/worker.mjs")).await;
+        mount_owned_domain(server).await;
+        mount_zone_owner(server).await;
+        Mock::given(method("GET"))
+            .and(path("/client/v4/zones"))
+            .and(query_param("account.id", "acct1"))
+            .respond_with(ok(json!([{"id":"zone1","name":"example.com","status":"active","account":{"id":"acct1"}}])))
+            .with_priority(100)
+            .mount(server).await;
+        Mock::given(method("GET"))
+            .and(path("/client/v4/accounts/acct1/storage/kv/namespaces"))
+            .respond_with(ok(json!([{"id":"ns1"}])))
+            .mount(server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/client/v4/accounts/acct1/storage/kv/namespaces/ns1/keys",
+            ))
+            .and(query_param("prefix", "p:"))
+            .respond_with(ok(json!([])))
+            .mount(server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/client/v4/accounts/acct1/storage/kv/namespaces/ns1/keys",
+            ))
+            .and(query_param("prefix", "l:example.com:"))
+            .respond_with(ok(if with_link {
+                json!([{"name":"l:example.com:short"}])
+            } else {
+                json!([])
+            }))
+            .mount(server)
+            .await;
+        Mock::given(method("GET")).and(path("/client/v4/accounts/acct1/storage/kv/namespaces/ns1/values/l%3Aexample.com%3Ashort"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(json!({"poolId":"pool1","code":"abc","updated":"2026-09-30T00:00:00Z"}).to_string()))
+            .mount(server).await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/client/v4/accounts/acct1/storage/kv/namespaces/ns1/values/m%3Amonitor",
+            ))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/client/v4/accounts/acct1/workers/scripts/edge-one/schedules",
+            ))
+            .respond_with(ok(json!({"schedules":[]})))
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn recovery_rejects_missing_remote_pool_without_changing_local_data() {
+        let (server, mut backend, _dir) = fixture().await;
+        let mut pool = sample_pool();
+        pool.sync_status = vec![PoolSyncStatus {
+            account_id: "acct1".into(),
+            status: "synced".into(),
+            message: "old receipt".into(),
+        }];
+        backend.db.pools.push(pool);
+        backend.db.domains.push(domain());
+        backend.persist().unwrap();
+        let before = serde_json::to_value(&backend.db).unwrap();
+        mount_recovery_without_pool(&server, true).await;
+        assert!(backend
+            .recover_account("acct1")
+            .await
+            .unwrap_err()
+            .contains("不属于此账号"));
+        assert_eq!(serde_json::to_value(&backend.db).unwrap(), before);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&std::fs::read(&backend.path).unwrap()).unwrap(),
+            before
+        );
+        assert!(server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .all(|r| r.method.as_str() == "GET"));
+    }
+
+    #[tokio::test]
+    async fn recovery_refreshes_only_current_account_receipts_and_rolls_back_persist_failure() {
+        for fail_persist in [false, true] {
+            let (server, mut backend, _dir) = fixture().await;
+            let mut pool = sample_pool();
+            pool.account_ids.push("acct2".into());
+            pool.sync_status = vec!["acct1", "acct2"]
+                .into_iter()
+                .map(|id| PoolSyncStatus {
+                    account_id: id.into(),
+                    status: "synced".into(),
+                    message: "old receipt".into(),
+                })
+                .collect();
+            backend.db.pools.push(pool);
+            backend.db.domains.push(domain());
+            backend.persist().unwrap();
+            let before = serde_json::to_value(&backend.db).unwrap();
+            mount_recovery_without_pool(&server, false).await;
+            if fail_persist {
+                backend
+                    .fail_persist_at
+                    .store(2, std::sync::atomic::Ordering::SeqCst);
+            }
+            let result = backend.recover_account("acct1").await;
+            if fail_persist {
+                assert!(result.is_err());
+                assert_eq!(serde_json::to_value(&backend.db).unwrap(), before);
+                assert_eq!(
+                    serde_json::from_slice::<Value>(&std::fs::read(&backend.path).unwrap())
+                        .unwrap(),
+                    before
+                );
+            } else {
+                result.unwrap();
+                assert_eq!(backend.db.pools[0].account_ids, vec!["acct2"]);
+                assert_eq!(backend.db.pools[0].sync_status.len(), 1);
+                assert_eq!(backend.db.pools[0].sync_status[0].account_id, "acct2");
+            }
+            assert!(server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .all(|r| r.method.as_str() == "GET"));
+        }
+    }
+    #[tokio::test]
+    async fn cleanup_new_business_key_during_preflight_blocks_all_deletes() {
+        let (server, mut backend, _dir) = fixture().await;
+        mount_cleanup_cloud(&server, vec![("h:pool1", cleanup_health())]).await;
+        let reads = std::sync::atomic::AtomicUsize::new(0);
+        Mock::given(method("GET"))
+            .and(path(
+                "/client/v4/accounts/acct1/storage/kv/namespaces/ns1/keys",
+            ))
+            .respond_with(move |_: &wiremock::Request| {
+                let mut keys = vec![json!({"name":MANIFEST_KEY}), json!({"name":"h:pool1"})];
+                if reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 0 {
+                    keys.push(json!({"name":"p:new-pool"}));
+                }
+                ok(json!(keys))
+            })
+            .mount(&server)
+            .await;
+        assert!(backend
+            .apply_cleanup("acct1")
+            .await
+            .unwrap_err()
+            .contains("变化"));
+        assert!(server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .all(|r| r.method.as_str() == "GET"));
+        assert!(backend.db.pending_operations.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cleanup_uncertain_applied_metadata_delete_resumes_from_remaining_keys() {
+        let (server, mut backend, _dir) = fixture().await;
+        let store = mount_cleanup_cloud(&server, vec![("h:pool1", cleanup_health())]).await;
+        let applied = store.clone();
+        Mock::given(method("DELETE"))
+            .and(path(
+                "/client/v4/accounts/acct1/storage/kv/namespaces/ns1/values/h%3Apool1",
+            ))
+            .respond_with(move |_: &wiremock::Request| {
+                applied.lock().unwrap().remove("h:pool1");
+                ResponseTemplate::new(503)
+            })
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        assert!(backend
+            .apply_cleanup("acct1")
+            .await
+            .unwrap_err()
+            .contains("503"));
+        assert_eq!(backend.db.pending_operations.len(), 1);
+        assert!(store.lock().unwrap().is_empty());
+        backend.db = serde_json::from_slice(&std::fs::read(&backend.path).unwrap()).unwrap();
+        backend.apply_cleanup("acct1").await.unwrap();
+        assert!(backend.db.pending_operations.is_empty());
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|r| r.method.as_str() == "DELETE" && r.url.path().ends_with("h%3Apool1"))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_refreshes_stale_zone_cache_before_replacing_domain_records() {
+        let (server, mut backend, _dir) = fixture().await;
+        backend.db.accounts[0].zones.clear();
+        backend.db.accounts[0].zone_count = 0;
+        backend.db.domains.push(domain());
+        mount_recovery_without_pool(&server, true).await;
+        Mock::given(method("GET"))
+            .and(path("/client/v4/accounts/acct1/storage/kv/namespaces/ns1/values/l%3Aexample.com%3Ashort"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "rules":[{"countries":["CN"],"url":"https://example.org/cn"}],
+                "default":"https://example.org/other","updated":"2026-09-30T00:00:00Z"
+            })))
+            .with_priority(1)
+            .mount(&server).await;
+        backend.recover_account("acct1").await.unwrap();
+        assert_eq!(backend.db.domains.len(), 1);
+        assert_eq!(backend.db.domains[0].host, "example.com");
+        assert_eq!(backend.db.links.len(), 1);
+        assert_eq!(backend.db.links[0].domain_id, backend.db.domains[0].id);
+        assert_eq!(backend.db.accounts[0].zones.len(), 1);
+        assert_eq!(backend.db.accounts[0].zone_count, 1);
+        assert!(server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .all(|r| r.method.as_str() == "GET"));
+    }
+
+    #[tokio::test]
+    async fn recovery_incomplete_or_failed_zone_read_preserves_local_records() {
+        for failed_read in [false, true] {
+            let (server, mut backend, _dir) = fixture().await;
+            backend.db.domains.push(domain());
+            backend.persist().unwrap();
+            let before = serde_json::to_value(&backend.db).unwrap();
+            mount_recovery_without_pool(&server, false).await;
+            Mock::given(method("GET"))
+                .and(path("/client/v4/zones"))
+                .respond_with(if failed_read {
+                    ResponseTemplate::new(403)
+                } else {
+                    ok(json!([]))
+                })
+                .mount(&server)
+                .await;
+            assert!(backend.recover_account("acct1").await.is_err());
+            assert_eq!(serde_json::to_value(&backend.db).unwrap(), before);
+            assert_eq!(
+                serde_json::from_slice::<Value>(&std::fs::read(&backend.path).unwrap()).unwrap(),
+                before
+            );
+            assert!(server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .all(|r| r.method.as_str() == "GET"));
+        }
+    }
+
+    #[tokio::test]
+    async fn cleanup_journal_persist_failure_cannot_leave_an_undurable_retry_intent() {
+        let (server, mut backend, _dir) = fixture().await;
+        backend.persist().unwrap();
+        mount_cleanup_cloud(&server, vec![("h:pool1", cleanup_health())]).await;
+        backend
+            .fail_persist_at
+            .store(2, std::sync::atomic::Ordering::SeqCst);
+        assert!(backend
+            .apply_cleanup("acct1")
+            .await
+            .unwrap_err()
+            .contains("本机配置保存失败"));
+        assert!(server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .all(|r| r.method.as_str() == "GET"));
+        let state_path = backend.path.clone();
+        let durable = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed = durable.clone();
+        Mock::given(method("DELETE"))
+            .and(path(
+                "/client/v4/accounts/acct1/storage/kv/namespaces/ns1/values/h%3Apool1",
+            ))
+            .respond_with(move |_: &wiremock::Request| {
+                let saved: Value =
+                    serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
+                observed.store(
+                    saved["pendingOperations"]
+                        .as_array()
+                        .is_some_and(|ops| !ops.is_empty()),
+                    std::sync::atomic::Ordering::SeqCst,
+                );
+                ResponseTemplate::new(503)
+            })
+            .mount(&server)
+            .await;
+        assert!(backend.apply_cleanup("acct1").await.is_err());
+        assert!(durable.load(std::sync::atomic::Ordering::SeqCst), "every cloud mutation must have a persisted cleanup journal, including retry after local save failure");
+    }
+
+    #[tokio::test]
+    async fn recovery_rejects_ambiguous_owned_routes_and_changed_zone_ownership() {
+        for case in 0..4 {
+            let (server, mut backend, _dir) = fixture().await;
+            backend.db.domains.push(domain());
+            backend.persist().unwrap();
+            let before = serde_json::to_value(&backend.db).unwrap();
+            mount_recovery_without_pool(&server, false).await;
+            if case == 3 {
+                Mock::given(method("GET"))
+                    .and(path("/client/v4/zones/zone1"))
+                    .respond_with(ok(
+                        json!({"id":"zone1","status":"active","account":{"id":"acct2"}}),
+                    ))
+                    .with_priority(1)
+                    .mount(&server)
+                    .await;
+            } else {
+                let route = json!({"id":"route1","pattern":"example.com/go/*","script":"edge-one"});
+                let routes = match case {
+                    0 => json!([{"id":"route1","pattern":"example.com/*","script":"edge-one"}]),
+                    1 => json!([{"id":"route1","script":"edge-one"}]),
+                    _ => json!([route.clone(), route]),
+                };
+                Mock::given(method("GET"))
+                    .and(path("/client/v4/zones/zone1/workers/routes"))
+                    .respond_with(ok(routes))
+                    .with_priority(1)
+                    .mount(&server)
+                    .await;
+            }
+            assert!(
+                backend.recover_account("acct1").await.is_err(),
+                "case {case}"
+            );
+            assert_eq!(serde_json::to_value(&backend.db).unwrap(), before);
+            assert_eq!(
+                serde_json::from_slice::<Value>(&std::fs::read(&backend.path).unwrap()).unwrap(),
+                before
+            );
+            assert!(server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .all(|r| r.method.as_str() == "GET"));
+        }
+    }
+
+    #[tokio::test]
+    async fn cleanup_partial_resource_or_final_persist_failure_keeps_explicit_journal() {
+        for fail_persist in [false, true] {
+            let (server, mut backend, _dir) = fixture().await;
+            backend.db.pools.push(sample_pool());
+            mount_cleanup_cloud(&server, vec![]).await;
+            if fail_persist {
+                backend
+                    .fail_persist_at
+                    .store(3, std::sync::atomic::Ordering::SeqCst);
+            } else {
+                Mock::given(method("DELETE"))
+                    .and(path("/client/v4/accounts/acct1/storage/kv/namespaces/ns1"))
+                    .respond_with(ResponseTemplate::new(503))
+                    .mount(&server)
+                    .await;
+            }
+            let error = backend.apply_cleanup("acct1").await.unwrap_err();
+            assert!(error.contains(if fail_persist {
+                "本机配置保存失败"
+            } else {
+                "Worker 已删除"
+            }));
+            assert!(backend.db.accounts[0].resources.is_some());
+            assert!(backend.db.pools[0]
+                .account_ids
+                .contains(&"acct1".to_owned()));
+            assert_eq!(backend.db.pending_operations.len(), 1);
+            let saved: Database =
+                serde_json::from_slice(&std::fs::read(&backend.path).unwrap()).unwrap();
+            assert!(saved.accounts[0].resources.is_some());
+            assert_eq!(saved.pending_operations, backend.db.pending_operations);
+            assert_eq!(
+                server
+                    .received_requests()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .filter(|r| r.method.as_str() == "DELETE")
+                    .count(),
+                2
+            );
+        }
     }
 }

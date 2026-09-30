@@ -16,7 +16,7 @@ const files=[];
 function walk(p){for(const e of readdirSync(p,{withFileTypes:true})){const x=join(p,e.name);if(e.isDirectory())walk(x);else files.push(x);}}
 walk(root);
 const sha256=path=>createHash('sha256').update(readFileSync(path)).digest('hex');
-const hex=value=>/^[0-9a-f]{64}$/.test(value??'');
+const hex=value=>typeof value==='string'&&/^[0-9a-f]{64}$/.test(value);
 const targets={
   'aarch64-apple-darwin':{host:'darwin-arm64',platform:'darwin-aarch64',installerDir:'dmg',installerSuffix:'.dmg',updaterDir:'macos',updaterSuffix:'.app.tar.gz'},
   'x86_64-apple-darwin':{host:'darwin-x64',platform:'darwin-x86_64',installerDir:'dmg',installerSuffix:'.dmg',updaterDir:'macos',updaterSuffix:'.app.tar.gz'},
@@ -30,15 +30,45 @@ function exactArtifact(candidateRoot,subdir,name,suffix,digest){
   if(matches.length!==1||lstatSync(matches[0]).isSymbolicLink()||sha256(matches[0])!==digest)throw new Error('Native evidence does not match its exact artifact.');
   return matches[0];
 }
+function macOSVersion(value){
+  if(typeof value!=='string'||!/^\d{1,3}\.\d{1,3}(?:\.\d{1,3})?$/.test(value))return null;
+  const parts=value.split('.').map(Number);
+  return [parts[0],parts[1],parts[2]??0];
+}
+function compareVersions(left,right){
+  for(let i=0;i<3;i++)if(left[i]!==right[i])return left[i]-right[i];
+  return 0;
+}
 function validateManualLocal(evidence,reviewedSha,target){
   if(target!=='aarch64-apple-darwin'||evidence.schema!==2||evidence.method!=='manual-local'||
      evidence.reviewedSha!==reviewedSha||!/^[0-9a-f]{40}$/.test(evidence.buildSha??'')||
-     evidence.osVersion!=='26.5.2'||evidence.guiObserved!==true||evidence.processAlive!==true||
+     !macOSVersion(evidence.osVersion)||evidence.guiObserved!==true||evidence.processAlive!==true||
      evidence.architectureVerified!==true||evidence.signatureVerified!==true||evidence.updaterSignatureVerified!==true||
-     evidence.updaterSignaturePresent!==true||evidence.minimumSystemVersionMetadata!=='11.0'||
-     evidence.minimumSystemRuntimeTested!==false)throw new Error('Manual local ARM evidence is incomplete.');
+     evidence.updaterSignaturePresent!==true)throw new Error('Manual local ARM evidence is incomplete.');
   const manifest=matchingAppInputs(evidence.buildSha,reviewedSha);
   if(evidence.appInputManifestSha256!==manifest.sha256||evidence.appInputFileCount!==manifest.fileCount)throw new Error('Manual local ARM app input manifest mismatch.');
+  const tauriConfig=JSON.parse(execFileSync('git',['show',`${reviewedSha}:src-tauri/tauri.conf.json`],{encoding:'utf8'}));
+  const minimumVersion=macOSVersion(tauriConfig.bundle?.macOS?.minimumSystemVersion);
+  const metadataVersion=macOSVersion(evidence.minimumSystemVersionMetadata);
+  const runtime=evidence.minimumSystemRuntime;
+  const testedVersion=macOSVersion(runtime?.osVersion);
+  if(!minimumVersion||!metadataVersion||compareVersions(metadataVersion,minimumVersion)!==0||
+     compareVersions(macOSVersion(evidence.osVersion),minimumVersion)<0||
+     evidence.minimumSystemRuntimeTested!==true||!testedVersion||compareVersions(testedVersion,minimumVersion)!==0||
+     runtime.host!=='darwin-arm64'||runtime.architectureVerified!==true||runtime.guiObserved!==true||runtime.processAlive!==true||
+     !hex(runtime.reportSha256)||runtime.installerSha256!==evidence.installerSha256||runtime.updaterSha256!==evidence.updaterSha256){
+    throw new Error('Manual local ARM minimum-system runtime evidence is incomplete or does not match this candidate.');
+  }
+  const signing=evidence.nativeSigning;
+  if(!signing||!['ad-hoc','developer-id'].includes(signing.identity)||signing.identityVerified!==true||
+     !['not-notarized','verified'].includes(signing.notarization)||!hex(signing.reportSha256)||
+     (signing.identity==='ad-hoc'&&signing.notarization!=='not-notarized')){
+    throw new Error('Manual local ARM native signing and notarization status must be verified explicitly.');
+  }
+  const environment=evidence.environmentVerification;
+  if(!environment||environment.differencesReviewed!==true||environment.compatibleWithRelease!==true||!hex(environment.reportSha256)){
+    throw new Error('Manual local ARM build-environment differences must be verified.');
+  }
   const config=evidence.buildConfiguration;
   if(!config||!hex(config.releaseConfigSha256)||config.updaterPublicKeySha256!==publicKeySha256||!hex(config.encodedRustflagsSha256)||
      config.updaterEndpoint!==`https://github.com/${repository}/releases/latest/download/latest.json`||
