@@ -96,7 +96,7 @@ fn problem(error: CloudError) -> String {
 }
 fn dns_write_error(error: CloudError) -> String {
     if error.message.contains("HTTP 403") {
-        "当前令牌没有 DNS 编辑权限；请在账号管理中更新令牌。其他只读与现有功能仍可继续使用。".into()
+        "Cloudflare 拒绝修改 DNS（HTTP 403）。请检查此令牌的 DNS 编辑权限和域名授权范围，补齐授权后再继续；已有功能仍可使用。".into()
     } else {
         error.message
     }
@@ -202,7 +202,7 @@ fn mock_key_reads() -> &'static std::sync::Mutex<Vec<String>> {
     READS.get_or_init(|| std::sync::Mutex::new(Vec::new()))
 }
 
-async fn read_refresh_token(account_id: &str) -> Result<Zeroizing<String>, String> {
+async fn read_account_token(account_id: &str) -> Result<Zeroizing<String>, String> {
     let id = account_id.to_owned();
     // Native authorization can wait for user input. Keep it off async runtime workers;
     // do not time out the prompt and leave a second authorization queued behind it.
@@ -247,7 +247,16 @@ fn validate_slug(value: &str) -> Result<(), String> {
     }
 }
 fn validate_target(value: &str) -> Result<(), String> {
+    if value.bytes().any(|c| c <= 32 || c == 127 || c == b'\\') {
+        return Err("目标网址不能包含空白、控制字符或反斜杠".into());
+    }
     let parsed = url::Url::parse(value).map_err(|_| "目标网址无效".to_string())?;
+    if value.len() > 2048 || parsed.as_str().len() > 2048 {
+        return Err("目标网址过长，转换为标准网址后不能超过 2048 个字符".into());
+    }
+    if parsed.port() == Some(0) {
+        return Err("目标网址的端口不能为 0，请核对网址".into());
+    }
     if parsed.scheme() != "https"
         || parsed.host_str().is_none()
         || !parsed.username().is_empty()
@@ -728,7 +737,7 @@ impl Backend {
             .filter(|item| choice.is_none_or(|id| item.id == id))
         {
             let id = item.id.clone();
-            let token = read_refresh_token(&id)
+            let token = read_account_token(&id)
                 .await
                 .map_err(|error| format!("无法刷新账户「{}」：{error}", item.label))?;
             let account = self
@@ -767,7 +776,7 @@ impl Backend {
             None => return Err("请选择要刷新域名的 Cloudflare 账户".into()),
         };
         let label = self.account(&id)?.label.clone();
-        let token = read_refresh_token(&id)
+        let token = read_account_token(&id)
             .await
             .map_err(|error| format!("无法读取账户「{label}」：{error}；未刷新域名列表"))?;
         let zones = tokio::time::timeout(Duration::from_secs(60), self.fetch_zones(&token, &id))
@@ -854,7 +863,7 @@ impl Backend {
             .collect();
         let mut refreshed = Vec::new();
         for (id, label) in accounts {
-            let token = read_refresh_token(&id)
+            let token = read_account_token(&id)
                 .await
                 .map_err(|error| format!("无法刷新账户「{label}」的域名：{error}"))?;
             let zones = self.fetch_zones(&token, &id).await.map_err(|error| {
@@ -883,7 +892,7 @@ impl Backend {
         account_id: &str,
         zone_id: &str,
         host: &str,
-    ) -> Result<(String, String), String> {
+    ) -> Result<(Zeroizing<String>, String), String> {
         let account = self.account(account_id)?;
         let zone = account
             .zones
@@ -894,7 +903,7 @@ impl Backend {
                     && (host == zone.name || host.ends_with(&format!(".{}", zone.name)))
             })
             .ok_or("域名所属区域未启用，或不属于此账号")?;
-        let token = keyring_get(account_id, "token")?;
+        let token = read_account_token(account_id).await?;
         let remote = self
             .cloud
             .get(&token, &format!("zones/{zone_id}"))
@@ -1163,7 +1172,7 @@ impl Backend {
         if !active {
             return (checks, None);
         }
-        let token = match keyring_get(account_id, "token") {
+        let token = match read_account_token(account_id).await {
             Ok(t) => t,
             Err(e) => {
                 checks.push(domain_check::hard_check("凭据", false, e));
@@ -2720,7 +2729,7 @@ impl Backend {
         if !current_path_risk.can_replace(takeover.expected_path_risk) {
             return Err("路径响应状态已变化，请重新检查域名并确认接管范围".into());
         }
-        let token = keyring_get(account_id, "token")?;
+        let token = read_account_token(account_id).await?;
         let existing = self.account(account_id)?.resources.clone();
         if let Some(r) = &existing {
             self.verify_resource_source(&token, account_id, r).await?;
@@ -5247,6 +5256,31 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn invalid_destinations_cannot_prepare_cloud_writes() {
+        let (server, mut backend, _dir) = fixture().await;
+        backend.db.domains.push(domain());
+        let base = "https://example.org/";
+        let invalid = [
+            format!("{base}{}", "a".repeat(2049 - base.len())),
+            format!("{base}{}", "值".repeat(230)),
+            "https://example.org:0/".into(),
+            "https://example.org/a\nb".into(),
+        ];
+        for target in invalid {
+            for field in ["cnUrl", "defaultUrl"] {
+                let mut payload = json!({"kind":"save_link", "domainId":domain().id,
+                    "slug":"test", "cnUrl":base, "defaultUrl":base});
+                payload[field] = json!(target);
+                assert!(backend.prepare_change(&payload).is_err());
+                assert!(backend.plans.is_empty());
+            }
+        }
+        assert!(server.received_requests().await.unwrap().is_empty());
+        assert!(canonical_target(&format!("{base}{}", "a".repeat(2048 - base.len()))).is_ok());
+        assert!(canonical_target("https://example.org:8443/").is_ok());
+    }
+
     #[test]
     fn route_overlap_is_conservative_for_wildcards() {
         assert!(route_conflict("example.com/*", "example.com", "go"));
@@ -6127,9 +6161,59 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(error.contains("没有 DNS 编辑权限"));
+        assert!(error.contains("DNS 编辑权限"));
         assert_eq!(backend.db.accounts.len(), 1);
         assert!(backend.db.pending_operations.is_empty());
+    }
+
+    #[tokio::test]
+    async fn missing_dns_permission_failure_never_retries_or_changes_other_records() {
+        let (server, mut backend, _dir) = fixture().await;
+        let records = json!([
+            {"id":"mail","name":"example.com","type":"MX","content":"mail.example.org",
+             "priority":10,"proxied":false,"proxiable":false},
+            {"id":"verify","name":"example.com","type":"TXT","content":"verification=example",
+             "proxied":false,"proxiable":false}
+        ]);
+        mount_zone_owner(&server).await;
+        mount_exact_dns(&server, records.clone()).await;
+        mount_full_dns(&server, records).await;
+        Mock::given(method("POST"))
+            .and(path("/client/v4/zones/zone1/dns_records"))
+            .respond_with(ResponseTemplate::new(403))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let prepared = backend
+            .dispatch("prepare_domain_dns", &json!({"input":"example.com"}))
+            .await
+            .unwrap();
+        let error = backend
+            .dispatch("apply_plan", &json!({"planId":prepared["plan"]["id"]}))
+            .await
+            .unwrap_err();
+        assert!(error.contains("HTTP 403") && error.contains("DNS 编辑权限"));
+        assert_eq!(backend.db.accounts.len(), 1);
+        assert!(backend.db.pending_operations.is_empty());
+        // An explicit refresh may prepare a fresh plan, but never silently reapplies it.
+        let refreshed = backend
+            .dispatch("prepare_domain_dns", &json!({"input":"example.com"}))
+            .await
+            .unwrap();
+        assert_eq!(refreshed["dnsStatus"], "missing");
+        assert_eq!(refreshed["canApply"], true);
+        let writes: Vec<_> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|request| matches!(request.method.as_str(), "POST" | "PATCH" | "DELETE"))
+            .collect();
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0].method.as_str(), "POST");
+        let value: Value = serde_json::from_slice(&writes[0].body).unwrap();
+        assert_eq!(value["type"], "AAAA");
+        assert_eq!(value["name"], "example.com");
     }
 
     #[tokio::test]

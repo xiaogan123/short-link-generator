@@ -28,6 +28,16 @@ describe('link inputs', () => {
     expect(validateTarget('/relative')).not.toBeNull();
   });
   it('constructs exact route paths', () => expect(shortUrl('go.example.com', 'r', 'test')).toBe('https://go.example.com/r/test'));
+  it('rejects destinations the redirect service cannot serve before saving', () => {
+    const base='https://example.org/';
+    expect(validateTarget(base+'a'.repeat(2048-base.length))).toBeNull();
+    expect(validateTarget(base+'a'.repeat(2049-base.length))).not.toBeNull();
+    expect(validateTarget(base+'值'.repeat(230))).not.toBeNull();
+    expect(validateTarget('https://example.org:0/')).not.toBeNull();
+    expect(validateTarget('https://example.org:8443/')).toBeNull();
+    expect(validateTarget(base+'#')).not.toBeNull();
+    expect(validateTarget(base+'#fragment')).not.toBeNull();
+  });
   it('splits supported invitation links without losing query parameters',()=>{
     expect(splitInvitationLink('https://example.com/join/CODE_1?lang=zh')).toEqual({prefix:'https://example.com/join/',code:'CODE_1',suffix:'?lang=zh'});
     expect(splitInvitationLink('https://example.org/zh/share/CODE-2')).toEqual({prefix:'https://example.org/zh/share/',code:'CODE-2',suffix:''});

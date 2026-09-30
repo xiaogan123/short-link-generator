@@ -93,9 +93,11 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: npm run tauri -- build --target ${{ matrix.target }} --config release-config.json --bundles ${{ matrix.bundles }}
       - name: Install and launch the candidate on its native runner
+        id: native_smoke
         env:
           RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
           RELEASE_SHA: ${{ needs.prepare.outputs.sha }}
+          SLG_UPDATER_PUBLIC_KEY: ${{ vars.UPDATER_PUBLIC_KEY }}
         run: node scripts/native-smoke.mjs src-tauri/target/${{ matrix.target }}/release/bundle ${{ matrix.target }}
       - name: Inspect candidate contents before upload
         id: privacy
@@ -104,7 +106,7 @@ jobs:
           SLG_RELEASE_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
         run: node scripts/artifact-check.mjs src-tauri/target/${{ matrix.target }}/release/bundle
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        if: ${{ !cancelled() && steps.privacy.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.native_smoke.outcome == 'success' && steps.privacy.outcome == 'success' }}
         with:
           name: candidate-${{ matrix.target }}
           path: src-tauri/target/${{ matrix.target }}/release/bundle
@@ -135,6 +137,7 @@ jobs:
         env:
           RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
           RELEASE_SHA: ${{ needs.prepare.outputs.sha }}
+          SLG_UPDATER_PUBLIC_KEY: ${{ vars.UPDATER_PUBLIC_KEY }}
         run: node scripts/release-manifest.mjs candidates --require-evidence
       - name: Create a draft for final review
         env:

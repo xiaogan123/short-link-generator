@@ -49,7 +49,9 @@ pub fn compose(template: &Template, code: &str) -> Result<String, String> {
         || !url.username().is_empty()
         || url.password().is_some()
         || url.fragment().is_some()
+        || url.port() == Some(0)
         || target.len() > 2048
+        || url.as_str().len() > 2048
         || url.origin() != prefix_url.origin()
     {
         return Err("平台地址模板必须生成不含账号信息或片段的完整 HTTPS 网址".into());
@@ -160,6 +162,30 @@ pub fn matching_cloud_value(pool: &Pool, remote: &Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn rejects_unusable_port_and_oversized_canonical_destinations() {
+        for prefix in [
+            "https://example.org:0/join/".to_string(),
+            format!("https://example.org/{}", "值".repeat(230)),
+        ] {
+            assert!(compose(
+                &Template {
+                    prefix,
+                    suffix: String::new()
+                },
+                "CODE"
+            )
+            .is_err());
+        }
+        assert!(compose(
+            &Template {
+                prefix: "https://example.org:8443/join/".into(),
+                suffix: String::new(),
+            },
+            "CODE"
+        )
+        .is_ok());
+    }
     #[test]
     fn preserves_template_query_and_encodes_host() {
         let t = Template {

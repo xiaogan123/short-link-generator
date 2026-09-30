@@ -1,8 +1,10 @@
-//! Short-lived, process-local cache for credentials kept in the platform store.
+//! Bounded, process-local cache for credentials kept in the platform store.
 //!
 //! Cached values are zeroized when replaced, expired, invalidated, or dropped. The
 //! public `get` API returns an owned `String` for compatibility with existing call
 //! sites; callers should keep that unavoidable plaintext copy no longer than needed.
+//! Successful reads use a sliding idle deadline with an absolute lifetime cap. A
+//! missing entry is cached briefly without storing any secret material.
 
 use std::{
     collections::HashMap,
@@ -18,7 +20,11 @@ use zeroize::Zeroizing;
 #[cfg(not(test))]
 const KEYRING_SERVICE: &str = "org.shortlink.generator";
 #[cfg(not(test))]
-const CACHE_TTL: Duration = Duration::from_secs(15 * 60);
+const CACHE_IDLE_TTL: Duration = Duration::from_secs(30 * 60);
+#[cfg(not(test))]
+const CACHE_MAX_LIFETIME: Duration = Duration::from_secs(8 * 60 * 60);
+#[cfg(not(test))]
+const MISSING_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 
 /// Stable, non-sensitive error categories safe to show at the bridge boundary.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -146,6 +152,11 @@ impl Hash for CacheKey {
 
 struct CachedSecret {
     value: Zeroizing<String>,
+    idle_expires_at: Duration,
+    absolute_expires_at: Duration,
+}
+
+struct CachedMissing {
     expires_at: Duration,
 }
 
@@ -161,6 +172,7 @@ enum SlotState {
         invalidated: bool,
     },
     Ready(CachedSecret),
+    Missing(CachedMissing),
 }
 
 struct SlotInner {
@@ -192,7 +204,9 @@ impl Slot {
             SlotState::Loading { invalidated, .. } | SlotState::Mutating { invalidated, .. } => {
                 *invalidated = true
             }
-            SlotState::Empty | SlotState::Ready(_) => inner.state = SlotState::Empty,
+            SlotState::Empty | SlotState::Ready(_) | SlotState::Missing(_) => {
+                inner.state = SlotState::Empty
+            }
         }
     }
 }
@@ -200,17 +214,27 @@ impl Slot {
 struct SecretStore<B: CredentialBackend, C: Clock> {
     backend: Arc<B>,
     clock: C,
-    ttl: Duration,
+    idle_ttl: Duration,
+    max_lifetime: Duration,
+    missing_ttl: Duration,
     epoch: std::sync::atomic::AtomicU64,
     slots: Mutex<HashMap<CacheKey, Arc<Slot>>>,
 }
 
 impl<B: CredentialBackend, C: Clock> SecretStore<B, C> {
-    fn new(backend: Arc<B>, clock: C, ttl: Duration) -> Self {
+    fn new(
+        backend: Arc<B>,
+        clock: C,
+        idle_ttl: Duration,
+        max_lifetime: Duration,
+        missing_ttl: Duration,
+    ) -> Self {
         Self {
             backend,
             clock,
-            ttl,
+            idle_ttl,
+            max_lifetime,
+            missing_ttl,
             epoch: std::sync::atomic::AtomicU64::new(0),
             slots: Mutex::new(HashMap::new()),
         }
@@ -252,11 +276,22 @@ impl<B: CredentialBackend, C: Clock> SecretStore<B, C> {
                 return Err(SecretError::Unavailable);
             }
 
+            let now = self.clock.now();
             match &mut inner.state {
-                SlotState::Ready(cached) if self.clock.now() < cached.expires_at => {
+                SlotState::Ready(cached)
+                    if now < cached.idle_expires_at && now < cached.absolute_expires_at =>
+                {
+                    cached.idle_expires_at =
+                        deadline(now, self.idle_ttl).min(cached.absolute_expires_at);
                     return Ok(cached.value.as_str().to_owned());
                 }
                 SlotState::Ready(_) => {
+                    inner.state = SlotState::Empty;
+                }
+                SlotState::Missing(cached) if now < cached.expires_at => {
+                    return Err(SecretError::Missing);
+                }
+                SlotState::Missing(_) => {
                     inner.state = SlotState::Empty;
                 }
                 SlotState::Empty => {
@@ -314,17 +349,14 @@ impl<B: CredentialBackend, C: Clock> SecretStore<B, C> {
         match loaded {
             Ok(secret) => {
                 let returned = secret.as_str().to_owned();
-                let expires_at = self
-                    .clock
-                    .now()
-                    .checked_add(self.ttl)
-                    .unwrap_or(Duration::MAX);
-                inner.state = SlotState::Ready(CachedSecret {
-                    value: secret,
-                    expires_at,
-                });
+                inner.state = SlotState::Ready(self.cached_secret(secret));
                 slot.changed.notify_all();
                 Ok(returned)
+            }
+            Err(SecretError::Missing) => {
+                inner.state = SlotState::Missing(self.cached_missing());
+                slot.changed.notify_all();
+                Err(SecretError::Missing)
             }
             Err(error) => {
                 inner.state = SlotState::Empty;
@@ -351,14 +383,7 @@ impl<B: CredentialBackend, C: Clock> SecretStore<B, C> {
                             && self.epoch.load(std::sync::atomic::Ordering::SeqCst)
                                 == store_epoch =>
                     {
-                        SlotState::Ready(CachedSecret {
-                            value: Zeroizing::new(value.to_owned()),
-                            expires_at: self
-                                .clock
-                                .now()
-                                .checked_add(self.ttl)
-                                .unwrap_or(Duration::MAX),
-                        })
+                        SlotState::Ready(self.cached_secret(Zeroizing::new(value.to_owned())))
                     }
                     Ok(()) | Err(_) => SlotState::Empty,
                 };
@@ -369,15 +394,43 @@ impl<B: CredentialBackend, C: Clock> SecretStore<B, C> {
     }
 
     fn delete(&self, id: &str, kind: &str) -> Result<(), SecretError> {
+        let store_epoch = self.epoch.load(std::sync::atomic::Ordering::SeqCst);
         let slot = self.slot(id, kind);
         let operation = self.begin_mutation(&slot);
         let result = self.backend.delete(id, kind);
         let mut inner = lock(&slot.inner);
-        if matches!(inner.state, SlotState::Mutating { id, .. } if id == operation) {
-            inner.state = SlotState::Empty;
-            slot.changed.notify_all();
+        if let SlotState::Mutating { id, invalidated } = inner.state {
+            if id == operation {
+                inner.state = match result {
+                    Ok(())
+                        if !invalidated
+                            && self.epoch.load(std::sync::atomic::Ordering::SeqCst)
+                                == store_epoch =>
+                    {
+                        SlotState::Missing(self.cached_missing())
+                    }
+                    Ok(()) | Err(_) => SlotState::Empty,
+                };
+                slot.changed.notify_all();
+            }
         }
         result
+    }
+
+    fn cached_secret(&self, value: Zeroizing<String>) -> CachedSecret {
+        let now = self.clock.now();
+        let absolute_expires_at = deadline(now, self.max_lifetime);
+        CachedSecret {
+            value,
+            idle_expires_at: deadline(now, self.idle_ttl).min(absolute_expires_at),
+            absolute_expires_at,
+        }
+    }
+
+    fn cached_missing(&self) -> CachedMissing {
+        CachedMissing {
+            expires_at: deadline(self.clock.now(), self.missing_ttl),
+        }
     }
 
     fn begin_mutation(&self, slot: &Slot) -> u64 {
@@ -402,7 +455,7 @@ impl<B: CredentialBackend, C: Clock> SecretStore<B, C> {
                     slot.changed.notify_all();
                     return operation;
                 }
-                SlotState::Empty | SlotState::Ready(_) => {
+                SlotState::Empty | SlotState::Ready(_) | SlotState::Missing(_) => {
                     inner.next_operation = inner.next_operation.wrapping_add(1);
                     let operation = inner.next_operation;
                     inner.state = SlotState::Mutating {
@@ -430,11 +483,18 @@ impl<B: CredentialBackend, C: Clock> SecretStore<B, C> {
         let slots = lock(&self.slots);
         for slot in slots.values() {
             let mut inner = lock(&slot.inner);
-            if matches!(&inner.state, SlotState::Ready(cached) if now >= cached.expires_at) {
+            if matches!(&inner.state, SlotState::Ready(cached)
+                if now >= cached.idle_expires_at || now >= cached.absolute_expires_at)
+                || matches!(&inner.state, SlotState::Missing(cached) if now >= cached.expires_at)
+            {
                 inner.state = SlotState::Empty;
             }
         }
     }
+}
+
+fn deadline(now: Duration, ttl: Duration) -> Duration {
+    now.checked_add(ttl).unwrap_or(Duration::MAX)
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -452,7 +512,15 @@ fn wait<'a, T>(condvar: &Condvar, guard: MutexGuard<'a, T>) -> MutexGuard<'a, T>
 #[cfg(not(test))]
 fn store() -> &'static SecretStore<KeyringBackend, SystemClock> {
     static STORE: OnceLock<SecretStore<KeyringBackend, SystemClock>> = OnceLock::new();
-    STORE.get_or_init(|| SecretStore::new(Arc::new(KeyringBackend), SystemClock::new(), CACHE_TTL))
+    STORE.get_or_init(|| {
+        SecretStore::new(
+            Arc::new(KeyringBackend),
+            SystemClock::new(),
+            CACHE_IDLE_TTL,
+            CACHE_MAX_LIFETIME,
+            MISSING_CACHE_TTL,
+        )
+    })
 }
 
 #[cfg(not(test))]
@@ -623,10 +691,28 @@ mod tests {
 
     type TestStore = SecretStore<MockBackend, Arc<ManualClock>>;
 
-    fn fixture(ttl: Duration) -> (Arc<TestStore>, Arc<MockBackend>, Arc<ManualClock>) {
+    fn fixture(idle_ttl: Duration) -> (Arc<TestStore>, Arc<MockBackend>, Arc<ManualClock>) {
+        fixture_with_policy(
+            idle_ttl,
+            idle_ttl.saturating_mul(8),
+            Duration::from_secs(60),
+        )
+    }
+
+    fn fixture_with_policy(
+        idle_ttl: Duration,
+        max_lifetime: Duration,
+        missing_ttl: Duration,
+    ) -> (Arc<TestStore>, Arc<MockBackend>, Arc<ManualClock>) {
         let backend = Arc::new(MockBackend::default());
         let clock = Arc::new(ManualClock::default());
-        let store = Arc::new(SecretStore::new(backend.clone(), clock.clone(), ttl));
+        let store = Arc::new(SecretStore::new(
+            backend.clone(),
+            clock.clone(),
+            idle_ttl,
+            max_lifetime,
+            missing_ttl,
+        ));
         (store, backend, clock)
     }
 
@@ -653,33 +739,124 @@ mod tests {
     }
 
     #[test]
-    fn caches_success_with_absolute_ttl() {
-        let ttl = Duration::from_secs(600);
-        let (store, backend, clock) = fixture(ttl);
+    fn successful_reads_slide_until_the_absolute_cap() {
+        let (store, backend, clock) = fixture_with_policy(
+            Duration::from_secs(10),
+            Duration::from_secs(25),
+            Duration::from_secs(5),
+        );
         backend.put("acct", "token", "one");
 
         assert!(success(store.get("acct", "token")) == "one");
-        clock.advance(Duration::from_secs(599));
+        clock.advance(Duration::from_secs(9));
+        assert!(success(store.get("acct", "token")) == "one");
+        clock.advance(Duration::from_secs(9));
+        assert!(success(store.get("acct", "token")) == "one");
+        backend.put("acct", "token", "two");
+        clock.advance(Duration::from_secs(6));
         assert!(success(store.get("acct", "token")) == "one");
         assert!(backend.get_count.load(Ordering::SeqCst) == 1);
 
-        clock.advance(Duration::from_secs(2));
+        clock.advance(Duration::from_secs(1));
+        assert!(success(store.get("acct", "token")) == "two");
+        assert!(backend.get_count.load(Ordering::SeqCst) == 2);
+    }
+
+    #[test]
+    fn idle_deadline_is_exclusive() {
+        let (store, backend, clock) = fixture_with_policy(
+            Duration::from_secs(10),
+            Duration::from_secs(100),
+            Duration::from_secs(5),
+        );
+        backend.put("acct", "token", "one");
         assert!(success(store.get("acct", "token")) == "one");
+
+        backend.put("acct", "token", "two");
+        clock.advance(Duration::from_secs(10));
+        assert!(success(store.get("acct", "token")) == "two");
         assert!(backend.get_count.load(Ordering::SeqCst) == 2);
     }
 
     #[test]
     fn maintenance_purges_expired_value_without_another_read() {
-        let ttl = Duration::from_secs(600);
-        let (store, backend, clock) = fixture(ttl);
+        let idle_ttl = Duration::from_secs(600);
+        let (store, backend, clock) = fixture(idle_ttl);
         backend.put("acct", "token", "one");
         assert!(success(store.get("acct", "token")) == "one");
 
-        clock.advance(ttl);
+        clock.advance(idle_ttl);
         store.purge_expired();
         backend.put("acct", "token", "two");
         assert!(success(store.get("acct", "token")) == "two");
         assert!(backend.get_count.load(Ordering::SeqCst) == 2);
+    }
+
+    #[test]
+    fn missing_value_is_cached_until_its_exclusive_deadline() {
+        let (store, backend, clock) = fixture_with_policy(
+            Duration::from_secs(10),
+            Duration::from_secs(100),
+            Duration::from_secs(5),
+        );
+
+        assert!(store.get("acct", "selftest").unwrap_err() == SecretError::Missing);
+        backend.put("acct", "selftest", "created-elsewhere");
+        clock.advance(Duration::from_secs(4));
+        assert!(store.get("acct", "selftest").unwrap_err() == SecretError::Missing);
+        assert!(backend.get_count.load(Ordering::SeqCst) == 1);
+
+        clock.advance(Duration::from_secs(1));
+        store.purge_expired();
+        assert!(success(store.get("acct", "selftest")) == "created-elsewhere");
+        assert!(backend.get_count.load(Ordering::SeqCst) == 2);
+    }
+
+    #[test]
+    fn set_replaces_cached_missing_without_another_backend_read() {
+        let (store, backend, _) = fixture(Duration::from_secs(600));
+        assert!(store.get("acct", "probe").unwrap_err() == SecretError::Missing);
+
+        success(store.set("acct", "probe", "new"));
+        assert!(success(store.get("acct", "probe")) == "new");
+        assert!(backend.get_count.load(Ordering::SeqCst) == 1);
+        assert!(backend.set_count.load(Ordering::SeqCst) == 1);
+    }
+
+    #[test]
+    fn clear_removes_cached_missing() {
+        let (store, backend, _) = fixture(Duration::from_secs(600));
+        assert!(store.get("acct", "selftest").unwrap_err() == SecretError::Missing);
+
+        backend.put("acct", "selftest", "created-elsewhere");
+        store.clear_all();
+        assert!(success(store.get("acct", "selftest")) == "created-elsewhere");
+        assert!(backend.get_count.load(Ordering::SeqCst) == 2);
+    }
+
+    #[test]
+    fn concurrent_missing_reads_share_one_backend_query() {
+        let (store, backend, _) = fixture(Duration::from_secs(600));
+        backend.block_gets();
+        let barrier = Arc::new(Barrier::new(7));
+        let mut threads = Vec::new();
+        for _ in 0..6 {
+            let store = store.clone();
+            let barrier = barrier.clone();
+            threads.push(thread::spawn(move || {
+                barrier.wait();
+                store.get("acct", "selftest")
+            }));
+        }
+        barrier.wait();
+        backend.wait_until_get_entered();
+        thread::sleep(StdDuration::from_millis(25));
+        backend.release_gets();
+
+        for handle in threads {
+            assert!(handle.join().unwrap().unwrap_err() == SecretError::Missing);
+        }
+        assert!(backend.get_count.load(Ordering::SeqCst) == 1);
     }
 
     #[test]
@@ -764,7 +941,7 @@ mod tests {
         *lock(&backend.delete_error) = None;
         success(store.delete("acct", "token"));
         assert!(store.get("acct", "token").unwrap_err() == SecretError::Missing);
-        assert!(backend.get_count.load(Ordering::SeqCst) == 3);
+        assert!(backend.get_count.load(Ordering::SeqCst) == 2);
     }
 
     #[test]

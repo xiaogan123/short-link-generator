@@ -6,13 +6,15 @@ import { tmpdir } from 'node:os';
 import { execFileSync,spawnSync } from 'node:child_process';
 import YAML from 'yaml';
 const root=process.cwd();
+const testPublicKey=Buffer.from('untrusted comment: minisign public key E7620F1842B4E81F\nRWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3\n').toString('base64');
+const testSignature=Buffer.from('untrusted comment: signature from minisign secret key\nRUQf6LRCGA9i559r3g7V1qNyJDApGip8MfqcadIgT9CuhV3EMhHoN1mGTkUidF/z7SrlQgXdy8ofjb7bNJJylDOocrCo8KLzZwo=\ntrusted comment: timestamp:1556193335\tfile:test\ny/rUw2y8/hOUYjZU71eHp/Wo1KZ40fGy2VJEDl34XMJM+TX48Ss/17u3IvIfbVR1FkZZSNCisQbuQY+bHwhEBg==\n').toString('base64');
 function fixture(){const dir=mkdtempSync(join(tmpdir(),'release-fixture-'));writeFileSync(join(dir,'package.json'),JSON.stringify({version:'0.1.0',type:'module'}));return dir;}
 test('three signed platforms with identical source basenames generate unique updater assets',()=>{
  const dir=fixture();try{
   for(const [target,file] of [['aarch64-apple-darwin','Example.app.tar.gz'],['x86_64-apple-darwin','Example.app.tar.gz'],['x86_64-pc-windows-msvc','Example.exe']]){
-   const path=join(dir,'candidates','candidate-'+target);mkdirSync(path,{recursive:true});writeFileSync(join(path,file),'fixture package');writeFileSync(join(path,file+'.sig'),'fixture signature');
+   const path=join(dir,'candidates','candidate-'+target);mkdirSync(path,{recursive:true});writeFileSync(join(path,file),'test');writeFileSync(join(path,file+'.sig'),testSignature);
   }
-  const r=spawnSync(process.execPath,[resolve(root,'scripts/release-manifest.mjs'),'candidates'],{cwd:dir,encoding:'utf8',env:{...process.env,GITHUB_REPOSITORY:'sample/short-link-generator'}});
+  const r=spawnSync(process.execPath,[resolve(root,'scripts/release-manifest.mjs'),'candidates'],{cwd:dir,encoding:'utf8',env:{...process.env,GITHUB_REPOSITORY:'sample/short-link-generator',SLG_UPDATER_PUBLIC_KEY:testPublicKey}});
   assert.equal(r.status,0,r.stderr);const manifest=JSON.parse(readFileSync(join(dir,'latest.json'),'utf8'));
   assert.deepEqual(Object.keys(manifest.platforms).sort(),['darwin-aarch64','darwin-x86_64','windows-x86_64']);
   assert.equal(new Set(Object.values(manifest.platforms).map(x=>x.url)).size,3);

@@ -3,9 +3,13 @@ import { join, basename, dirname } from 'node:path';
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { matchingAppInputs } from './release-app-inputs.mjs';
+import { updaterPublicKeySha256, verifyUpdaterSignatureFile } from './updater-signature.mjs';
 const version=JSON.parse(readFileSync('package.json','utf8')).version;
 const repository=process.env.GITHUB_REPOSITORY;
 if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repository??''))throw new Error('Invalid repository.');
+const updaterPublicKey=process.env.SLG_UPDATER_PUBLIC_KEY;
+if(!updaterPublicKey)throw new Error('Configured updater public key is required.');
+const publicKeySha256=updaterPublicKeySha256(updaterPublicKey);
 const root=process.argv[2]??'candidates';
 const requireEvidence=process.argv.includes('--require-evidence');
 const files=[];
@@ -19,6 +23,7 @@ const targets={
   'x86_64-pc-windows-msvc':{host:'win32-x64',platform:'windows-x86_64',installerDir:'nsis',installerSuffix:'-setup.exe',updaterDir:'nsis',updaterSuffix:'-setup.exe'},
 };
 const verified=new Map();
+const verifiedSignatures=new Set();
 function exactArtifact(candidateRoot,subdir,name,suffix,digest){
   if(typeof name!=='string'||basename(name)!==name||!name.endsWith(suffix)||!hex(digest))throw new Error('Invalid native artifact name or digest.');
   const matches=files.filter(file=>dirname(file)===join(candidateRoot,subdir)&&basename(file)===name);
@@ -35,7 +40,7 @@ function validateManualLocal(evidence,reviewedSha,target){
   const manifest=matchingAppInputs(evidence.buildSha,reviewedSha);
   if(evidence.appInputManifestSha256!==manifest.sha256||evidence.appInputFileCount!==manifest.fileCount)throw new Error('Manual local ARM app input manifest mismatch.');
   const config=evidence.buildConfiguration;
-  if(!config||!hex(config.releaseConfigSha256)||!hex(config.updaterPublicKeySha256)||!hex(config.encodedRustflagsSha256)||
+  if(!config||!hex(config.releaseConfigSha256)||config.updaterPublicKeySha256!==publicKeySha256||!hex(config.encodedRustflagsSha256)||
      config.updaterEndpoint!==`https://github.com/${repository}/releases/latest/download/latest.json`||
      JSON.stringify(config.normalizedRustflags)!==JSON.stringify(['workspace-path-remap','home-path-remap']))throw new Error('Manual local ARM build configuration evidence is incomplete.');
 }
@@ -52,7 +57,8 @@ if(requireEvidence){
     if(matches.length!==1||lstatSync(matches[0]).isSymbolicLink())throw new Error(`Missing unique native startup evidence for ${target}.`);
     const evidence=JSON.parse(readFileSync(matches[0],'utf8'));
     if(evidence.tag!==tag||evidence.target!==target||evidence.host!==config.host||
-       evidence.processAlive!==true||evidence.updaterSignaturePresent!==true||evidence.architectureVerified!==true){
+       evidence.processAlive!==true||evidence.updaterSignaturePresent!==true||
+       evidence.updaterSignatureVerified!==true||evidence.architectureVerified!==true){
       throw new Error(`Native startup evidence is invalid for ${target}.`);
     }
     if(evidence.method==='manual-local')validateManualLocal(evidence,sha,target);
@@ -65,6 +71,11 @@ if(requireEvidence){
     const updater=exactArtifact(candidateRoot,config.updaterDir,evidence.updater,config.updaterSuffix,evidence.updaterSha256);
     const signature=`${updater}.sig`;
     if(!files.includes(signature)||lstatSync(signature).isSymbolicLink()||!readFileSync(signature,'utf8').trim())throw new Error(`Missing updater signature for ${target}.`);
+    verifyUpdaterSignatureFile(updater,signature,updaterPublicKey,version);
+    verifiedSignatures.add(signature);
+    if(evidence.method!=='manual-local'&&(
+       evidence.updaterSignature!==basename(signature)||evidence.updaterSignatureSha256!==sha256(signature)||
+       evidence.updaterPublicKeySha256!==publicKeySha256))throw new Error(`Native signature evidence is invalid for ${target}.`);
     verified.set(installer,{platform:config.platform,suffix:config.installerSuffix==='-setup.exe'?'.exe':config.installerSuffix});
     verified.set(updater,{platform:config.platform,suffix:config.updaterSuffix==='-setup.exe'?'.exe':config.updaterSuffix,signature});
   }
@@ -94,6 +105,9 @@ for(const file of publishFiles){
   const signatureFile=item?.signature??file+'.sig';
   if(files.includes(signatureFile)) {
     const signature=readFileSync(signatureFile,'utf8').trim();if(!signature)throw new Error('Empty update signature.');
+    if(!verifiedSignatures.has(signatureFile)){
+      verifyUpdaterSignatureFile(file,signatureFile,updaterPublicKey,version);verifiedSignatures.add(signatureFile);
+    }
     copyFileSync(signatureFile,out+'.sig');uploads.push(out+'.sig');
     if(suffix==='.app.tar.gz'||(platform==='windows-x86_64'&&suffix==='.exe'))platforms[platform]={signature,url:`https://github.com/${repository}/releases/download/v${version}/${name}`};
   }

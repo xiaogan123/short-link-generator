@@ -30,7 +30,7 @@ The desktop frontend calls `invoke('dispatch', { request: { action, payload } })
 - `export_config` `{}` → JSON string without secrets. UI saves via native dialog.
 - `import_config` `{json}` → State. Import non-secret local configuration after schema validation and remote ownership/read checks; never accept credentials or injected route/resource IDs as authoritative. No remote writes.
 
-Backend persists credentials in the OS key store and non-secret state in app data, never the project tree. Successful secret reads may be reused briefly in Rust memory with bounded expiry, per-key loading coordination, invalidation on write/delete and clearing on window close or exit. Missing credentials are distinct from denied/cancelled access. No system password is collected by the application.
+Backend persists credentials in the OS key store and non-secret state in app data, never the project tree. Successful secret reads may be reused in Rust memory with a 30-minute sliding idle deadline and an 8-hour absolute limit from the system read/write. Missing-item results may be cached for 5 minutes without secret data. Per-key loading coordination, invalidation on mutation failure, successful mutation replacement and clearing on window close or exit remain required. Missing credentials are distinct from denied/cancelled access. No system password is collected by the application.
 
 `check_link_targets` returns local checks with `status`, `message`, `source`, `url`, `checkedAt`, `reason` and `stage`. Reason/stage explain DNS, transport, redirect or HTTP outcomes without weakening public-address validation. Local checks disable application HTTP proxies, not OS routing or DNS; they never establish Mainland reachability. Exported files contain the user's domains and targets and are private backups. Preview mode must be explicitly labeled and never persist real tokens or call cloud APIs. No cloud writes are permitted during implementation without a separately supplied test hostname and credentials.
 
@@ -45,3 +45,5 @@ Prefix `[a-z0-9-]{1,12}`. Slug `[A-Za-z0-9_-]{1,32}`. Redirects use only saved a
 ## Application version
 
 `State.appVersion` and every `check_update` result’s `currentVersion` come from the running binary’s package version, not stored user configuration. An available update additionally reports `version`. The UI shows the current version even when the update channel is unavailable. Version metadata is not persisted into user backups.
+
+Domain onboarding may automatically chain read-only preparations when DNS is the sole blocker, but every DNS repair and directory takeover requires its own explicit plan confirmation. A failed DNS write retains the draft and visible recovery actions; retrying after a permission change only prepares a new plan, never applies it automatically. Destination validation rejects port zero and addresses longer than 2048 characters after URL serialization, before preparing or applying writes.

@@ -15,6 +15,7 @@ const releaseOnlyFiles = new Set([
   'scripts/release-app-inputs.mjs', 'scripts/release-config.mjs',
   'scripts/release-manifest.mjs', 'scripts/release-selective.test.mjs',
   'scripts/release-secret-material.mjs', 'scripts/release-secret-material.test.mjs',
+  'scripts/updater-signature.mjs', 'scripts/updater-signature.test.mjs',
   'scripts/release.test.mjs',
 ]);
 const releaseOnlyPrefixes = [

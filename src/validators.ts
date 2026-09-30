@@ -12,6 +12,9 @@ export function validateTarget(value: string): string | null {
   try {
     const url = new URL(value);
     if (url.protocol !== 'https:' || !url.hostname || url.username || url.password) return '请输入完整的 HTTPS 地址，不能包含账号信息。';
+    if (value.length > 2048 || url.href.length > 2048) return '目标网址过长，转换为标准网址后不能超过 2048 个字符。';
+    if (url.port === '0') return '目标网址的端口不能为 0，请核对网址。';
+    if (value.includes('#')) return '目标网址不能包含 # 后面的片段，请先去掉再保存。';
     return null;
   } catch { return '请输入完整的 HTTPS 地址。'; }
 }

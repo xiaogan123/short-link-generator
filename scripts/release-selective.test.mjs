@@ -8,9 +8,19 @@ import { tmpdir } from 'node:os';
 import YAML from 'yaml';
 import { isWindowsX64Executable, selectArtifacts } from './native-smoke.mjs';
 import { isAppInput, matchingAppInputs } from './release-app-inputs.mjs';
+import { updaterPublicKeySha256 } from './updater-signature.mjs';
 
 const root = resolve('.');
 const digest = path => createHash('sha256').update(readFileSync(path)).digest('hex');
+const TEST_PUBLIC_KEY = Buffer.from(`untrusted comment: minisign public key E7620F1842B4E81F
+RWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3
+`).toString('base64');
+const TEST_SIGNATURE = Buffer.from(`untrusted comment: signature from minisign secret key
+RUQf6LRCGA9i559r3g7V1qNyJDApGip8MfqcadIgT9CuhV3EMhHoN1mGTkUidF/z7SrlQgXdy8ofjb7bNJJylDOocrCo8KLzZwo=
+trusted comment: timestamp:1556193335\tfile:test
+y/rUw2y8/hOUYjZU71eHp/Wo1KZ40fGy2VJEDl34XMJM+TX48Ss/17u3IvIfbVR1FkZZSNCisQbuQY+bHwhEBg==
+`).toString('base64');
+const TEST_PUBLIC_KEY_SHA256 = updaterPublicKeySha256(TEST_PUBLIC_KEY);
 function fixture() {
   const dir = mkdtempSync(join(tmpdir(), 'release-selective-'));
   writeFileSync(join(dir, 'package.json'), JSON.stringify({ version: '0.1.1', type: 'module' }));
@@ -81,17 +91,20 @@ test('strict assembly checks source and artifact hashes and includes latest.json
       const mac = target.includes('apple');
       const installer = join(base, mac ? 'dmg' : 'nsis', mac ? 'Example.dmg' : 'Example-setup.exe');
       const updater = mac ? join(base, 'macos', 'Example.app.tar.gz') : installer;
-      put(installer, `installer-${target}`); put(updater, `updater-${target}`); put(`${updater}.sig`, `signature-${target}`);
+      put(installer, `installer-${target}`); put(updater, 'test'); put(`${updater}.sig`, TEST_SIGNATURE);
       if (!mac) put(join(base, 'msi', 'Example.msi'), 'unverified alternate installer');
       put(join(base, 'native-smoke.json'), JSON.stringify({ schema: 1, tag: 'v0.1.1', sha, target,
         host: target === 'aarch64-apple-darwin' ? 'darwin-arm64' : target === 'x86_64-apple-darwin' ? 'darwin-x64' : 'win32-x64',
-        processAlive: true, updaterSignaturePresent: true, architectureVerified: true,
+        processAlive: true, updaterSignaturePresent: true, updaterSignatureVerified: true,
+        updaterSignature: `${updater.split('/').at(-1)}.sig`, updaterSignatureSha256: digest(`${updater}.sig`),
+        updaterPublicKeySha256: TEST_PUBLIC_KEY_SHA256, architectureVerified: true,
         signatureVerified: mac ? true : null, windowObserved: mac ? null : true,
         installer: installer.split('/').at(-1), installerSha256: digest(installer),
         updater: updater.split('/').at(-1), updaterSha256: digest(updater) }));
     }
     const run = () => spawnSync(process.execPath, [join(root, 'scripts/release-manifest.mjs'), 'candidates', '--require-evidence'], {
-      cwd: dir, encoding: 'utf8', env: { ...process.env, RELEASE_TAG: 'v0.1.1', RELEASE_SHA: sha, GITHUB_REPOSITORY: 'sample/short-link-generator' },
+      cwd: dir, encoding: 'utf8', env: { ...process.env, RELEASE_TAG: 'v0.1.1', RELEASE_SHA: sha,
+        GITHUB_REPOSITORY: 'sample/short-link-generator', SLG_UPDATER_PUBLIC_KEY: TEST_PUBLIC_KEY },
     });
     assert.equal(run().status, 0);
     const windowsEvidence = join(dir, 'candidates', 'candidate-x86_64-pc-windows-msvc', 'native-smoke.json');
@@ -117,7 +130,21 @@ test('strict assembly checks source and artifact hashes and includes latest.json
     const updater = join(dir, 'candidates', 'candidate-aarch64-apple-darwin', 'macos', 'Example.app.tar.gz');
     put(updater, 'tampered updater');
     assert.notEqual(run().status, 0);
-    put(updater, 'updater-aarch64-apple-darwin');
+    put(updater, 'test');
+    const signature = `${updater}.sig`;
+    const validSignature = readFileSync(signature, 'utf8');
+    put(signature, 'NOT_A_SIGNATURE');
+    assert.notEqual(run().status, 0);
+    put(signature, validSignature);
+    const wrongKey = Buffer.from(Buffer.from(TEST_PUBLIC_KEY, 'base64').toString('utf8').replace(
+      'RWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3',
+      'RWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO2',
+    )).toString('base64');
+    const wrongKeyRun = spawnSync(process.execPath, [join(root, 'scripts/release-manifest.mjs'), 'candidates', '--require-evidence'], {
+      cwd: dir, encoding: 'utf8', env: { ...process.env, RELEASE_TAG: 'v0.1.1', RELEASE_SHA: sha,
+        GITHUB_REPOSITORY: 'sample/short-link-generator', SLG_UPDATER_PUBLIC_KEY: wrongKey },
+    });
+    assert.notEqual(wrongKeyRun.status, 0);
     const bad = join(dir, 'candidates', 'candidate-aarch64-apple-darwin', 'native-smoke.json');
     const evidence = JSON.parse(readFileSync(bad, 'utf8')); evidence.sha = 'b'.repeat(40); put(bad, JSON.stringify(evidence));
     assert.notEqual(run().status, 0);
@@ -156,10 +183,12 @@ test('manual ARM reuse derives the application tree from both commits and reject
       const mac = target.includes('apple');
       const installer = join(base, mac ? 'dmg' : 'nsis', mac ? 'Example.dmg' : 'Example-setup.exe');
       const updater = mac ? join(base, 'macos', 'Example.app.tar.gz') : installer;
-      put(installer, `installer-${target}`); put(updater, `updater-${target}`); put(`${updater}.sig`, 'fixture signature');
+      put(installer, `installer-${target}`); put(updater, 'test'); put(`${updater}.sig`, TEST_SIGNATURE);
       const evidence = { tag: 'v0.1.1', target,
         host: target === 'aarch64-apple-darwin' ? 'darwin-arm64' : target === 'x86_64-apple-darwin' ? 'darwin-x64' : 'win32-x64',
-        processAlive: true, updaterSignaturePresent: true, architectureVerified: true,
+        processAlive: true, updaterSignaturePresent: true, updaterSignatureVerified: true,
+        updaterSignature: `${updater.split('/').at(-1)}.sig`, updaterSignatureSha256: digest(`${updater}.sig`),
+        updaterPublicKeySha256: TEST_PUBLIC_KEY_SHA256, architectureVerified: true,
         signatureVerified: mac ? true : null, windowObserved: mac ? null : true,
         installer: installer.split('/').at(-1), installerSha256: digest(installer),
         updater: updater.split('/').at(-1), updaterSha256: digest(updater) };
@@ -169,7 +198,7 @@ test('manual ARM reuse derives the application tree from both commits and reject
         minimumSystemVersionMetadata: '11.0', minimumSystemRuntimeTested: false,
         appInputManifestSha256: expected.sha256, appInputFileCount: expected.fileCount,
         buildConfiguration: {
-          releaseConfigSha256: 'a'.repeat(64), updaterPublicKeySha256: 'b'.repeat(64),
+          releaseConfigSha256: 'a'.repeat(64), updaterPublicKeySha256: TEST_PUBLIC_KEY_SHA256,
           updaterEndpoint: 'https://github.com/sample/short-link-generator/releases/latest/download/latest.json',
           encodedRustflagsSha256: 'c'.repeat(64), normalizedRustflags: ['workspace-path-remap', 'home-path-remap'],
         },
@@ -179,7 +208,8 @@ test('manual ARM reuse derives the application tree from both commits and reject
     }
     const evidenceFile = join(dir, 'candidates', 'candidate-aarch64-apple-darwin', 'native-smoke.json');
     const run = () => spawnSync(process.execPath, [join(root, 'scripts/release-manifest.mjs'), 'candidates', '--require-evidence'], {
-      cwd: dir, encoding: 'utf8', env: { ...process.env, RELEASE_TAG: 'v0.1.1', RELEASE_SHA: reviewedSha, GITHUB_REPOSITORY: 'sample/short-link-generator' },
+      cwd: dir, encoding: 'utf8', env: { ...process.env, RELEASE_TAG: 'v0.1.1', RELEASE_SHA: reviewedSha,
+        GITHUB_REPOSITORY: 'sample/short-link-generator', SLG_UPDATER_PUBLIC_KEY: TEST_PUBLIC_KEY },
     });
     const assembled = run();
     assert.equal(assembled.status, 0, assembled.stderr);
@@ -238,9 +268,13 @@ test('release workflow is manual, selective, and scans before one-day upload', (
   const upload = steps.findIndex(step => step.uses?.startsWith('actions/upload-artifact@'));
   assert.ok(smoke >= 0 && scan > smoke && upload > scan);
   assert.equal(steps.find(step => step.name === 'Build installers locally on native runner').id, 'package');
+  assert.equal(steps[smoke].id, 'native_smoke');
+  assert.equal(steps[smoke].env.SLG_UPDATER_PUBLIC_KEY, '${{ vars.UPDATER_PUBLIC_KEY }}');
   assert.equal(steps[scan].id, 'privacy');
   assert.equal(steps[scan].if, "${{ !cancelled() && steps.package.outcome == 'success' }}");
-  assert.equal(steps[upload].if, "${{ !cancelled() && steps.privacy.outcome == 'success' }}");
+  assert.equal(steps[upload].if, "${{ !cancelled() && steps.native_smoke.outcome == 'success' && steps.privacy.outcome == 'success' }}");
   assert.equal(steps[upload].with['retention-days'], 1);
+  const assemble = release.jobs.draft.steps.find(step => step.name?.includes('assemble the draft assets'));
+  assert.equal(assemble.env.SLG_UPDATER_PUBLIC_KEY, '${{ vars.UPDATER_PUBLIC_KEY }}');
   assert.equal(existsSync('.github/workflows/release.yml'), true);
 });

@@ -4,6 +4,9 @@ import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSyn
 import { tmpdir } from 'node:os';
 import { basename, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import {
+  updaterPublicKeySha256, verifyUpdaterSignatureFile,
+} from './updater-signature.mjs';
 import { observeWindowsWindow } from './windows-window-observer.mjs';
 
 const targets = {
@@ -36,10 +39,11 @@ export function selectArtifacts(bundle, target) {
   }
   const [installer] = installerMatches;
   const [updater] = updaterMatches;
-  if (!files.includes(`${updater}.sig`) || !readFileSync(`${updater}.sig`, 'utf8').trim()) {
+  const signature = `${updater}.sig`;
+  if (!files.includes(signature) || !readFileSync(signature, 'utf8').trim()) {
     throw new Error('Signed updater package is missing its nonempty signature.');
   }
-  return { installer, updater, config };
+  return { installer, updater, signature, config };
 }
 
 export function isWindowsX64Executable(path) {
@@ -142,7 +146,7 @@ export async function main(args = process.argv.slice(2)) {
   const [bundleArg, target, mode] = args;
   if (!bundleArg || !targets[target]) throw new Error('Usage: node scripts/native-smoke.mjs <bundle> <target> [--plan]');
   const bundle = resolve(bundleArg);
-  const { installer, updater, config } = selectArtifacts(bundle, target);
+  const { installer, updater, signature, config } = selectArtifacts(bundle, target);
   if (mode === '--plan') {
     console.log(JSON.stringify({ target, installer: basename(installer), updater: basename(updater) }));
     return;
@@ -164,6 +168,10 @@ export async function main(args = process.argv.slice(2)) {
     throw new Error('Validated release tag and source SHA are required.');
   }
   if (run('git', ['rev-parse', 'HEAD']) !== sha) throw new Error('Source SHA changed after preparation.');
+  const updaterPublicKey = process.env.SLG_UPDATER_PUBLIC_KEY;
+  if (!updaterPublicKey) throw new Error('Configured updater public key is required.');
+  verifyUpdaterSignatureFile(updater, signature, updaterPublicKey, tag);
+  const publicKeySha256 = updaterPublicKeySha256(updaterPublicKey);
   const temp = mkdtempSync(join(process.env.RUNNER_TEMP ?? tmpdir(), 'slg-native-smoke-'));
   try {
     const result = config.host === 'darwin'
@@ -173,7 +181,9 @@ export async function main(args = process.argv.slice(2)) {
       host: `${process.platform}-${process.arch}`, checkedAt: new Date().toISOString(),
       installer: basename(installer), installerSha256: digest(installer),
       updater: basename(updater), updaterSha256: digest(updater),
-      updaterSignaturePresent: true, ...result };
+      updaterSignature: basename(signature), updaterSignatureSha256: digest(signature),
+      updaterPublicKeySha256: publicKeySha256,
+      updaterSignaturePresent: true, updaterSignatureVerified: true, ...result };
     writeFileSync(join(bundle, 'native-smoke.json'), `${JSON.stringify(evidence, null, 2)}\n`);
     console.log(JSON.stringify({ target, result: 'passed', ...result }));
   } finally {
