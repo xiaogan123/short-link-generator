@@ -79,21 +79,22 @@ export function runCaptured(command, args, { env, input, timeout = 60_000, onChi
 
 export async function prepareMaterial(material, expectedPin, { run = runCaptured, openssl = '/usr/bin/openssl', env = {}, temp }) {
   const decodeEnv = { ...env, SLG_INTERNAL_P12_PASSWORD: material.password };
-  let privatePem;
+  let privatePem, exportPem;
   try {
-    const certOutput = await run(openssl, ['pkcs12', '-in', '/dev/stdin', '-passin', 'env:SLG_INTERNAL_P12_PASSWORD', '-nokeys'], { env: decodeEnv, input: material.p12 });
+    const certOutput = await run(openssl, ['pkcs12', '-passin', 'env:SLG_INTERNAL_P12_PASSWORD', '-nokeys'], { env: decodeEnv, input: material.p12 });
     const certificates = certOutput.toString('utf8').match(/-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----/g);
     if (certificates?.length !== 1) throw fail();
     const cert = new X509Certificate(certificates[0]);
     const info = certificateInfo(cert.raw, expectedPin);
-    privatePem = await run(openssl, ['pkcs12', '-in', '/dev/stdin', '-passin', 'env:SLG_INTERNAL_P12_PASSWORD', '-nocerts', '-nodes'], { env: decodeEnv, input: material.p12 });
+    privatePem = await run(openssl, ['pkcs12', '-passin', 'env:SLG_INTERNAL_P12_PASSWORD', '-nocerts', '-nodes'], { env: decodeEnv, input: material.p12 });
     if ((privatePem.toString('utf8').match(/-----BEGIN (?:RSA |EC |ENCRYPTED )?PRIVATE KEY-----/g) ?? []).length !== 1 ||
         !cert.checkPrivateKey(createPrivateKey(privatePem))) throw fail();
-    const certificatePath = join(temp, 'certificate.pem');
-    writeFileSync(certificatePath, certificates[0], { mode: 0o600 });
+    // Omitted input options use stdin directly. Descriptor paths reopen Node's
+    // socket-backed pipe on Linux; '-' is not portable to Apple's LibreSSL.
+    exportPem = Buffer.concat([privatePem, Buffer.from(`\n${certificates[0]}\n`)]);
     const importPassword = randomBytes(32).toString('base64url');
-    const wrapped = await run(openssl, ['pkcs12', '-export', '-in', certificatePath, '-inkey', '/dev/stdin', '-passout', 'env:SLG_INTERNAL_IMPORT_PASSWORD'], {
-      env: { ...env, SLG_INTERNAL_IMPORT_PASSWORD: importPassword }, input: privatePem,
+    const wrapped = await run(openssl, ['pkcs12', '-export', '-passout', 'env:SLG_INTERNAL_IMPORT_PASSWORD'], {
+      env: { ...env, SLG_INTERNAL_IMPORT_PASSWORD: importPassword }, input: exportPem,
     });
     const importPath = join(temp, 'import.p12');
     writeFileSync(importPath, wrapped, { mode: 0o600 });
@@ -102,6 +103,7 @@ export async function prepareMaterial(material, expectedPin, { run = runCaptured
   } catch {
     throw new Error('macOS signing material, password, certificate pin, or private-key match is invalid.');
   } finally {
+    exportPem?.fill(0);
     privatePem?.fill(0);
     material.p12.fill(0);
     delete decodeEnv.SLG_INTERNAL_P12_PASSWORD;

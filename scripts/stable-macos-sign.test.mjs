@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createHash, generateKeyPairSync, X509Certificate } from 'node:crypto';
+import { createHash, createPrivateKey, generateKeyPairSync, X509Certificate } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -13,15 +13,16 @@ import { classifyCodesignError, executeSigning, readSigningContext, signingArgum
 // No test creates/imports a real Keychain, invokes native signing, or reads user credentials.
 const openssl = process.platform === 'darwin' && existsSync('/opt/homebrew/bin/openssl') ? '/opt/homebrew/bin/openssl' : 'openssl';
 const supported = process.platform !== 'win32';
-function fixture() {
+function fixture(fixtureOpenSSL = openssl) {
   const temp = mkdtempSync(join(tmpdir(), 'slg-signing-fixture-'));
   const key = join(temp, 'test-key.pem'); const cert = join(temp, 'test-cert.pem'); const p12 = join(temp, 'test.p12');
   const password = 'synthetic-fixture-only';
+  const config = join(temp, 'fixture.cnf');
+  writeFileSync(config, '[req]\ndistinguished_name=dn\nprompt=no\nx509_extensions=codesign\n[dn]\nCN=Example Synthetic Signing\n[codesign]\nbasicConstraints=critical,CA:FALSE\nextendedKeyUsage=codeSigning\nkeyUsage=critical,digitalSignature\n', { mode: 0o600 });
   const env = { ...process.env, FIXTURE_PASSWORD: password };
-  execFileSync(openssl, ['req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-keyout', key, '-out', cert,
-    '-subj', '/CN=Example Synthetic Signing', '-days', '1', '-addext', 'basicConstraints=critical,CA:FALSE',
-    '-addext', 'extendedKeyUsage=codeSigning', '-addext', 'keyUsage=critical,digitalSignature'], { env, stdio: 'pipe' });
-  execFileSync(openssl, ['pkcs12', '-export', '-inkey', key, '-in', cert, '-out', p12, '-passout', 'env:FIXTURE_PASSWORD'], { env, stdio: 'pipe' });
+  execFileSync(fixtureOpenSSL, ['req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-keyout', key, '-out', cert,
+    '-days', '1', '-config', config], { env, stdio: 'pipe' });
+  execFileSync(fixtureOpenSSL, ['pkcs12', '-export', '-inkey', key, '-in', cert, '-out', p12, '-passout', 'env:FIXTURE_PASSWORD'], { env, stdio: 'pipe' });
   const der = new X509Certificate(readFileSync(cert)).raw;
   const info = certificateInfo(der, hash(der));
   return { temp, password, der, info, p12: readFileSync(p12), cleanup: () => rmSync(temp, { recursive: true, force: true }) };
@@ -82,21 +83,37 @@ test('build receives only its required updater secrets and no macOS signing inpu
   assert.throws(() => loadMaterial({}, process.cwd()));
 });
 
-test('PKCS12 fixture proves password, certificate pin and private-key correspondence', { skip: !supported }, async () => {
-  const f = fixture();
+const fixtureEngines = process.platform === 'darwin' ? [...new Set(['/usr/bin/openssl', openssl])] : [openssl];
+for (const fixtureOpenSSL of fixtureEngines) test(`PKCS12 fixture proves stdin roundtrip, password, certificate pin and private-key correspondence (${fixtureOpenSSL})`, { skip: !supported }, async () => {
+  const f = fixture(fixtureOpenSSL);
   try {
     const prepared = await prepareMaterial({ p12: Buffer.from(f.p12), password: f.password }, f.info.certificateSha256,
-      { openssl, env: process.env, temp: f.temp });
+      { openssl: fixtureOpenSSL, env: process.env, temp: f.temp });
     assert.equal(prepared.certificateSha1, f.info.certificateSha1);
     assert.notEqual(prepared.importPassword, f.password);
     assert.ok(existsSync(prepared.importPath));
+    const decodeEnv = { ...process.env, SYNTHETIC_WRAP_PASSWORD: prepared.importPassword };
+    const wrapped = readFileSync(prepared.importPath);
+    const wrappedCert = await runCaptured(fixtureOpenSSL, ['pkcs12', '-passin', 'env:SYNTHETIC_WRAP_PASSWORD', '-nokeys'], { env: decodeEnv, input: wrapped });
+    assert.deepEqual(new X509Certificate(wrappedCert).raw, f.der);
+    const wrappedKey = await runCaptured(fixtureOpenSSL, ['pkcs12', '-passin', 'env:SYNTHETIC_WRAP_PASSWORD', '-nocerts', '-nodes'], { env: decodeEnv, input: wrapped });
+    try { assert.ok(new X509Certificate(f.der).checkPrivateKey(createPrivateKey(wrappedKey))); }
+    finally { wrappedKey.fill(0); wrapped.fill(0); }
     for (const [password, pin] of [['wrong-password', f.info.certificateSha256], [f.password, '0'.repeat(64)]]) {
-      await assert.rejects(prepareMaterial({ p12: Buffer.from(f.p12), password }, pin, { openssl, env: process.env, temp: f.temp }), /material/);
+      await assert.rejects(prepareMaterial({ p12: Buffer.from(f.p12), password }, pin, { openssl: fixtureOpenSSL, env: process.env, temp: f.temp }), /material/);
     }
     const wrongKey = generateKeyPairSync('rsa', { modulusLength: 2048 }).privateKey.export({ format: 'pem', type: 'pkcs8' });
     const mismatch = (command, args, options) => args.includes('-nocerts') ? Promise.resolve(Buffer.from(wrongKey)) : runCaptured(command, args, options);
     await assert.rejects(prepareMaterial({ p12: Buffer.from(f.p12), password: f.password }, f.info.certificateSha256,
-      { openssl, env: process.env, temp: f.temp, run: mismatch }), /material/);
+      { openssl: fixtureOpenSSL, env: process.env, temp: f.temp, run: mismatch }), /material/);
+    let failedExportInput;
+    const exportFailure = (command, args, options) => {
+      if (args.includes('-export')) { failedExportInput = options.input; return Promise.reject(new Error('synthetic-export-failure')); }
+      return runCaptured(command, args, options);
+    };
+    await assert.rejects(prepareMaterial({ p12: Buffer.from(f.p12), password: f.password }, f.info.certificateSha256,
+      { openssl: fixtureOpenSSL, env: process.env, temp: f.temp, run: exportFailure }), /material/);
+    assert.ok(Buffer.isBuffer(failedExportInput) && failedExportInput.every(byte => byte === 0));
     assert.throws(() => certificateInfo(f.der, '0'.repeat(64)), /certificate/);
   } finally { f.cleanup(); }
 });
