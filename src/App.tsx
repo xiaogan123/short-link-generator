@@ -163,6 +163,10 @@ function poolTargetUrl(prefix: string, suffix: string, code = "") {
   return `${prefix}${encodeURIComponent(code)}${suffix}`;
 }
 
+function isSelftestRecovery(kind: PendingAction["kind"]) {
+  return kind === "resume_selftest_rotation" || kind === "recover_selftest_rotation" || kind === "recover_selftest_resources";
+}
+
 export default function App() {
   const [page, setPage] = useState<Page>("links");
   const [state, setState] = useState<State>(emptyState);
@@ -171,6 +175,7 @@ export default function App() {
   const [working, setWorking] = useState(false);
   const [mutation, setMutation] = useState<string | null>(null);
   const mutationRef = useRef<string | null>(null);
+  const pendingPrepareRef = useRef(false);
   const busy = working || mutation !== null;
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
@@ -465,6 +470,9 @@ export default function App() {
       else
         setPlanDetails([
           `账户：${state.accounts.find((a) => a.id === fields.accountId)?.label || String(fields.accountId)}`,
+          ...(kind === "recover_selftest_resources"
+            ? ["本次只找回本机检测配置；完成后，恢复检测密钥仍需另行查看计划并确认。"]
+            : []),
         ]);
       setPlan(next);
     }
@@ -490,6 +498,8 @@ export default function App() {
           }),
         appliedKind === "migrate_credentials"
           ? "本机授权已更新，请重试刚才的操作"
+          : appliedKind === "recover_selftest_resources"
+            ? "本机检测配置已找回。请查看新的修复计划，另行确认恢复检测密钥。"
           : appliedKind === "add_domain"
             ? "域名已接入。现在可以创建第一条短链接；云端配置可能需要稍等片刻才生效。"
             : appliedKind === "fix_domain_dns"
@@ -513,6 +523,7 @@ export default function App() {
           });
           return;
         }
+        if (appliedKind === "recover_selftest_resources") return;
         if (appliedKind === "save_link") closeLink();
         setDomainOpen(appliedKind === "fix_domain_dns");
         setPreflight(null);
@@ -1295,34 +1306,39 @@ export default function App() {
     }
   }
   async function resumePending(action: PendingAction) {
-    if (action.accountId && !requireCurrentCredentials([action.accountId])) return;
-    if (action.kind === "resume_pool_sync" && action.poolId) {
-      await prepare("resume_pool_sync", { poolId: action.poolId });
-      return;
-    }
-    if (action.kind === "delete_pool" && action.poolId) {
-      await prepare("delete_pool", { poolId: action.poolId });
-      return;
-    }
-    if (
-      (action.kind === "resume_selftest_rotation" ||
-        action.kind === "recover_selftest_rotation") &&
-      action.accountId
-    ) {
-      await prepare(action.kind, { accountId: action.accountId });
-      return;
-    }
-    if (action.kind === "resume_monitor" && action.accountId) {
-      const next = await run(() =>
-        dispatch<Plan>("resume_monitor", { accountId: action.accountId }),
-      );
-      if (next) {
-        setPlanKind("resume_monitor");
-        setPlanDetails([
-          `账户：${state.accounts.find((a) => a.id === action.accountId)?.label || action.accountId}`,
-        ]);
-        setPlan(next);
+    if (busy || mutationRef.current || pendingPrepareRef.current) return;
+    pendingPrepareRef.current = true;
+    try {
+      if (action.accountId && !requireCurrentCredentials([action.accountId])) return;
+      if (action.kind === "resume_pool_sync" && action.poolId) {
+        await prepare("resume_pool_sync", { poolId: action.poolId });
+        return;
       }
+      if (action.kind === "delete_pool" && action.poolId) {
+        await prepare("delete_pool", { poolId: action.poolId });
+        return;
+      }
+      if (
+        isSelftestRecovery(action.kind) &&
+        action.accountId
+      ) {
+        await prepare(action.kind, { accountId: action.accountId });
+        return;
+      }
+      if (action.kind === "resume_monitor" && action.accountId) {
+        const next = await run(() =>
+          dispatch<Plan>("resume_monitor", { accountId: action.accountId }),
+        );
+        if (next) {
+          setPlanKind("resume_monitor");
+          setPlanDetails([
+            `账户：${state.accounts.find((a) => a.id === action.accountId)?.label || action.accountId}`,
+          ]);
+          setPlan(next);
+        }
+      }
+    } finally {
+      pendingPrepareRef.current = false;
     }
   }
   async function inspectPool(poolId: string) {
@@ -1694,12 +1710,23 @@ export default function App() {
                   有 {state.pendingActions.length} 项变更可继续处理
                 </strong>
                 <p>打开计划复核当前状态，再确认后续步骤。应用不会在后台自动重试。</p>
+                {state.pendingActions.some((action) => isSelftestRecovery(action.kind)) && (
+                  <p>检测密钥用于检查短链接，不是 Cloudflare API 令牌；待处理记录不代表账户连接失效，无需因此删除令牌。</p>
+                )}
                 {state.pendingActions.map((action, index) => (
                   <div
                     className="pending-action"
                     key={`${action.kind}:${action.poolId || action.accountId || index}`}
                   >
-                    <span>{action.label}</span>
+                    <div>
+                      {action.accountId && (
+                        <strong>账户：{state.accounts.find((account) => account.id === action.accountId)?.label || state.accounts.find((account) => account.id === action.accountId)?.cloudflareName || action.accountId}</strong>
+                      )}
+                      <div><span>{action.kind === "recover_selftest_resources" ? "找回本机检测配置" : action.label}</span></div>
+                      {action.kind === "recover_selftest_resources" && (
+                        <p>先只读核对云端，找回本机检测配置，已有密钥和待处理记录会保留。完成后，请另行确认恢复检测密钥。</p>
+                      )}
+                    </div>
                     <button
                       className="button secondary"
                       disabled={
@@ -1707,10 +1734,8 @@ export default function App() {
                         ((action.kind === "resume_pool_sync" ||
                           action.kind === "delete_pool") &&
                           !action.poolId) ||
-                        ((action.kind === "resume_monitor" ||
-                          action.kind === "resume_selftest_rotation" ||
-                          action.kind === "recover_selftest_rotation") &&
-                          !action.accountId)
+                        ((action.kind === "resume_monitor" || isSelftestRecovery(action.kind)) &&
+                          !state.accounts.some((account) => account.id === action.accountId))
                       }
                       onClick={() => void resumePending(action)}
                     >
@@ -1722,6 +1747,8 @@ export default function App() {
                             ? "继续修复"
                             : action.kind === "recover_selftest_rotation"
                               ? "查看修复计划"
+                            : action.kind === "recover_selftest_resources"
+                              ? "找回本机检测配置"
                           : "继续删除"}
                     </button>
                   </div>
@@ -1731,9 +1758,9 @@ export default function App() {
           {state.pendingOperations.length > 0 && (
             <details className="operation-log">
               <summary>
-                有 {state.pendingOperations.length} 条操作需要核对
+                查看待处理记录（{state.pendingOperations.length} 条）
               </summary>
-              <p>以下操作尚未确认完成。请先查看云端实际状态，避免重复提交。</p>
+              <p>{state.pendingActions?.length ? "以下为历史操作详情，请按上方对应账户的入口核对后续步骤。" : "以下记录尚未确认完成，请先核对对应账户和云端状态，避免重复提交。"}</p>
               <ul>
                 {state.pendingOperations.map((entry, i) => (
                   <li key={i}>{entry}</li>

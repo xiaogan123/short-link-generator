@@ -20,8 +20,8 @@ const demoState: State = {
     { domainId: 'demo-d1', slug: 'guide', cnUrl: 'https://example.org/zh', defaultUrl: 'https://example.org/en', updated: now() },
     { domainId: 'demo-d2', slug: 'news', cnUrl: 'https://example.com/news', defaultUrl: 'https://example.org/news', updated: now() },
   ],
-  pendingOperations: [],
-  pendingActions: [],
+  pendingOperations: new URLSearchParams(window.location.search).get('legacyRecovery') === '1' ? ['旧版检测密钥操作待确认'] : [],
+  pendingActions: new URLSearchParams(window.location.search).get('legacyRecovery') === '1' ? [{kind:'recover_selftest_resources',poolId:null,accountId:'demo-b',label:'找回检测服务配置'}] : [],
   pools: [],
 };
 let local: State = structuredClone(demoState);
@@ -101,7 +101,12 @@ function previewDispatch(action: Action, payload: Record<string, unknown>): unkn
       plan.credentialMigrationConfirmation = '系统可能需要你授权访问已保存的令牌或检测密钥；已有记录会保留，云端配置不变。';
       return plan;
     }
-    const titles: Record<string, string> = { save_link: '保存短链接', delete_link: '删除短链接', save_pool: '保存平台地址', resume_pool_sync:'继续同步平台地址', delete_pool: '删除平台地址', remove_domain: '移除域名', cleanup_account: '清理远端资源', recover_account: '恢复账户资源', rotate_selftest: '轮换检测密钥' };
+    if (kind === 'recover_selftest_resources') {
+      const account = local.accounts.find(a => a.id === payload.accountId);
+      if (!account || account.hasResources || !local.pendingActions.some(a => a.kind === kind && a.accountId === account.id)) throw new Error('当前账户无需找回检测配置，请重新核对状态。');
+      return makePlan('找回检测服务配置', ['只读核对云端唯一的检测服务及其归属', '登记本机检测配置，保留已有密钥与待处理记录', '完成后另行确认恢复检测密钥'], ['本地预览只模拟找回配置，不读取真实凭据或访问云服务。'], kind, {accountId:account.id});
+    }
+    const titles: Record<string, string> = { save_link: '保存短链接', delete_link: '删除短链接', save_pool: '保存平台地址', resume_pool_sync:'继续同步平台地址', delete_pool: '删除平台地址', remove_domain: '移除域名', cleanup_account: '清理远端资源', recover_account: '恢复账户资源', rotate_selftest: '轮换检测密钥', recover_selftest_rotation: '恢复检测密钥', resume_selftest_rotation: '继续恢复检测密钥' };
     if (kind === 'delete_pool' && local.links.some(l => l.poolId === payload.poolId)) throw new Error('平台地址仍有链接引用，无法删除。');
     return makePlan(titles[kind] || '确认变更', [`核对当前状态与资源归属`, `${titles[kind] || kind}并记录结果`], kind === 'delete_link' || kind === 'remove_domain' || kind === 'cleanup_account' ? ['该操作会修改远端资源。请确认影响范围。'] : [], kind, payload);
   }
@@ -113,6 +118,12 @@ function previewDispatch(action: Action, payload: Record<string, unknown>): unkn
     if (item.action === 'migrate_credentials' && payload.acknowledgeCredentialMigration !== true) throw new Error('请先确认更新本机授权。');
     plans.delete(item.plan.id);
     if (item.action === 'migrate_credentials') local.accounts = local.accounts.map(a => a.id === p.accountId ? {...a, needsCredentialMigration:false} : a);
+    if (item.action === 'recover_selftest_resources') {
+      const account = local.accounts.find(a => a.id === p.accountId);
+      if (!account || account.hasResources || !local.pendingActions.some(a => a.kind === item.action && a.accountId === account.id)) throw new Error('计划已失效，请重新核对状态。');
+      local.accounts = local.accounts.map(a => a.id === account.id ? {...a,hasResources:true} : a);
+      local.pendingActions = local.pendingActions.map(a => a.kind === item.action && a.accountId === account.id ? {...a,kind:'recover_selftest_rotation',label:'恢复旧版自检密钥操作'} : a);
+    }
     if (item.action === 'add_domain') local.domains.push({ id: uid(), host: String(p.host), prefix: String(p.prefix), accountId: String(p.accountId), zoneId: String(p.zoneId), routeId: `demo-route-${uid()}` });
     if (item.action === 'save_link') {
       const pool = (local.pools || []).find(pool => pool.id === p.poolId);

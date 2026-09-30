@@ -216,6 +216,70 @@ pub struct Database {
     pub pending_operations: Vec<String>,
 }
 
+impl Database {
+    pub(crate) fn has_legacy_selftest_rotation(&self, account_id: &str) -> bool {
+        !self
+            .pending_selftest_rotations
+            .iter()
+            .any(|p| p.account_id == account_id)
+            && self
+                .pending_operations
+                .iter()
+                .any(|entry| entry.starts_with(&format!("重置自检密钥 {account_id} (")))
+    }
+
+    /// This exception only repairs missing local resource identity. Unknown or
+    /// overlapping unfinished work must remain blocked, never silently cleared.
+    pub(crate) fn can_recover_selftest_resources(&self, account_id: &str) -> bool {
+        let pool_mentions = |p: &PendingPoolChange| {
+            p.pool.account_ids.iter().any(|id| id == account_id)
+                || p.previous
+                    .as_ref()
+                    .is_some_and(|old| old.account_ids.iter().any(|id| id == account_id))
+        };
+        if !self
+            .accounts
+            .iter()
+            .any(|a| a.id == account_id && a.resources.is_none())
+            || !self.has_legacy_selftest_rotation(account_id)
+            || self
+                .pending_monitor_changes
+                .iter()
+                .any(|p| p.account_id == account_id)
+            || self.pending_pool_changes.iter().any(pool_mentions)
+        {
+            return false;
+        }
+        let matches_journal = |entry: &str, journal: &str| {
+            !journal.is_empty()
+                && (entry == journal
+                    || entry
+                        .strip_prefix(journal)
+                        .is_some_and(|rest| rest.starts_with('：')))
+        };
+        self.pending_operations.iter().all(|entry| {
+            entry.starts_with(&format!("重置自检密钥 {account_id} ("))
+                || self.accounts.iter().any(|a| {
+                    a.id != account_id
+                        && self.has_legacy_selftest_rotation(&a.id)
+                        && entry.starts_with(&format!("重置自检密钥 {} (", a.id))
+                })
+                || self
+                    .pending_selftest_rotations
+                    .iter()
+                    .any(|p| p.account_id != account_id && matches_journal(entry, &p.journal))
+                || self
+                    .pending_monitor_changes
+                    .iter()
+                    .any(|p| p.account_id != account_id && matches_journal(entry, &p.journal))
+                || self
+                    .pending_pool_changes
+                    .iter()
+                    .any(|p| !pool_mentions(p) && matches_journal(entry, &p.journal))
+        })
+    }
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct State {
@@ -238,26 +302,7 @@ pub struct PendingAction {
 
 impl From<&Database> for State {
     fn from(db: &Database) -> Self {
-        let has_legacy_rotation = |account_id: &str| {
-            if db
-                .pending_selftest_rotations
-                .iter()
-                .any(|pending| pending.account_id == account_id)
-            {
-                return false;
-            }
-            let prefix = format!("重置自检密钥 {account_id} (");
-            db.pending_operations.iter().any(|entry| {
-                entry.starts_with(&prefix)
-                    && !db.pending_selftest_rotations.iter().any(|pending| {
-                        pending.account_id == account_id
-                            && (entry == &pending.journal
-                                || entry
-                                    .strip_prefix(&pending.journal)
-                                    .is_some_and(|rest| rest.starts_with('：')))
-                    })
-            })
-        };
+        let has_legacy_rotation = |account_id: &str| db.has_legacy_selftest_rotation(account_id);
         Self {
             accounts: db
                 .accounts
@@ -348,10 +393,20 @@ impl From<&Database> for State {
                         .iter()
                         .filter(|account| has_legacy_rotation(&account.id))
                         .map(|account| PendingAction {
-                            kind: "recover_selftest_rotation".into(),
+                            kind: if db.can_recover_selftest_resources(&account.id) {
+                                "recover_selftest_resources"
+                            } else {
+                                "recover_selftest_rotation"
+                            }
+                            .into(),
                             pool_id: None,
                             account_id: Some(account.id.clone()),
-                            label: "恢复旧版自检密钥操作".into(),
+                            label: if db.can_recover_selftest_resources(&account.id) {
+                                "找回检测服务配置"
+                            } else {
+                                "恢复旧版自检密钥操作"
+                            }
+                            .into(),
                         }),
                 )
                 .collect(),
@@ -459,6 +514,9 @@ pub enum PlanKind {
         account_id: String,
     },
     RecoverSelftestRotation {
+        account_id: String,
+    },
+    RecoverSelftestResources {
         account_id: String,
     },
 }

@@ -10,6 +10,8 @@ mod mac_credentials;
 mod model;
 mod pools;
 mod secret_store;
+#[cfg(test)]
+mod selftest_resource_recovery_tests;
 
 use chrono::Utc;
 use cloud::{Cloud, CloudError};
@@ -803,6 +805,7 @@ impl Backend {
             | PlanKind::RecoverAccount { account_id }
             | PlanKind::RotateSelftest { account_id }
             | PlanKind::ResumeSelftestRotation { account_id }
+            | PlanKind::RecoverSelftestResources { account_id }
             | PlanKind::RecoverSelftestRotation { account_id } => vec![account_id.clone()],
             PlanKind::SaveLink { domain_id, .. }
             | PlanKind::DeleteLink { domain_id, .. }
@@ -946,21 +949,7 @@ impl Backend {
     }
 
     fn has_legacy_selftest_rotation(&self, account_id: &str) -> bool {
-        if self
-            .db
-            .pending_selftest_rotations
-            .iter()
-            .any(|pending| pending.account_id == account_id)
-        {
-            return false;
-        }
-        let prefix = selftest_rotation_prefix(account_id);
-        self.db.pending_operations.iter().any(|entry| {
-            entry.starts_with(&prefix)
-                && !self.db.pending_selftest_rotations.iter().any(|pending| {
-                    pending.account_id == account_id && journal_matches(entry, &pending.journal)
-                })
-        })
+        self.db.has_legacy_selftest_rotation(account_id)
     }
 
     fn has_selftest_rotation(&self, account_id: &str) -> bool {
@@ -2257,10 +2246,23 @@ impl Backend {
                     PlanKind::ResumeSelftestRotation { account_id: id },
                 )
             }
+            "recover_selftest_resources" => {
+                let id = field(payload, "accountId")?.to_owned();
+                self.require_selftest_resource_recovery(&id)?;
+                (
+                    "找回检测服务配置",
+                    vec![
+                        "只读检查并验证属于此账户的唯一 Worker 和 KV 资源组合".into(),
+                        "仅在本机登记已验证的资源定位，保留原有日志和密钥".into(),
+                    ],
+                    vec!["本次不会更换检测密钥；后续密钥恢复仍需单独查看并确认计划".into()],
+                    PlanKind::RecoverSelftestResources { account_id: id },
+                )
+            }
             "recover_selftest_rotation" => {
                 let id = field(payload, "accountId")?.to_owned();
                 let account = self.account(&id)?;
-                let resources = account.resources.as_ref().ok_or("账号没有 Worker")?;
+                let resources = account.resources.as_ref().ok_or("本机缺少检测服务配置，请先使用“找回检测服务配置”；若入口不可用，请先核对其他待处理操作")?;
                 let missing_staging = self
                     .db
                     .pending_selftest_rotations
@@ -3345,6 +3347,9 @@ impl Backend {
             }
             PlanKind::RecoverSelftestRotation { account_id } => {
                 self.apply_legacy_selftest_recovery(&account_id).await
+            }
+            PlanKind::RecoverSelftestResources { account_id } => {
+                self.recover_selftest_resources(&account_id).await
             }
         }
     }
@@ -5309,20 +5314,15 @@ impl Backend {
         Ok(())
     }
 
-    async fn recover_account(&mut self, account_id: &str) -> Result<(), String> {
-        self.require_credentials(account_id)?;
-        if !self.db.pending_monitor_changes.is_empty()
-            || !self.db.pending_pool_changes.is_empty()
-            || self.has_selftest_rotation(account_id)
-        {
-            return Err("请先恢复未完成的云端操作再找回账号".into());
-        }
-        let token = keyring_get(account_id, "token")?;
-        self.account(account_id)?;
+    async fn discover_owned_resources(
+        &self,
+        account_id: &str,
+        token: &str,
+    ) -> Result<Resources, String> {
         let namespaces = self
             .cloud
             .list_pages(
-                &token,
+                token,
                 &format!("accounts/{account_id}/storage/kv/namespaces"),
             )
             .await
@@ -5337,7 +5337,7 @@ impl Backend {
             }
             let Some(raw) = self
                 .cloud
-                .read_value(&token, account_id, id, MANIFEST_KEY)
+                .read_value(token, account_id, id, MANIFEST_KEY)
                 .await
                 .map_err(problem)?
             else {
@@ -5356,34 +5356,65 @@ impl Backend {
             {
                 continue;
             }
-            let settings = self
-                .cloud
-                .script_settings(&token, account_id, script)
-                .await
-                .map_err(problem)?;
-            let verified = settings["result"]["bindings"].as_array().is_some_and(|bs| {
-                bs.iter().any(|b| {
-                    b["type"] == "kv_namespace" && b["name"] == "LINKS" && b["namespace_id"] == id
-                })
-            });
-            if verified {
-                let resources = Resources {
-                    script: script.into(),
-                    namespace: id.into(),
-                };
-                if self
-                    .verify_resource_source(&token, account_id, &resources)
-                    .await
-                    .is_ok()
-                {
-                    matches.push(resources);
-                }
-            }
+            let resources = Resources {
+                script: script.into(),
+                namespace: id.into(),
+            };
+            // A matching ownership manifest is a candidate, not permission to
+            // ignore an unreadable or altered Worker and choose another one.
+            self.verify_resource_source(token, account_id, &resources)
+                .await?;
+            matches.push(resources);
         }
         if matches.len() != 1 {
             return Err("未找到唯一且已验证的 Worker/KV 资源组合".into());
         }
         let resources = matches.remove(0);
+        Ok(resources)
+    }
+
+    fn require_selftest_resource_recovery(&self, account_id: &str) -> Result<(), String> {
+        self.require_credentials(account_id)?;
+        if !self.db.can_recover_selftest_resources(account_id) {
+            return Err(
+                "仅能为缺少本机检测配置的旧版恢复记录找回资源；请先核对该账户其他待处理操作".into(),
+            );
+        }
+        Ok(())
+    }
+
+    async fn recover_selftest_resources(&mut self, account_id: &str) -> Result<(), String> {
+        self.require_selftest_resource_recovery(account_id)?;
+        let token = read_account_token(account_id).await?;
+        let resources = self.discover_owned_resources(account_id, &token).await?;
+        self.require_selftest_resource_recovery(account_id)?;
+        let index = self
+            .db
+            .accounts
+            .iter()
+            .position(|a| a.id == account_id)
+            .ok_or("找不到此账号")?;
+        let previous = self.db.accounts[index].clone();
+        self.db.accounts[index].resources = Some(resources);
+        self.db.accounts[index].has_resources = true;
+        if let Err(error) = self.persist() {
+            self.db.accounts[index] = previous;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    async fn recover_account(&mut self, account_id: &str) -> Result<(), String> {
+        self.require_credentials(account_id)?;
+        if !self.db.pending_monitor_changes.is_empty()
+            || !self.db.pending_pool_changes.is_empty()
+            || self.has_selftest_rotation(account_id)
+        {
+            return Err("请先恢复未完成的云端操作再找回账号".into());
+        }
+        let token = keyring_get(account_id, "token")?;
+        self.account(account_id)?;
+        let resources = self.discover_owned_resources(account_id, &token).await?;
         // Cached zones are only UI hints. Recovery replaces this account's
         // domain/link records, so discovery must use the current visible zones.
         let fresh_zones = self.fetch_zones(&token, account_id).await?;
@@ -9241,7 +9272,7 @@ mod tests {
                 .iter()
                 .filter(|action| action.kind == "recover_selftest_rotation")
                 .count(),
-            2
+            1
         );
         mount_resource(&server, include_str!("../../edge/worker.mjs")).await;
         mount_selftest_rotation(&server, 200).await;
