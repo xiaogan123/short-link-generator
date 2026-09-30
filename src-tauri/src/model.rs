@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 pub struct Account {
     pub id: String,
     pub label: String,
+    #[serde(default)]
+    pub mac_credential_schema: u8,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cloudflare_name: Option<String>,
     pub zone_count: usize,
@@ -28,6 +30,7 @@ pub struct Account {
 pub struct AccountView {
     pub id: String,
     pub label: String,
+    pub needs_credential_migration: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cloudflare_name: Option<String>,
     pub zone_count: usize,
@@ -45,6 +48,7 @@ impl From<&Account> for AccountView {
         Self {
             id: a.id.clone(),
             label: a.label.clone(),
+            needs_credential_migration: cfg!(target_os = "macos") && a.mac_credential_schema != 2,
             cloudflare_name: a.cloudflare_name.clone(),
             zone_count: a.zone_count,
             checked_at: a.checked_at.clone(),
@@ -365,6 +369,8 @@ pub struct PlanView {
     pub expires_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub domain_takeover_confirmation: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credential_migration_confirmation: Option<String>,
 }
 
 #[derive(Clone, Serialize)]
@@ -394,6 +400,9 @@ pub struct DomainCheck {
 
 #[derive(Clone)]
 pub enum PlanKind {
+    MigrateCredentials {
+        account_id: String,
+    },
     Domain {
         account_id: String,
         zone_id: String,
@@ -520,9 +529,12 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(account.cloudflare_name, None);
+        assert_eq!(account.mac_credential_schema, 0);
         assert_eq!(account.label, "自定义备注");
         let value = serde_json::to_value(AccountView::from(&account)).unwrap();
         assert!(value.get("cloudflareName").is_none());
+        assert_eq!(value["needsCredentialMigration"], cfg!(target_os = "macos"));
+        assert!(value.get("macCredentialSchema").is_none());
         assert_eq!(value["zones"][0]["id"], "zone-example");
         assert_eq!(value["zones"][0]["name"], "example.com");
         assert_eq!(value["zones"][0]["status"], "active");

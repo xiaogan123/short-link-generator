@@ -18,7 +18,11 @@ use std::{sync::OnceLock, time::Instant};
 use zeroize::Zeroizing;
 
 #[cfg(not(test))]
-const KEYRING_SERVICE: &str = "org.shortlink.generator";
+const KEYRING_SERVICE: &str = if cfg!(target_os = "macos") {
+    "org.shortlink.generator.credentials.v2"
+} else {
+    "org.shortlink.generator"
+};
 #[cfg(not(test))]
 const CACHE_IDLE_TTL: Duration = Duration::from_secs(30 * 60);
 #[cfg(not(test))]
@@ -33,6 +37,15 @@ pub(crate) enum SecretError {
     AccessDenied,
     Unavailable,
     Other,
+    MigrationRequired,
+    #[cfg(any(target_os = "macos", test))]
+    LegacyTokenMissing,
+    #[cfg(any(target_os = "macos", test))]
+    Conflict,
+    #[cfg(any(target_os = "macos", test))]
+    ReadbackMismatch,
+    #[cfg(any(target_os = "macos", test))]
+    DeletionNotConfirmed,
 }
 
 impl fmt::Display for SecretError {
@@ -42,6 +55,17 @@ impl fmt::Display for SecretError {
             Self::AccessDenied => "未能访问系统凭据库，请在系统提示中允许访问",
             Self::Unavailable => "系统凭据库暂时不可用",
             Self::Other => "系统凭据库操作失败",
+            Self::MigrationRequired => {
+                "此账户需要更新本机授权，请在账户页面点击“更新本机授权”后重试"
+            }
+            #[cfg(any(target_os = "macos", test))]
+            Self::LegacyTokenMissing => "旧访问令牌缺失，请先更新此账户的令牌，再继续更新本机授权",
+            #[cfg(any(target_os = "macos", test))]
+            Self::Conflict => "本机凭据在更新期间发生冲突，未覆盖任何已有值；请重新核对并确认",
+            #[cfg(any(target_os = "macos", test))]
+            Self::ReadbackMismatch => "新本机凭据读回不一致，未完成授权更新；旧凭据已保留",
+            #[cfg(any(target_os = "macos", test))]
+            Self::DeletionNotConfirmed => "无法确认本机凭据已删除，账户记录已保留，请稍后重试",
         })
     }
 }
@@ -525,16 +549,19 @@ fn store() -> &'static SecretStore<KeyringBackend, SystemClock> {
 
 #[cfg(not(test))]
 pub(crate) fn get(id: &str, kind: &str) -> Result<String, SecretError> {
+    require_current_route(id, kind)?;
     store().get(id, kind)
 }
 
 #[cfg(not(test))]
 pub(crate) fn set(id: &str, kind: &str, value: &str) -> Result<(), SecretError> {
+    require_current_route(id, kind)?;
     store().set(id, kind, value)
 }
 
 #[cfg(not(test))]
 pub(crate) fn delete(id: &str, kind: &str) -> Result<(), SecretError> {
+    require_current_route(id, kind)?;
     store().delete(id, kind)
 }
 
@@ -550,9 +577,125 @@ pub(crate) fn purge_expired() {
     store().purge_expired();
 }
 
+#[cfg(all(not(test), target_os = "macos"))]
+fn routes() -> &'static Mutex<HashMap<String, u8>> {
+    static ROUTES: OnceLock<Mutex<HashMap<String, u8>>> = OnceLock::new();
+    ROUTES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[cfg(not(test))]
+fn require_current_route(id: &str, kind: &str) -> Result<(), SecretError> {
+    #[cfg(target_os = "macos")]
+    {
+        validate_current_route(lock(routes()).get(id).copied(), kind)?;
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = (id, kind);
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn validate_current_route(schema: Option<u8>, kind: &str) -> Result<(), SecretError> {
+    if !crate::credential_migration::KINDS.contains(&kind) {
+        return Err(SecretError::Other);
+    }
+    if schema != Some(2) {
+        return Err(SecretError::MigrationRequired);
+    }
+    Ok(())
+}
+
+/// Publish only after Database loading or successful persistent state commit.
+#[cfg(all(not(test), target_os = "macos"))]
+pub(crate) fn register_routes(accounts: &[crate::model::Account]) {
+    let mut routes = lock(routes());
+    store().clear_all();
+    *routes = accounts
+        .iter()
+        .map(|a| (a.id.clone(), a.mac_credential_schema))
+        .collect();
+}
+
+/// The token is supplied by the user and already validated for this account.
+/// This limited entry point never reads the legacy namespace or activates a route.
+#[cfg(not(test))]
+pub(crate) fn set_explicit_token(id: &str, value: &str, replace: bool) -> Result<(), SecretError> {
+    #[cfg(target_os = "macos")]
+    {
+        use crate::credential_migration::MigrationBackend;
+        let backend = crate::mac_credentials::NativeMigration;
+        // Invalidate before native work, including every failure/readback path.
+        store().clear_all();
+        let created = if replace {
+            KeyringBackend.set(id, "token", value)?;
+            None
+        } else {
+            Some(backend.create(id, "token", value)?)
+        };
+        let actual = backend.current(id, "token")?;
+        if actual.as_str() != value {
+            return Err(
+                if matches!(
+                    created,
+                    Some(crate::credential_migration::Created::AlreadyExists)
+                ) {
+                    SecretError::Conflict
+                } else {
+                    SecretError::ReadbackMismatch
+                },
+            );
+        }
+        store().clear_all();
+        Ok(())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = replace;
+        store().set(id, "token", value)
+    }
+}
+
+/// Explicit account removal may also clean a partially migrated account.
+/// Legacy items remain untouched and this must be stated in the confirmation UI.
+#[cfg(all(not(test), target_os = "macos"))]
+pub(crate) fn remove_current_account(id: &str) -> Result<(), SecretError> {
+    use crate::credential_migration::MigrationBackend;
+    store().clear_all();
+    crate::credential_migration::remove_current_verified(
+        |kind| KeyringBackend.delete(id, kind),
+        |kind| crate::mac_credentials::NativeMigration.current(id, kind),
+    )
+}
+
+#[cfg(all(not(test), target_os = "macos"))]
+pub(crate) fn migrate_account(id: &str) -> Result<(), SecretError> {
+    store().clear_all();
+    let result = crate::credential_migration::migrate(&crate::mac_credentials::NativeMigration, id);
+    store().clear_all();
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn current_route_requires_known_committed_schema_and_kind() {
+        for schema in [None, Some(0), Some(1), Some(3), Some(255)] {
+            for kind in crate::credential_migration::KINDS {
+                assert!(matches!(
+                    validate_current_route(schema, kind),
+                    Err(SecretError::MigrationRequired)
+                ));
+            }
+        }
+        for kind in crate::credential_migration::KINDS {
+            assert!(validate_current_route(Some(2), kind).is_ok());
+        }
+        assert!(matches!(
+            validate_current_route(Some(2), "unknown"),
+            Err(SecretError::Other)
+        ));
+    }
     use std::{
         sync::{
             atomic::{AtomicU64, AtomicUsize, Ordering},

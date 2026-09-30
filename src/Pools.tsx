@@ -1,4 +1,4 @@
-import {useEffect,useRef,useState,type FormEvent} from 'react';
+import {useEffect,useRef,useState,type FormEvent,type ReactNode} from 'react';
 import {Plus,Stack,WarningCircle} from '@phosphor-icons/react';
 import Dialog from './Dialog';
 import type {Account,Pool,PoolCandidate,PoolHealth} from './types';
@@ -21,7 +21,7 @@ function AddressPaste({label,onApply}:{label:string;onApply:(parts:InvitationPar
  function parse(){try{setParts(splitInvitationLink(full));setMessage('');}catch(error){setParts(null);setMessage(error instanceof Error?error.message:'无法识别链接。');}}
  return <div className="address-paste"><label>{label}的完整邀请链接<input aria-label={`${label} 完整邀请链接`} type="text" inputMode="url" value={full} onChange={event=>{setFull(event.target.value);setParts(null);setMessage('');}} placeholder="https://example.com/join/CODE"/></label><button type="button" className="button ghost" onClick={parse}>识别</button>{message&&<p className="inline-warning" role="alert">{message}</p>}{parts&&<div className="address-paste-result"><span>邀请码：<strong>{parts.code}</strong></span><button type="button" className="button secondary" onClick={()=>{onApply(parts);setMessage('已去掉邀请码并填入链接地址，请核对后保存。');}}>填入链接地址</button></div>}</div>;
 }
-export default function Pools({pools,accounts,linkCount,onSave,onDelete,busy,health,onCheckHealth,planOpen,savedRevision,serverError="",onDraftChange}:{pools:Pool[];accounts:Account[];linkCount:(id:string)=>number;onSave:(pool:Pool,shouldAccept?:()=>boolean)=>Promise<boolean>;onDelete:(id:string)=>void;busy:boolean;health:Record<string,PoolHealth>;onCheckHealth:(id:string)=>void;planOpen:boolean;savedRevision:number;serverError?:string;onDraftChange?:()=>void}){
+export default function Pools({pools,accounts,linkCount,onSave,onDelete,busy,health,onCheckHealth,planOpen,savedRevision,serverError="",onDraftChange,errorAction,dismissDisabled=false}:{pools:Pool[];accounts:Account[];linkCount:(id:string)=>number;onSave:(pool:Pool,shouldAccept?:()=>boolean)=>Promise<boolean>;onDelete:(id:string)=>void;busy:boolean;health:Record<string,PoolHealth>;onCheckHealth:(id:string)=>void;planOpen:boolean;savedRevision:number;serverError?:string;onDraftChange?:()=>void;errorAction?:ReactNode;dismissDisabled?:boolean}){
  const [draft,setDraft]=useState<Pool|null>(null);const [error,setError]=useState('');
  const [clock,setClock]=useState(Date.now());
  const draftGeneration=useRef(0);
@@ -49,7 +49,7 @@ export default function Pools({pools,accounts,linkCount,onSave,onDelete,busy,hea
    </article>)}</div>}
   </section>
   <p className="page-footnote"><WarningCircle size={16}/>未配置检测服务时，备用地址状态为未知。状态过期或检测失败也不会被显示为可用；全部备用地址明确失败时，短链接会暂时不可用。</p>
-  {draft&&!planOpen&&<Dialog title={draft.id?'编辑平台地址':'添加平台地址'} wide error={error||serverError} onClose={()=>replaceDraft(null)} footer={<><button className="button ghost" onClick={()=>replaceDraft(null)}>取消</button><button className="button primary" form="pool-form" type="submit" disabled={busy}>下一步，核对内容</button></>}>
+  {draft&&!planOpen&&<Dialog title={draft.id?'编辑平台地址':'添加平台地址'} wide error={error||serverError} errorAction={errorAction} dismissDisabled={dismissDisabled} onClose={()=>{if(!dismissDisabled)replaceDraft(null);}} footer={<><button className="button ghost" disabled={dismissDisabled} onClick={()=>replaceDraft(null)}>取消</button><button className="button primary" form="pool-form" type="submit" disabled={busy}>下一步，核对内容</button></>}>
    <form id="pool-form" className="form-grid" onSubmit={event=>void save(event)}>
     <label>名称<input value={draft.name} onChange={event=>replaceDraft({...draft,name:event.target.value})} placeholder="例如：常用平台 A" maxLength={60} required/><small>仅用于本机区分，不影响链接地址。</small></label>
     <div className="template-card"><div className="template-heading"><h3>官网链接（中国大陆以外访客使用）</h3><span>必填</span></div><AddressPaste label="官网链接" onApply={parts=>applySplit('official',parts)}/><label>链接地址（不含邀请码）<input value={draft.official.prefix} onChange={event=>replaceDraft({...draft,official:{...draft.official,prefix:event.target.value}})} placeholder="https://example.com/join/" required/></label><details className="advanced"><summary>高级设置：额外参数</summary><label>额外参数（可选）<input value={draft.official.suffix} onChange={event=>replaceDraft({...draft,official:{...draft.official,suffix:event.target.value}})} placeholder="例如 ?lang=zh"/></label></details></div>

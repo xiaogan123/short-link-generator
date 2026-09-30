@@ -1,6 +1,12 @@
 mod cloud;
+#[cfg(any(target_os = "macos", test))]
+mod credential_migration;
+#[cfg(all(test, target_os = "macos"))]
+mod credential_migration_tests;
 mod domain_check;
 mod local_check;
+#[cfg(target_os = "macos")]
+mod mac_credentials;
 mod model;
 mod pools;
 mod secret_store;
@@ -46,7 +52,20 @@ async fn lock_backend<'a>(
 ) -> Result<tokio::sync::MutexGuard<'a, Backend>, String> {
     if matches!(
         action,
-        "refresh_domains" | "refresh_accounts" | "prepare_domain" | "prepare_domain_dns"
+        "refresh_domains"
+            | "refresh_accounts"
+            | "prepare_domain"
+            | "prepare_domain_dns"
+            | "prepare_change"
+            | "apply_plan"
+            | "check_pool_health"
+            | "selftest_link"
+            | "prepare_monitor"
+            | "disable_monitor"
+            | "resume_monitor"
+            | "import_token"
+            | "remove_account"
+            | "import_config"
     ) {
         state.0.try_lock().map_err(|_| {
             "上一个操作仍在进行，请稍候；若有系统授权窗口，请先完成或取消，无需重复点击".to_string()
@@ -62,6 +81,8 @@ struct Backend {
     plans: Vec<Plan>,
     cloud: Cloud,
     app: Option<tauri::AppHandle>,
+    #[cfg(target_os = "macos")]
+    _credential_lease: Option<mac_credentials::ConfigurationLease>,
     #[cfg(test)]
     persist_count: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
@@ -141,6 +162,10 @@ fn keyring_get(id: &str, kind: &str) -> Result<String, String> {
 fn keyring_set(id: &str, kind: &str, value: &str) -> Result<(), String> {
     #[cfg(test)]
     {
+        mock_key_mutations()
+            .lock()
+            .unwrap()
+            .push(format!("set:{kind}:{id}"));
         if mock_key_set_failures()
             .lock()
             .expect("test key set failures")
@@ -162,6 +187,24 @@ fn keyring_set(id: &str, kind: &str, value: &str) -> Result<(), String> {
 fn keyring_delete(id: &str, kind: &str) -> Result<(), String> {
     #[cfg(test)]
     {
+        mock_key_mutations()
+            .lock()
+            .unwrap()
+            .push(format!("delete:{kind}:{id}"));
+        if mock_key_set_failures()
+            .lock()
+            .unwrap()
+            .contains(&format!("delete:{kind}:{id}"))
+        {
+            return Err("测试注入：系统凭据删除失败".into());
+        }
+        if mock_key_set_failures()
+            .lock()
+            .unwrap()
+            .contains(&format!("swallow-delete:{kind}:{id}"))
+        {
+            return Ok(());
+        }
         mock_keys()
             .lock()
             .expect("test key store")
@@ -176,6 +219,10 @@ fn keyring_delete(id: &str, kind: &str) -> Result<(), String> {
 fn keyring_get_optional(id: &str, kind: &str) -> Result<Option<String>, String> {
     #[cfg(test)]
     {
+        mock_key_reads()
+            .lock()
+            .expect("test reads")
+            .push(format!("optional:{kind}:{id}"));
         Ok(mock_keys()
             .lock()
             .expect("test key store")
@@ -189,6 +236,141 @@ fn keyring_get_optional(id: &str, kind: &str) -> Result<Option<String>, String> 
             Err(secret_store::SecretError::Missing) => Ok(None),
             Err(error) => Err(error.to_string()),
         }
+    }
+}
+
+async fn write_explicit_token(id: &str, value: &str, replace: bool) -> Result<(), String> {
+    let id = id.to_owned();
+    let value = Zeroizing::new(value.to_owned());
+    tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        {
+            if !replace {
+                if let Some(existing) = mock_keys()
+                    .lock()
+                    .expect("keys")
+                    .get(&format!("token:{id}"))
+                {
+                    return if existing == value.as_str() {
+                        Ok(())
+                    } else {
+                        Err("本机凭据冲突，未覆盖".into())
+                    };
+                }
+            }
+            keyring_set(&id, "token", &value)?;
+            if keyring_get(&id, "token")? != value.as_str() {
+                return Err("本机凭据读回不一致".into());
+            }
+            Ok(())
+        }
+        #[cfg(not(test))]
+        {
+            secret_store::set_explicit_token(&id, &value, replace)
+                .map_err(|error| error.to_string())
+        }
+    })
+    .await
+    .map_err(|_| "本机凭据保存任务未完成".to_string())?
+}
+
+async fn remove_current_credentials(id: &str) -> Result<(), String> {
+    let id = id.to_owned();
+    tokio::task::spawn_blocking(move || {
+        #[cfg(all(target_os = "macos", not(test)))]
+        {
+            secret_store::remove_current_account(&id).map_err(|error| error.to_string())
+        }
+        #[cfg(all(target_os = "macos", test))]
+        {
+            use credential_migration::MigrationBackend;
+            credential_migration::remove_current_verified(
+                |kind| {
+                    keyring_delete(&id, kind).map_err(|_| secret_store::SecretError::Unavailable)
+                },
+                |kind| MockMigration.current(&id, kind),
+            )
+            .map_err(|error| error.to_string())
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            keyring_delete(&id, "token")?;
+            keyring_delete(&id, "selftest")?;
+            let _ = keyring_delete(&id, "probe");
+            Ok(())
+        }
+    })
+    .await
+    .map_err(|_| "本机凭据移除任务未完成".to_string())?
+}
+
+#[cfg(test)]
+fn mock_legacy_keys() -> &'static std::sync::Mutex<std::collections::HashMap<String, String>> {
+    static KEYS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, String>>> =
+        std::sync::OnceLock::new();
+    KEYS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+#[cfg(test)]
+fn mock_key_mutations() -> &'static std::sync::Mutex<Vec<String>> {
+    static CALLS: std::sync::OnceLock<std::sync::Mutex<Vec<String>>> = std::sync::OnceLock::new();
+    CALLS.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+#[cfg(all(test, target_os = "macos"))]
+struct MockMigration;
+#[cfg(all(test, target_os = "macos"))]
+impl credential_migration::MigrationBackend for MockMigration {
+    fn current(
+        &self,
+        id: &str,
+        kind: &str,
+    ) -> Result<Zeroizing<String>, secret_store::SecretError> {
+        mock_key_reads()
+            .lock()
+            .unwrap()
+            .push(format!("current:{kind}:{id}"));
+        mock_keys()
+            .lock()
+            .unwrap()
+            .get(&format!("{kind}:{id}"))
+            .cloned()
+            .map(Zeroizing::new)
+            .ok_or(secret_store::SecretError::Missing)
+    }
+    fn legacy(&self, id: &str, kind: &str) -> Result<Zeroizing<String>, secret_store::SecretError> {
+        mock_key_reads()
+            .lock()
+            .unwrap()
+            .push(format!("legacy:{kind}:{id}"));
+        mock_legacy_keys()
+            .lock()
+            .unwrap()
+            .get(&format!("{kind}:{id}"))
+            .cloned()
+            .map(Zeroizing::new)
+            .ok_or(secret_store::SecretError::Missing)
+    }
+    fn create(
+        &self,
+        id: &str,
+        kind: &str,
+        value: &str,
+    ) -> Result<credential_migration::Created, secret_store::SecretError> {
+        mock_key_mutations()
+            .lock()
+            .unwrap()
+            .push(format!("create:{kind}:{id}"));
+        let key = format!("{kind}:{id}");
+        if mock_key_set_failures().lock().unwrap().contains(&key) {
+            return Err(secret_store::SecretError::Unavailable);
+        }
+        let mut keys = mock_keys().lock().unwrap();
+        if keys.contains_key(&key) {
+            return Ok(credential_migration::Created::AlreadyExists);
+        }
+        keys.insert(key, value.to_owned());
+        Ok(credential_migration::Created::New)
     }
 }
 
@@ -512,13 +694,28 @@ fn route_conflict(pattern: &str, host: &str, prefix: &str) -> bool {
 
 impl Backend {
     fn load(path: PathBuf, app: tauri::AppHandle) -> Result<Self, String> {
-        let db = if path.exists() {
+        #[cfg(target_os = "macos")]
+        let lease =
+            mac_credentials::ConfigurationLease::acquire(path.parent().ok_or("配置目录无效")?)?;
+        let db: Database = if path.exists() {
             let bytes = fs::read(&path).map_err(|_| "无法读取本机配置".to_string())?;
             serde_json::from_slice(&bytes).map_err(|_| "本机配置格式无效".to_string())?
         } else {
             Database::default()
         };
+        #[cfg(target_os = "macos")]
+        if db
+            .accounts
+            .iter()
+            .any(|a| !matches!(a.mac_credential_schema, 0 | 2))
+        {
+            return Err("本机凭据格式版本不受支持".into());
+        }
+        #[cfg(all(not(test), target_os = "macos"))]
+        secret_store::register_routes(&db.accounts);
         Ok(Self {
+            #[cfg(target_os = "macos")]
+            _credential_lease: Some(lease),
             db,
             path,
             plans: Vec::new(),
@@ -571,6 +768,103 @@ impl Backend {
             .find(|a| a.id == id)
             .ok_or_else(|| "找不到此账号".into())
     }
+    fn publish_credential_routes(&self) {
+        #[cfg(all(not(test), target_os = "macos"))]
+        secret_store::register_routes(&self.db.accounts);
+    }
+
+    fn require_credentials(&self, id: &str) -> Result<(), String> {
+        let account = self.account(id)?;
+        if cfg!(target_os = "macos") && account.mac_credential_schema != 2 {
+            return Err(secret_store::SecretError::MigrationRequired.to_string());
+        }
+        Ok(())
+    }
+    fn require_many_credentials<'a>(
+        &self,
+        ids: impl IntoIterator<Item = &'a str>,
+    ) -> Result<(), String> {
+        for id in ids {
+            self.require_credentials(id)?;
+        }
+        Ok(())
+    }
+    fn require_plan_credentials(&self, kind: &PlanKind) -> Result<(), String> {
+        if !cfg!(target_os = "macos") {
+            return Ok(());
+        }
+        let ids: Vec<String> = match kind {
+            PlanKind::MigrateCredentials { .. } => return Ok(()),
+            PlanKind::Domain { account_id, .. }
+            | PlanKind::DomainDns { account_id, .. }
+            | PlanKind::EnableMonitor { account_id, .. }
+            | PlanKind::DisableMonitor { account_id }
+            | PlanKind::CleanupAccount { account_id }
+            | PlanKind::RecoverAccount { account_id }
+            | PlanKind::RotateSelftest { account_id }
+            | PlanKind::ResumeSelftestRotation { account_id }
+            | PlanKind::RecoverSelftestRotation { account_id } => vec![account_id.clone()],
+            PlanKind::SaveLink { domain_id, .. }
+            | PlanKind::DeleteLink { domain_id, .. }
+            | PlanKind::RemoveDomain { domain_id } => {
+                vec![self.domain(domain_id)?.account_id.clone()]
+            }
+            PlanKind::SavePool { pool } => pool.account_ids.clone(),
+            // Deletion checks remote leftovers on every configured resource account.
+            PlanKind::DeletePool { .. } => self
+                .db
+                .accounts
+                .iter()
+                .filter(|a| a.resources.is_some())
+                .map(|a| a.id.clone())
+                .collect(),
+        };
+        self.require_many_credentials(ids.iter().map(String::as_str))
+    }
+    async fn migrate_credentials(&mut self, id: &str) -> Result<(), String> {
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = id;
+            Err("此系统不需要本机授权迁移".into())
+        }
+        #[cfg(target_os = "macos")]
+        {
+            if self.account(id)?.mac_credential_schema != 0 {
+                return Err("此账户不需要本机授权迁移".into());
+            }
+            let account_id = id.to_owned();
+            tokio::task::spawn_blocking(move || {
+                #[cfg(not(test))]
+                {
+                    secret_store::migrate_account(&account_id)
+                }
+                #[cfg(test)]
+                {
+                    credential_migration::migrate(&MockMigration, &account_id)
+                }
+            })
+            .await
+            .map_err(|_| "更新本机授权任务未完成".to_string())?
+            .map_err(|error| {
+                format!("{error}；已保存的新条目和旧条目均已保留，未修改云端或恢复记录")
+            })?;
+            let index = self
+                .db
+                .accounts
+                .iter()
+                .position(|a| a.id == id)
+                .ok_or("找不到此账号")?;
+            self.db.accounts[index].mac_credential_schema = 2;
+            if let Err(error) = self.persist() {
+                self.db.accounts[index].mac_credential_schema = 0;
+                clear_credential_cache();
+                return Err(error);
+            }
+            self.publish_credential_routes();
+            Ok(())
+        }
+    }
+
     fn domain(&self, id: &str) -> Result<&Domain, String> {
         self.db
             .domains
@@ -604,6 +898,8 @@ impl Backend {
             warnings,
             expires_at: (Utc::now() + chrono::Duration::minutes(5)).to_rfc3339(),
             domain_takeover_confirmation,
+            credential_migration_confirmation: matches!(&kind, PlanKind::MigrateCredentials {..})
+                .then(|| "我确认更新本机授权。系统可能需要我授权访问已保存的令牌或检测密钥；已有记录会保留，云端配置和待处理恢复记录不变。".into()),
         };
         let snapshot = self.database_snapshot();
         self.plans.push(Plan {
@@ -796,9 +1092,15 @@ impl Backend {
             }
             imported.push((id, cloudflare_name, zones));
         }
+        let before_import = self.db.clone();
         // Validate every account before changing credentials or local state.
         for (id, cloudflare_name, zones) in imported {
-            keyring_set(&id, "token", token)?;
+            let existing_account = self.db.accounts.iter().any(|a| a.id == id);
+            if let Err(error) = write_explicit_token(&id, token, replace && existing_account).await
+            {
+                self.db = before_import;
+                return Err(error);
+            }
             if let Some(account) = self.db.accounts.iter_mut().find(|a| a.id == id) {
                 account.cloudflare_name = Some(cloudflare_name);
                 account.zone_count = zones.len();
@@ -809,6 +1111,7 @@ impl Backend {
                 self.db.accounts.push(Account {
                     id,
                     label,
+                    mac_credential_schema: if cfg!(target_os = "macos") { 2 } else { 0 },
                     cloudflare_name: Some(cloudflare_name),
                     zone_count: zones.len(),
                     checked_at: Some(now()),
@@ -822,7 +1125,11 @@ impl Backend {
                 });
             }
         }
-        self.persist()?;
+        if let Err(error) = self.persist() {
+            self.db = before_import;
+            return Err(error);
+        }
+        self.publish_credential_routes();
         Ok(self.state())
     }
 
@@ -848,6 +1155,13 @@ impl Backend {
         if let Some(id) = choice {
             self.account(id)?;
         }
+        self.require_many_credentials(
+            self.db
+                .accounts
+                .iter()
+                .filter(|a| choice.is_none_or(|id| a.id == id))
+                .map(|a| a.id.as_str()),
+        )?;
         let mut refreshed = self.db.accounts.clone();
         for item in refreshed
             .iter_mut()
@@ -892,6 +1206,7 @@ impl Backend {
             None if self.db.accounts.len() == 1 => self.db.accounts[0].id.clone(),
             None => return Err("请选择要刷新域名的 Cloudflare 账户".into()),
         };
+        self.require_credentials(&id)?;
         let label = self.account(&id)?.label.clone();
         let token = read_account_token(&id)
             .await
@@ -978,6 +1293,7 @@ impl Backend {
             .filter(|account| account.id == lookup_choice)
             .map(|account| (account.id.clone(), account.label.clone()))
             .collect();
+        self.require_many_credentials(accounts.iter().map(|(id, _)| id.as_str()))?;
         let mut refreshed = Vec::new();
         for (id, label) in accounts {
             let token = read_account_token(&id)
@@ -1010,6 +1326,7 @@ impl Backend {
         zone_id: &str,
         host: &str,
     ) -> Result<(Zeroizing<String>, String), String> {
+        self.require_credentials(account_id)?;
         let account = self.account(account_id)?;
         let zone = account
             .zones
@@ -1308,6 +1625,10 @@ impl Backend {
         planned_probe_segment: Option<&str>,
     ) -> (Vec<DomainCheck>, Option<PathRiskSnapshot>) {
         let mut checks = Vec::new();
+        if let Err(error) = self.require_credentials(account_id) {
+            checks.push(domain_check::hard_check("本机授权", false, error));
+            return (checks, None);
+        }
         let account = match self.account(account_id) {
             Ok(v) => v,
             Err(e) => {
@@ -1567,6 +1888,28 @@ impl Backend {
     fn prepare_change(&mut self, payload: &Value) -> Result<Value, String> {
         let kind = field(payload, "kind")?;
         let (title, steps, warnings, plan_kind) = match kind {
+            "migrate_credentials" => {
+                if !cfg!(target_os = "macos") {
+                    return Err("此系统不需要本机授权迁移".into());
+                }
+                let id = field(payload, "accountId")?.to_owned();
+                let account = self.account(&id)?;
+                if account.mac_credential_schema != 0 {
+                    return Err("此账户不需要本机授权迁移".into());
+                }
+                (
+                    "更新本机授权",
+                    vec![
+                        "仅复制本机凭据，并直接从系统凭据库读回核对".into(),
+                        "完成后请自行重试原操作；不会自动执行云端操作".into(),
+                    ],
+                    vec![
+                        "系统可能逐项请求授权；应用不会索要系统密码".into(),
+                        "旧版凭据保留；后续在新版改密后请继续使用新版".into(),
+                    ],
+                    PlanKind::MigrateCredentials { account_id: id },
+                )
+            }
             "save_link" => {
                 let domain_id = field(payload, "domainId")?.to_owned();
                 let domain = self.domain(&domain_id)?;
@@ -1948,6 +2291,7 @@ impl Backend {
             }
             _ => return Err("不支持此变更类型".into()),
         };
+        self.require_plan_credentials(&plan_kind)?;
         let view = self.make_plan(title, steps, warnings, plan_kind);
         serde_json::to_value(view).map_err(|_| "无法建立操作计划".into())
     }
@@ -2002,9 +2346,8 @@ impl Backend {
                 {
                     return Err("此账号有未完成的云端操作，请先在待处理操作中恢复".into());
                 }
-                keyring_delete(id, "token")?;
-                keyring_delete(id, "selftest")?;
-                let _ = keyring_delete(id, "probe");
+                remove_current_credentials(id).await?;
+                let previous = self.db.clone();
                 let domain_ids: HashSet<_> = self
                     .db
                     .domains
@@ -2020,7 +2363,11 @@ impl Backend {
                 }
                 self.db.accounts.retain(|a| a.id != id);
                 self.plans.clear();
-                self.persist()?;
+                if let Err(error) = self.persist() {
+                    self.db = previous;
+                    return Err(error);
+                }
+                self.publish_credential_routes();
                 Ok(self.state())
             }
             "refresh_accounts" | "refresh_domains" => {
@@ -2039,6 +2386,7 @@ impl Backend {
             "prepare_domain_dns" => self.prepare_domain_dns(payload).await,
             "prepare_change" => self.prepare_change(payload),
             "prepare_monitor" => {
+                self.require_credentials(field(payload, "accountId")?)?;
                 let account_id = field(payload, "accountId")?.to_owned();
                 if self.db.pending_pool_changes.iter().any(|p| {
                     p.pool.account_ids.contains(&account_id)
@@ -2116,6 +2464,7 @@ impl Backend {
                 serde_json::to_value(view).map_err(|_| "无法建立监测计划".into())
             }
             "disable_monitor" => {
+                self.require_credentials(field(payload, "accountId")?)?;
                 let account_id = field(payload, "accountId")?.to_owned();
                 if self
                     .db
@@ -2141,6 +2490,7 @@ impl Backend {
                 serde_json::to_value(view).map_err(|_| "无法建立监测计划".into())
             }
             "resume_monitor" => {
+                self.require_credentials(field(payload, "accountId")?)?;
                 let account_id = field(payload, "accountId")?;
                 let pending = self
                     .db
@@ -2185,6 +2535,11 @@ impl Backend {
                 let acknowledge_domain_takeover = payload["acknowledgeDomainTakeover"]
                     .as_bool()
                     .unwrap_or(false);
+                if matches!(&plan.kind, PlanKind::MigrateCredentials { .. })
+                    && payload["acknowledgeCredentialMigration"].as_bool() != Some(true)
+                {
+                    return Err("请明确确认更新本机授权；尚未读取任何旧凭据".into());
+                }
                 self.apply(plan.kind, acknowledge_domain_takeover).await?;
                 Ok(self.state())
             }
@@ -2523,6 +2878,19 @@ impl Backend {
             self.account(id)?;
             labels.push((id.to_owned(), label.to_owned()));
         }
+        let mut credential_accounts = HashSet::new();
+        for item in entries {
+            credential_accounts.insert(field(item, "accountId")?.to_owned());
+        }
+        for item in pool_entries {
+            let ids = item["accountIds"]
+                .as_array()
+                .ok_or("备份平台地址账号无效")?;
+            for id in ids {
+                credential_accounts.insert(id.as_str().ok_or("备份平台地址账号无效")?.to_owned());
+            }
+        }
+        self.require_many_credentials(credential_accounts.iter().map(String::as_str))?;
         // Import only records that already exist on the remote account; never write remote data.
         let mut recovered_domains = Vec::new();
         for item in entries {
@@ -2899,7 +3267,11 @@ impl Backend {
         kind: PlanKind,
         acknowledge_domain_takeover: bool,
     ) -> Result<(), String> {
+        self.require_plan_credentials(&kind)?;
         match kind {
+            PlanKind::MigrateCredentials { account_id } => {
+                self.migrate_credentials(&account_id).await
+            }
             PlanKind::Domain {
                 account_id,
                 zone_id,
@@ -3567,6 +3939,7 @@ impl Backend {
     }
 
     async fn apply_save_pool(&mut self, mut pool: Pool) -> Result<(), String> {
+        self.require_many_credentials(pool.account_ids.iter().map(String::as_str))?;
         if self
             .db
             .pending_monitor_changes
@@ -3772,6 +4145,13 @@ impl Backend {
     }
 
     async fn apply_delete_pool(&mut self, pool_id: &str) -> Result<(), String> {
+        self.require_many_credentials(
+            self.db
+                .accounts
+                .iter()
+                .filter(|a| a.resources.is_some())
+                .map(|a| a.id.as_str()),
+        )?;
         let pending = self
             .db
             .pending_pool_changes
@@ -4668,6 +5048,7 @@ impl Backend {
         account_id: &str,
         recovering_legacy: bool,
     ) -> Result<(), String> {
+        self.require_credentials(account_id)?;
         let resources = self
             .account(account_id)?
             .resources
@@ -4755,6 +5136,7 @@ impl Backend {
     }
 
     async fn resume_selftest_rotation(&mut self, account_id: &str) -> Result<(), String> {
+        self.require_credentials(account_id)?;
         let pending = self
             .db
             .pending_selftest_rotations
@@ -4928,6 +5310,7 @@ impl Backend {
     }
 
     async fn recover_account(&mut self, account_id: &str) -> Result<(), String> {
+        self.require_credentials(account_id)?;
         if !self.db.pending_monitor_changes.is_empty()
             || !self.db.pending_pool_changes.is_empty()
             || self.has_selftest_rotation(account_id)
@@ -5265,6 +5648,7 @@ impl Backend {
     ) -> Result<Option<SelftestSnapshot>, String> {
         validate_slug(slug)?;
         let domain = self.domain(domain_id)?;
+        self.require_credentials(&domain.account_id)?;
         if self.has_selftest_rotation(&domain.account_id) {
             return Ok(None);
         }
@@ -5342,6 +5726,13 @@ impl Backend {
             .find(|p| p.id == pool_id)
             .cloned()
             .ok_or("找不到平台地址")?;
+        // Check every enabled account before reading even the first token.
+        for id in &pool.account_ids {
+            let account = self.account(id)?;
+            if account.resources.is_some() && account.monitor_enabled {
+                self.require_credentials(id)?;
+            }
+        }
         let mut accounts = Vec::new();
         for id in &pool.account_ids {
             let account = self.account(id)?;
@@ -5349,6 +5740,7 @@ impl Backend {
                 // Disabled monitoring produces a local status row, so it must
                 // not require access to this account's system credential item.
                 let token = if account.monitor_enabled {
+                    self.require_credentials(id)?;
                     Some(Zeroizing::new(keyring_get(id, "token")?))
                 } else {
                     None
@@ -5646,7 +6038,7 @@ async fn dispatch(request: Value, state: tauri::State<'_, AppState>) -> Result<V
     let payload = request.get("payload").cloned().unwrap_or_else(|| json!({}));
     if action == "check_pool_health" {
         let snapshot = {
-            let backend = state.0.lock().await;
+            let backend = lock_backend(&state, &action).await?;
             backend.health_snapshot(field(&payload, "poolId")?)?
         };
         return run_pool_health(snapshot).await;
@@ -5683,7 +6075,7 @@ async fn dispatch(request: Value, state: tauri::State<'_, AppState>) -> Result<V
     }
     if action == "selftest_link" {
         let snapshot = {
-            let backend = state.0.lock().await;
+            let backend = lock_backend(&state, &action).await?;
             backend.selftest_snapshot(field(&payload, "domainId")?, field(&payload, "slug")?)?
         };
         return match snapshot {
@@ -5776,11 +6168,11 @@ mod tests {
     fn ok(result: Value) -> ResponseTemplate {
         ResponseTemplate::new(200).set_body_json(json!({"success":true,"result":result}))
     }
-    struct FixtureGuard {
+    pub(super) struct FixtureGuard {
         _dir: tempfile::TempDir,
         _lock: tokio::sync::OwnedMutexGuard<()>,
     }
-    async fn fixture() -> (MockServer, Backend, FixtureGuard) {
+    pub(super) async fn fixture() -> (MockServer, Backend, FixtureGuard) {
         static LOCK: std::sync::OnceLock<std::sync::Arc<tokio::sync::Mutex<()>>> =
             std::sync::OnceLock::new();
         let guard = LOCK
@@ -5791,13 +6183,16 @@ mod tests {
         let server = MockServer::start().await;
         let dir = tempfile::tempdir().unwrap();
         mock_keys().lock().unwrap().clear();
+        mock_legacy_keys().lock().unwrap().clear();
         mock_key_set_failures().lock().unwrap().clear();
         keyring_set("acct1", "token", "test-token-value").unwrap();
         keyring_set("acct1", "selftest", &"a1".repeat(32)).unwrap();
         mock_key_reads().lock().unwrap().clear();
+        mock_key_mutations().lock().unwrap().clear();
         let account = Account {
             id: "acct1".into(),
             label: "账号 1".into(),
+            mac_credential_schema: 2,
             cloudflare_name: Some("Example Account".into()),
             zone_count: 1,
             checked_at: Some(now()),
@@ -5832,6 +6227,8 @@ mod tests {
             plans: vec![],
             cloud: Cloud::for_test(&format!("{}/client/v4/", server.uri())),
             app: None,
+            #[cfg(target_os = "macos")]
+            _credential_lease: None,
             persist_count: std::sync::atomic::AtomicUsize::new(0),
             fail_persist_at: std::sync::atomic::AtomicUsize::new(0),
         };
@@ -5929,7 +6326,7 @@ mod tests {
             .mount(server)
             .await;
     }
-    fn domain() -> Domain {
+    pub(super) fn domain() -> Domain {
         Domain {
             id: "domain1".into(),
             account_id: "acct1".into(),
@@ -6759,6 +7156,13 @@ mod tests {
             "refresh_accounts",
             "prepare_domain",
             "prepare_domain_dns",
+            "prepare_change",
+            "apply_plan",
+            "check_pool_health",
+            "selftest_link",
+            "import_token",
+            "remove_account",
+            "import_config",
         ] {
             let result =
                 tokio::time::timeout(Duration::from_millis(100), lock_backend(&state, action))
@@ -7831,7 +8235,7 @@ mod tests {
         assert_eq!(hex::encode(Sha256::digest(module)), bundled_source_hash());
     }
 
-    fn sample_pool() -> Pool {
+    pub(super) fn sample_pool() -> Pool {
         Pool {
             id: "pool1".into(),
             name: "测试平台地址".into(),

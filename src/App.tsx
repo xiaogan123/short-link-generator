@@ -196,6 +196,7 @@ export default function App() {
   const [plan, setPlan] = useState<Plan | null>(null);
   const [planDetails, setPlanDetails] = useState<string[]>([]);
   const [planKind, setPlanKind] = useState("");
+  const [migrationAccountId, setMigrationAccountId] = useState<string | null>(null);
   const [tokenOpen, setTokenOpen] = useState(false);
   const [updateTokenAccount, setUpdateTokenAccount] = useState<Account | null>(
     null,
@@ -293,6 +294,7 @@ export default function App() {
     }
   }
   function closeMonitor() {
+    if (mutationRef.current === "prepare_credentials") return;
     monitorPrepareSequence.current += 1;
     setMonitorAccount(null);
     setMonitorSecret("");
@@ -321,12 +323,79 @@ export default function App() {
       setWorking(false);
     }
   }
+  function requireCurrentCredentials(
+    accountIds: string[],
+    onFailure?: (message: string) => void,
+  ) {
+    const account = stateRef.current.accounts.find(
+      (item) => accountIds.includes(item.id) && item.needsCredentialMigration,
+    );
+    if (!account) {
+      setMigrationAccountId(null);
+      return true;
+    }
+    const message = `「${account.label}」需要先更新本机授权。请使用“更新本机授权”，完成后再重试当前操作。`;
+    setMigrationAccountId(account.id);
+    setDomainFeedback(null);
+    setError(message);
+    onFailure?.(message);
+    return false;
+  }
+  function changeAccountIds(fields: Record<string, unknown>) {
+    if (typeof fields.accountId === "string") return [fields.accountId];
+    if (typeof fields.domainId === "string")
+      return stateRef.current.domains
+        .filter((d) => d.id === fields.domainId)
+        .map((d) => d.accountId);
+    const pool = fields.pool as Pool | undefined;
+    const poolId = pool?.id || fields.poolId;
+    if (!poolId) return pool?.accountIds || [];
+    return [...new Set([
+      ...(pool?.accountIds || []),
+      ...(stateRef.current.pools?.find((p) => p.id === poolId)?.accountIds || []),
+      ...stateRef.current.links
+        .filter((link) => link.poolId === poolId)
+        .flatMap((link) => stateRef.current.domains
+          .filter((domain) => domain.id === link.domainId)
+          .map((domain) => domain.accountId)),
+    ])];
+  }
+  async function prepareCredentialMigration(accountId: string) {
+    if (busy || domainOperation.current.inflight) return;
+    await withMutation("prepare_credentials", async () => {
+      const account = stateRef.current.accounts.find(
+        (item) => item.id === accountId,
+      );
+      if (!account?.needsCredentialMigration) return;
+      setMigrationAccountId(accountId);
+      if (await prepare("migrate_credentials", { accountId })) setManageAccount(null);
+    });
+  }
+  function migrationAction(accountId = migrationAccountId) {
+    const account = state.accounts.find((item) => item.id === accountId);
+    if (!account?.needsCredentialMigration) return null;
+    return (
+      <button
+        type="button"
+        className="button secondary"
+        disabled={busy || domainBusy}
+        onClick={() => void prepareCredentialMigration(account.id)}
+      >
+        更新本机授权
+      </button>
+    );
+  }
   async function prepare(
     kind: string,
     fields: Record<string, unknown>,
     shouldAccept: () => boolean = () => true,
     onFailure?: (message: string) => void,
   ) {
+    if (mutationRef.current && kind !== "migrate_credentials") return false;
+    if (
+      kind !== "migrate_credentials" &&
+      !requireCurrentCredentials(changeAccountIds(fields), onFailure)
+    ) return false;
     const next = await run(
       () => dispatch<Plan>("prepare_change", { kind, ...fields }),
       undefined,
@@ -415,14 +484,19 @@ export default function App() {
           dispatch<State>("apply_plan", {
             planId: plan.id,
             ...(takeover ? { acknowledgeDomainTakeover: true } : {}),
+            ...(appliedKind === "migrate_credentials"
+              ? { acknowledgeCredentialMigration: true }
+              : {}),
           }),
-        appliedKind === "add_domain"
-          ? "域名已接入。现在可以创建第一条短链接；云端配置可能需要稍等片刻才生效。"
-          : appliedKind === "fix_domain_dns"
-            ? "解析设置已提交，正在继续检查域名。"
-            : "已提交修改。云端更新可能需要一点时间生效。",
+        appliedKind === "migrate_credentials"
+          ? "本机授权已更新，请重试刚才的操作"
+          : appliedKind === "add_domain"
+            ? "域名已接入。现在可以创建第一条短链接；云端配置可能需要稍等片刻才生效。"
+            : appliedKind === "fix_domain_dns"
+              ? "解析设置已提交，正在继续检查域名。"
+              : "已提交修改。云端更新可能需要一点时间生效。",
         undefined,
-        appliedKind === "save_pool" ? setPoolError : undefined,
+        appliedKind === "save_pool" || (appliedKind === "migrate_credentials" && page === "pools") ? setPoolError : undefined,
       );
       if (next) {
         stateRef.current = next;
@@ -430,6 +504,15 @@ export default function App() {
         setPoolHealth({});
         if (appliedKind === "save_pool") setPoolSavedRevision((n) => n + 1);
         setPlan(null);
+        if (appliedKind === "migrate_credentials") {
+          setMigrationAccountId(null);
+          setPoolError("");
+          setDomainFeedback({
+            tone: "success",
+            message: "本机授权已更新，请重试刚才的操作",
+          });
+          return;
+        }
         if (appliedKind === "save_link") closeLink();
         setDomainOpen(appliedKind === "fix_domain_dns");
         setPreflight(null);
@@ -454,9 +537,10 @@ export default function App() {
         }
       } else {
         setPlan(null);
-        setDomainOpen(
-          appliedKind === "add_domain" || appliedKind === "fix_domain_dns",
-        );
+        if (appliedKind !== "migrate_credentials")
+          setDomainOpen(
+            appliedKind === "add_domain" || appliedKind === "fix_domain_dns",
+          );
         try {
           const latest = await dispatch<State>("get_state");
           stateRef.current = latest;
@@ -503,15 +587,17 @@ export default function App() {
   }
   function updateLinkDraft(fields: Partial<LinkDraft>) {
     linkPrepareSequence.current += 1;
+    setMigrationAccountId(null);
     setLinkDraft((current) => (current ? { ...current, ...fields } : current));
   }
   function closeLink() {
+    if (mutationRef.current === "prepare_credentials") return;
     linkPrepareSequence.current += 1;
     setLinkDraft(null);
   }
   async function saveLink(event: FormEvent) {
     event.preventDefault();
-    if (!linkDraft) return;
+    if (!linkDraft || mutationRef.current) return;
     const validation =
       validateSlug(linkDraft.slug) ||
       (linkDraft.poolId
@@ -557,7 +643,11 @@ export default function App() {
     );
   }
   function beginDomainOperation() {
-    if (domainOperation.current.inflight) return null;
+    if (
+      domainOperation.current.inflight ||
+      mutationRef.current === "prepare_credentials" ||
+      (mutationRef.current === "apply" && planKind === "migrate_credentials")
+    ) return null;
     const sequence = ++domainOperation.current.sequence;
     domainOperation.current.inflight = true;
     setDomainBusy(true);
@@ -567,6 +657,7 @@ export default function App() {
   function invalidateDomainPreparation() {
     domainOperation.current.sequence += 1;
     domainCheckSequence.current += 1;
+    setMigrationAccountId(null);
     setPreflight(null);
     setDnsPreflight(null);
     setDomainFeedback(null);
@@ -645,6 +736,20 @@ export default function App() {
       setDomainFeedback({ tone: "error", message: validation });
       return;
     }
+    const host = normalizeHost(draft.input);
+    const cachedAccounts = stateRef.current.accounts.filter((account) =>
+      account.zones?.some((zone) =>
+        zone.status === "active" &&
+        (host === zone.name || host.endsWith(`.${zone.name}`))),
+    );
+    const accountIds = draft.accountId
+      ? [draft.accountId]
+      : (cachedAccounts.length
+          ? cachedAccounts
+          : stateRef.current.accounts.length === 1
+            ? stateRef.current.accounts
+            : []).map((account) => account.id);
+    if (!requireCurrentCredentials(accountIds)) return;
     const operation = beginDomainOperation();
     if (operation === null) return;
     const sequence = ++domainCheckSequence.current;
@@ -655,7 +760,7 @@ export default function App() {
     };
     setDomainFeedback({
       tone: "progress",
-      message: "正在检查此账户的域名配置，请完成系统授权后稍候。",
+      message: "正在检查此账户的域名配置，请稍候。",
     });
     setPreflight(null);
     setDnsPreflight(null);
@@ -799,6 +904,7 @@ export default function App() {
       });
       return;
     }
+    if (!requireCurrentCredentials([selectedAccountId])) return;
     const operation = beginDomainOperation();
     if (operation === null) return;
     const sequence = ++domainCheckSequence.current;
@@ -807,7 +913,7 @@ export default function App() {
     );
     setDomainFeedback({
       tone: "progress",
-      message: "正在读取此账户的域名，请完成系统授权后稍候。",
+      message: "正在读取此账户的域名，请稍候。",
     });
     setPreflight(null);
     setDnsPreflight(null);
@@ -910,6 +1016,7 @@ export default function App() {
     );
   }
   function closeDomain() {
+    if (mutationRef.current === "prepare_credentials") return;
     invalidateDomainPreparation();
     setDomainOpen(false);
   }
@@ -1061,11 +1168,11 @@ export default function App() {
     if (next) setState(next);
   }
   async function refreshAccounts() {
-    const next = await run(
-      () => dispatch<State>("refresh_accounts"),
-      "账户状态已更新。",
-    );
-    if (next) setState(next);
+    if (!requireCurrentCredentials(stateRef.current.accounts.map((a) => a.id))) return;
+    await withMutation("refresh_accounts", async () => {
+      const next = await run(() => dispatch<State>("refresh_accounts"), "账户状态已更新。");
+      if (next) setState(next);
+    });
   }
   async function checkUpdate() {
     const result = await run(() => dispatch<UpdateStatus>("check_update"));
@@ -1124,7 +1231,7 @@ export default function App() {
   }
   async function prepareMonitor(event: FormEvent) {
     event.preventDefault();
-    if (!monitorAccount) return;
+    if (!monitorAccount || !requireCurrentCredentials([monitorAccount.id])) return;
     const endpoint = monitorEndpoint.trim();
     try {
       const url = new URL(endpoint);
@@ -1177,6 +1284,7 @@ export default function App() {
     }
   }
   async function disableMonitor(account: Account) {
+    if (!requireCurrentCredentials([account.id])) return;
     const next = await run(() =>
       dispatch<Plan>("disable_monitor", { accountId: account.id }),
     );
@@ -1187,6 +1295,7 @@ export default function App() {
     }
   }
   async function resumePending(action: PendingAction) {
+    if (action.accountId && !requireCurrentCredentials([action.accountId])) return;
     if (action.kind === "resume_pool_sync" && action.poolId) {
       await prepare("resume_pool_sync", { poolId: action.poolId });
       return;
@@ -1217,6 +1326,9 @@ export default function App() {
     }
   }
   async function inspectPool(poolId: string) {
+    const enabledAccounts = (stateRef.current.pools?.find((pool) => pool.id === poolId)?.accountIds || [])
+      .filter((id) => stateRef.current.accounts.some((account) => account.id === id && account.monitorEnabled));
+    if (!requireCurrentCredentials(enabledAccounts)) return;
     const fingerprint = poolFingerprint(poolId, stateRef.current);
     const result = await run(() =>
       dispatch<PoolHealth>("check_pool_health", { poolId }),
@@ -1244,6 +1356,7 @@ export default function App() {
     ]);
   }
   async function selftest(link: Link, domain: Domain) {
+    if (!requireCurrentCredentials([domain.accountId])) return;
     const url = shortUrl(domain.host, domain.prefix, link.slug);
     const sequence = ++detectionSequence.current;
     latestDetectionForLink.current[detectionKey(link)] = sequence;
@@ -1376,6 +1489,11 @@ export default function App() {
         : page === "domains"
           ? "添加前检查所属账户和现有网站配置。"
           : "管理连接、检测服务与本机备份。";
+  const domainMigrationAccount = state.accounts.find((account) =>
+    account.id === (domainDraft.accountId ||
+      (state.accounts.length === 1 ? state.accounts[0].id : "")) &&
+    account.needsCredentialMigration,
+  );
   const currentVersion = updateStatus?.currentVersion || state.appVersion;
   let domainExampleHost = "example.com";
   try {
@@ -1411,6 +1529,7 @@ export default function App() {
                   setPage(item.key);
                   setSidebarOpen(false);
                   setError("");
+                  setMigrationAccountId(null);
                 }}
               >
                 <Icon
@@ -1535,6 +1654,7 @@ export default function App() {
             <div role="alert" className="alert error">
               <WarningCircle size={19} />
               <span>{error}</span>
+              {!linkDraft && !domainOpen && !manageAccount && !monitorAccount && !plan && migrationAction()}
               <button aria-label="关闭错误" onClick={() => setError("")}>
                 <X size={16} />
               </button>
@@ -1970,7 +2090,9 @@ export default function App() {
               busy={busy}
               health={visiblePoolHealth}
               onCheckHealth={(id) => void inspectPool(id)}
-              planOpen={Boolean(plan && planKind === "save_pool")}
+              planOpen={Boolean(plan && (planKind === "save_pool" || planKind === "migrate_credentials"))}
+              errorAction={migrationAction()}
+              dismissDisabled={mutation === "prepare_credentials"}
               savedRevision={poolSavedRevision}
               serverError={poolError}
               onDraftChange={() => setPoolError("")}
@@ -2150,11 +2272,17 @@ export default function App() {
                         <div className="account-main">
                           <div className="account-title">
                             <h3>{account.cloudflareName || account.label}</h3>
+                            {account.needsCredentialMigration && (
+                              <StatusPill tone="amber">
+                                需要更新本机授权
+                              </StatusPill>
+                            )}
                             {account.needsSelftestKey ? (
                               <StatusPill tone="amber">
                                 检测密钥待恢复
                               </StatusPill>
                             ) : (
+                              !account.needsCredentialMigration &&
                               <StatusPill>已连接</StatusPill>
                             )}
                           </div>
@@ -2185,8 +2313,10 @@ export default function App() {
                             )}
                           </span>
                         </div>
+                        {migrationAction(account.id)}
                         <button
                           className="button ghost"
+                          disabled={mutation === "prepare_credentials"}
                           aria-label={`管理 ${account.label}`}
                           onClick={() => setManageAccount(account)}
                         >
@@ -2234,12 +2364,16 @@ export default function App() {
           title={originalSlug ? "编辑短链接" : "创建短链接"}
           eyebrow="LINK DETAILS"
           error={error}
+          errorAction={migrationAction()}
+          status={notice === "本机授权已更新，请重试刚才的操作" ? <div role="status">{notice}</div> : undefined}
+          dismissDisabled={mutation === "prepare_credentials"}
           onClose={closeLink}
           footer={
             <>
               <button
                 className="button ghost"
                 onClick={closeLink}
+                disabled={mutation === "prepare_credentials"}
               >
                 取消
               </button>
@@ -2373,12 +2507,13 @@ export default function App() {
           </form>
         </Dialog>
       )}
-      {domainOpen && (
+      {domainOpen && !plan && (
         <Dialog
           title="添加域名"
           eyebrow="DOMAIN SETUP"
           error={domainErrorMessage(error)}
-          errorAction={domainRecoveryActions()}
+          errorAction={domainMigrationAccount ? undefined : migrationAction() || domainRecoveryActions()}
+          dismissDisabled={mutation === "prepare_credentials"}
           status={
             domainFeedback ? (
               <div
@@ -2391,7 +2526,7 @@ export default function App() {
             ) : domainBusy ? (
               <div role="status" className="domain-feedback progress">
                 <span>
-                  上一项检查仍在进行，请完成或取消系统授权后稍候。
+                  上一项检查仍在进行，请稍候。
                 </span>
               </div>
             ) : undefined
@@ -2400,7 +2535,7 @@ export default function App() {
           wide
           footer={
             <>
-              <button className="button ghost" onClick={closeDomain}>
+              <button className="button ghost" onClick={closeDomain} disabled={mutation === "prepare_credentials"}>
                 取消
               </button>
               {preflight?.canApply && preflight.plan ? (
@@ -2533,6 +2668,12 @@ export default function App() {
                 </small>
               </label>
             </div>
+            {domainMigrationAccount && (
+              <div className="warning-box">
+                <p>「{domainMigrationAccount.label}」需要更新本机授权后才能读取域名。当前输入会保留。</p>
+                {migrationAction(domainMigrationAccount.id)}
+              </div>
+            )}
             <div className="domain-list-refresh">
               <button
                 type="button"
@@ -2710,11 +2851,13 @@ export default function App() {
               >
                 {busy
                   ? "正在提交…"
-                  : planKind === "fix_domain_dns"
-                    ? "确认修改并继续检查"
-                    : plan.domainTakeoverConfirmation
-                      ? "确认使用此目录"
-                      : "确认并执行"}
+                  : planKind === "migrate_credentials"
+                    ? "确认更新本机授权"
+                    : planKind === "fix_domain_dns"
+                      ? "确认修改并继续检查"
+                      : plan.domainTakeoverConfirmation
+                        ? "确认使用此目录"
+                        : "确认并执行"}
               </button>
             </>
           }
@@ -2734,7 +2877,19 @@ export default function App() {
                 </div>
               </div>
             )}
-            <p>应用将再次检查账户归属和当前状态，然后执行以下步骤：</p>
+            {planKind === "migrate_credentials" && (
+              <div className="takeover-confirmation">
+                <WarningCircle size={20} />
+                <div>
+                  <strong>请确认本机授权更新</strong>
+                  <p>{plan.credentialMigrationConfirmation || "系统可能需要你授权访问已保存的令牌或检测密钥；已有记录会保留，云端配置不变。"}</p>
+                  <p>完成后请手动重试刚才的操作；不会自动重新执行之前的修改。请在系统窗口中授权，不要在本应用中输入系统密码。</p>
+                </div>
+              </div>
+            )}
+            <p>{planKind === "migrate_credentials"
+              ? "本次仅更新此账户在本机的凭据保存方式："
+              : "应用将再次检查账户归属和当前状态，然后执行以下步骤："}</p>
             <ol>
               {plan.steps.map((step, i) => (
                 <li key={i}>{step}</li>
@@ -2953,20 +3108,22 @@ export default function App() {
         >
           <p className="modal-paragraph">
             将移除“{removeAccount.label}
-            ”的本机凭据和关联记录。此操作不会删除云端短链接服务；如需删除，请先在账户管理中选择“删除云端短链接服务”。
+            ”的本机配置及新版使用的凭据。更新本机授权时保留的旧版钥匙串条目不会自动删除。此操作不会删除云端短链接服务；如需删除，请先在账户管理中选择“删除云端短链接服务”。
           </p>
         </Dialog>
       )}
       {manageAccount && (
         <Dialog
           title="账户管理"
+          dismissDisabled={mutation === "prepare_credentials"}
           eyebrow="CLOUDFLARE ACCOUNT"
           error={error}
-          onClose={() => setManageAccount(null)}
+          onClose={() => { if (mutationRef.current !== "prepare_credentials") setManageAccount(null); }}
           footer={
             <button
               className="button ghost"
               onClick={() => setManageAccount(null)}
+              disabled={mutation === "prepare_credentials"}
             >
               完成
             </button>
@@ -2987,7 +3144,9 @@ export default function App() {
               </details>
             </div>
             <div className="manager-actions">
+              {migrationAction(manageAccount.id)}
               <button
+                disabled={mutation === "prepare_credentials"}
                 className="button secondary"
                 onClick={() => {
                   setUpdateTokenAccount(manageAccount);
@@ -3001,6 +3160,7 @@ export default function App() {
                 更新访问令牌
               </button>
               <button
+                disabled={mutation === "prepare_credentials"}
                 className="button secondary"
                 onClick={() => {
                   setRenameAccount(manageAccount);
@@ -3012,6 +3172,7 @@ export default function App() {
               </button>
               {!manageAccount.monitorEnabled && (
                 <button
+                  disabled={mutation === "prepare_credentials"}
                   className="button secondary"
                   onClick={() => {
                     monitorPrepareSequence.current += 1;
@@ -3027,6 +3188,7 @@ export default function App() {
               )}
               {manageAccount.monitorEnabled && (
                 <button
+                  disabled={mutation === "prepare_credentials"}
                   className="button secondary"
                   onClick={() => {
                     void disableMonitor(manageAccount);
@@ -3037,6 +3199,7 @@ export default function App() {
                 </button>
               )}
               <button
+                disabled={mutation === "prepare_credentials"}
                 className="button secondary"
                 onClick={() => {
                   void prepare("recover_account", {
@@ -3048,6 +3211,7 @@ export default function App() {
                 从 Cloudflare 找回配置
               </button>
               <button
+                disabled={mutation === "prepare_credentials"}
                 className="button secondary"
                 onClick={() => {
                   void prepare("rotate_selftest", {
@@ -3066,6 +3230,7 @@ export default function App() {
                 Worker、路由和短链接数据；不会删除其他网站或 DNS 记录。
               </p>
               <button
+                disabled={mutation === "prepare_credentials"}
                 className="button danger-button"
                 onClick={() => {
                   void prepare("cleanup_account", {
@@ -3077,6 +3242,7 @@ export default function App() {
                 删除云端短链接服务
               </button>
               <button
+                disabled={mutation === "prepare_credentials"}
                 className="button danger-button"
                 onClick={() => {
                   setRemoveAccount(manageAccount);
@@ -3089,9 +3255,11 @@ export default function App() {
           </div>
         </Dialog>
       )}
-      {monitorAccount && (
+      {monitorAccount && !plan && (
         <Dialog
           title="配置检测服务"
+          errorAction={migrationAction()}
+          dismissDisabled={mutation === "prepare_credentials"}
           eyebrow="OPTIONAL MONITOR"
           error={error}
           onClose={closeMonitor}
@@ -3100,6 +3268,7 @@ export default function App() {
               <button
                 className="button ghost"
                 onClick={closeMonitor}
+                disabled={mutation === "prepare_credentials"}
               >
                 取消
               </button>

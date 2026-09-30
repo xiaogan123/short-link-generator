@@ -89,12 +89,12 @@ it('keeps one domain request in flight across draft edits and closing then reope
   let dialog=screen.getByRole('dialog',{name:'添加域名'});
   fireEvent.change(within(dialog).getByRole('combobox',{name:'Cloudflare 账户'}),{target:{value:'a'}});
   fireEvent.click(within(dialog).getByRole('button',{name:'刷新域名列表'}));
-  expect((await within(dialog).findByRole('status')).textContent).toContain('正在读取此账户的域名，请完成系统授权后稍候。');
+  expect((await within(dialog).findByRole('status')).textContent).toContain('正在读取此账户的域名，请稍候。');
   fireEvent.change(within(dialog).getByPlaceholderText('go.example.com'),{target:{value:'changed.example.com'}});
   fireEvent.click(within(dialog).getByRole('button',{name:'取消'}));
   fireEvent.click(screen.getAllByRole('button',{name:'添加域名'})[0]);
   dialog=screen.getByRole('dialog',{name:'添加域名'});
-  expect(within(dialog).getByRole('status').textContent).toContain('上一项检查仍在进行，请完成或取消系统授权后稍候。');
+  expect(within(dialog).getByRole('status').textContent).toContain('上一项检查仍在进行，请稍候。');
   expect((within(dialog).getByRole('button',{name:'正在读取…'}) as HTMLButtonElement).disabled).toBe(true);
   fireEvent.click(within(dialog).getByRole('button',{name:'正在读取…'}));
   expect(control.calls.filter(call=>call.action==='refresh_domains')).toHaveLength(1);

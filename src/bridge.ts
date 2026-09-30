@@ -8,8 +8,8 @@ const uid = () => Math.random().toString(36).slice(2, 10);
 const demoState: State = {
   appVersion: '0.0.0-preview',
   accounts: [
-    { id: 'demo-a', label: '示例账户 · 团队', cloudflareName: 'Example team', zones: [{id:'demo-zone-1',name:'example.com',status:'active'},{id:'demo-zone-2',name:'example.org',status:'active'}], zoneCount: 2, checkedAt: now(), hasResources: true, needsSelftestKey: false },
-    { id: 'demo-b', label: '示例账户 · 个人', cloudflareName: 'Example personal', zones: [{id:'demo-zone-3',name:'example.net',status:'active'}], zoneCount: 1, checkedAt: now(), hasResources: false, needsSelftestKey: true },
+    { id: 'demo-a', label: '示例账户 · 团队', cloudflareName: 'Example team', zones: [{id:'demo-zone-1',name:'example.com',status:'active'},{id:'demo-zone-2',name:'example.org',status:'active'}], zoneCount: 2, checkedAt: now(), hasResources: true, needsSelftestKey: false, needsCredentialMigration: new URLSearchParams(window.location.search).get('legacyCredentials') === '1' },
+    { id: 'demo-b', label: '示例账户 · 个人', cloudflareName: 'Example personal', zones: [{id:'demo-zone-3',name:'example.net',status:'active'}], zoneCount: 1, checkedAt: now(), hasResources: false, needsSelftestKey: true, needsCredentialMigration: false },
   ],
   domains: [
     { id: 'demo-d1', accountId: 'demo-a', zoneId: 'demo-zone-1', host: 'go.example.com', prefix: 'r', routeId: 'demo-route-1' },
@@ -28,7 +28,7 @@ let local: State = structuredClone(demoState);
 const plans = new Map<string, { plan: Plan; action: string; payload: Record<string, unknown> }>();
 const clone = ():State => {const state=structuredClone(local);state.links=state.links.map(link=>{if(!link.poolId)return link;const pool=state.pools?.find(p=>p.id===link.poolId);if(!pool)return link;const code=encodeURIComponent(link.code||'');const candidate=pool.candidates.find(c=>c.enabled);return {...link,cnUrl:candidate?candidate.prefix+code+candidate.suffix:'',defaultUrl:pool.official.prefix+code+pool.official.suffix};});return state;};
 function makePlan(title: string, steps: string[], warnings: string[], action: string, payload: Record<string, unknown>, domainTakeoverConfirmation?: string): Plan {
-  const plan = { id: uid(), title, steps, warnings, expiresAt: new Date(Date.now() + 300000).toISOString(), ...(domainTakeoverConfirmation ? { domainTakeoverConfirmation } : {}) };
+  const plan: Plan = { id: uid(), title, steps, warnings, expiresAt: new Date(Date.now() + 300000).toISOString(), ...(domainTakeoverConfirmation ? { domainTakeoverConfirmation } : {}) };
   plans.set(plan.id, { plan, action, payload });
   return plan;
 }
@@ -49,7 +49,8 @@ function previewDispatch(action: Action, payload: Record<string, unknown>): unkn
     if (!token) throw new Error('请先粘贴令牌。');
     const existing = local.accounts.find(a => a.id === 'demo-imported');
     if (existing && !payload.replace) throw new Error('该账户已经存在。请确认是否替换本机保存的令牌。');
-    if (!existing) local.accounts.push({ id: 'demo-imported', label: '导入的示例账户', zoneCount: 1, checkedAt: now(), hasResources: false, needsSelftestKey: false });
+    if (!existing) local.accounts.push({ id: 'demo-imported', label: '导入的示例账户', zoneCount: 1, checkedAt: now(), hasResources: false, needsSelftestKey: false, needsCredentialMigration: false });
+    else local.accounts = local.accounts.map(a => a.id === existing.id ? {...a, needsCredentialMigration: false} : a);
     return clone();
   }
   if (action === 'rename_account') { local.accounts = local.accounts.map(a => a.id === payload.accountId ? { ...a, label: String(payload.label) } : a); return clone(); }
@@ -93,6 +94,13 @@ function previewDispatch(action: Action, payload: Record<string, unknown>): unkn
   }
   if (action === 'prepare_change') {
     const kind = String(payload.kind);
+    if (kind === 'migrate_credentials') {
+      const account = local.accounts.find(a => a.id === payload.accountId);
+      if (!account?.needsCredentialMigration) throw new Error('此账户无需更新本机授权。');
+      const plan = makePlan('更新本机授权', ['读取此账户的旧凭据', '保存到新的本机凭据存储并验证'], ['本地预览只模拟迁移，不读取真实凭据或访问云服务。'], kind, {accountId:account.id});
+      plan.credentialMigrationConfirmation = '系统可能需要你授权访问已保存的令牌或检测密钥；已有记录会保留，云端配置不变。';
+      return plan;
+    }
     const titles: Record<string, string> = { save_link: '保存短链接', delete_link: '删除短链接', save_pool: '保存平台地址', resume_pool_sync:'继续同步平台地址', delete_pool: '删除平台地址', remove_domain: '移除域名', cleanup_account: '清理远端资源', recover_account: '恢复账户资源', rotate_selftest: '轮换检测密钥' };
     if (kind === 'delete_pool' && local.links.some(l => l.poolId === payload.poolId)) throw new Error('平台地址仍有链接引用，无法删除。');
     return makePlan(titles[kind] || '确认变更', [`核对当前状态与资源归属`, `${titles[kind] || kind}并记录结果`], kind === 'delete_link' || kind === 'remove_domain' || kind === 'cleanup_account' ? ['该操作会修改远端资源。请确认影响范围。'] : [], kind, payload);
@@ -102,7 +110,9 @@ function previewDispatch(action: Action, payload: Record<string, unknown>): unkn
     if (!item || Date.parse(item.plan.expiresAt) < Date.now()) throw new Error('计划已过期，请重新准备。');
     const p = item.payload;
     if (item.plan.domainTakeoverConfirmation && payload.acknowledgeDomainTakeover !== true) throw new Error('请先确认链接目录的接管范围。');
+    if (item.action === 'migrate_credentials' && payload.acknowledgeCredentialMigration !== true) throw new Error('请先确认更新本机授权。');
     plans.delete(item.plan.id);
+    if (item.action === 'migrate_credentials') local.accounts = local.accounts.map(a => a.id === p.accountId ? {...a, needsCredentialMigration:false} : a);
     if (item.action === 'add_domain') local.domains.push({ id: uid(), host: String(p.host), prefix: String(p.prefix), accountId: String(p.accountId), zoneId: String(p.zoneId), routeId: `demo-route-${uid()}` });
     if (item.action === 'save_link') {
       const pool = (local.pools || []).find(pool => pool.id === p.poolId);
