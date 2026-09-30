@@ -171,6 +171,26 @@ pub struct PendingMonitorChange {
     pub journal: String,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SelftestRotationStatus {
+    Staged,
+    DefinitiveFailure,
+    Uncertain,
+    CloudApplied,
+    StagingMissing,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingSelftestRotation {
+    pub account_id: String,
+    pub script: String,
+    pub namespace: String,
+    pub journal: String,
+    pub status: SelftestRotationStatus,
+}
+
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Database {
@@ -186,6 +206,8 @@ pub struct Database {
     pub pending_pool_changes: Vec<PendingPoolChange>,
     #[serde(default)]
     pub pending_monitor_changes: Vec<PendingMonitorChange>,
+    #[serde(default)]
+    pub pending_selftest_rotations: Vec<PendingSelftestRotation>,
     #[serde(default)]
     pub pending_operations: Vec<String>,
 }
@@ -212,8 +234,43 @@ pub struct PendingAction {
 
 impl From<&Database> for State {
     fn from(db: &Database) -> Self {
+        let has_legacy_rotation = |account_id: &str| {
+            if db
+                .pending_selftest_rotations
+                .iter()
+                .any(|pending| pending.account_id == account_id)
+            {
+                return false;
+            }
+            let prefix = format!("重置自检密钥 {account_id} (");
+            db.pending_operations.iter().any(|entry| {
+                entry.starts_with(&prefix)
+                    && !db.pending_selftest_rotations.iter().any(|pending| {
+                        pending.account_id == account_id
+                            && (entry == &pending.journal
+                                || entry
+                                    .strip_prefix(&pending.journal)
+                                    .is_some_and(|rest| rest.starts_with('：')))
+                    })
+            })
+        };
         Self {
-            accounts: db.accounts.iter().map(AccountView::from).collect(),
+            accounts: db
+                .accounts
+                .iter()
+                .map(|account| {
+                    let mut view = AccountView::from(account);
+                    if db
+                        .pending_selftest_rotations
+                        .iter()
+                        .any(|pending| pending.account_id == account.id)
+                        || has_legacy_rotation(&account.id)
+                    {
+                        view.needs_selftest_key = true;
+                    }
+                    view
+                })
+                .collect(),
             domains: db.domains.clone(),
             links: db
                 .links
@@ -265,6 +322,34 @@ impl From<&Database> for State {
                         "继续关闭监测".into()
                     },
                 }))
+                .chain(db.pending_selftest_rotations.iter().map(|p| {
+                    PendingAction {
+                        kind: if p.status == SelftestRotationStatus::StagingMissing {
+                            "recover_selftest_rotation"
+                        } else {
+                            "resume_selftest_rotation"
+                        }
+                        .into(),
+                        pool_id: None,
+                        account_id: Some(p.account_id.clone()),
+                        label: if p.status == SelftestRotationStatus::StagingMissing {
+                            "重新建立自检密钥".into()
+                        } else {
+                            "继续恢复自检密钥".into()
+                        },
+                    }
+                }))
+                .chain(
+                    db.accounts
+                        .iter()
+                        .filter(|account| has_legacy_rotation(&account.id))
+                        .map(|account| PendingAction {
+                            kind: "recover_selftest_rotation".into(),
+                            pool_id: None,
+                            account_id: Some(account.id.clone()),
+                            label: "恢复旧版自检密钥操作".into(),
+                        }),
+                )
                 .collect(),
         }
     }
@@ -359,6 +444,12 @@ pub enum PlanKind {
         account_id: String,
     },
     RotateSelftest {
+        account_id: String,
+    },
+    ResumeSelftestRotation {
+        account_id: String,
+    },
+    RecoverSelftestRotation {
         account_id: String,
     },
 }

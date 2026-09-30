@@ -159,6 +159,9 @@ function domainErrorMessage(message: string) {
     ? `当前授权无法修改此域名的解析。${message}`
     : message;
 }
+function poolTargetUrl(prefix: string, suffix: string, code = "") {
+  return `${prefix}${encodeURIComponent(code)}${suffix}`;
+}
 
 export default function App() {
   const [page, setPage] = useState<Page>("links");
@@ -220,6 +223,8 @@ export default function App() {
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [clock, setClock] = useState(Date.now());
   const stateRef = useRef(state);
+  const linkDraftRef = useRef(linkDraft);
+  const linkPrepareSequence = useRef(0);
   const domainDraftRef = useRef(domainDraft);
   const detectionSequence = useRef(0);
   const domainCheckSequence = useRef(0);
@@ -227,6 +232,7 @@ export default function App() {
   const resumeDomainAfterToken = useRef(false);
   const latestDetectionForLink = useRef<Record<string, number>>({});
   stateRef.current = state;
+  linkDraftRef.current = linkDraft;
   domainDraftRef.current = domainDraft;
   function poolFingerprint(poolId: string, snapshot: State) {
     const pool = snapshot.pools?.find((p) => p.id === poolId);
@@ -273,25 +279,32 @@ export default function App() {
   async function run<T>(
     work: () => Promise<T>,
     success?: string,
+    shouldAccept: () => boolean = () => true,
   ): Promise<T | undefined> {
     setBusy(true);
     setError("");
     try {
       const value = await work();
-      if (success) setNotice(success);
+      if (success && shouldAccept()) setNotice(success);
       return value;
     } catch (e) {
-      setError(errorMessage(e));
+      if (shouldAccept()) setError(errorMessage(e));
       return undefined;
     } finally {
       setBusy(false);
     }
   }
-  async function prepare(kind: string, fields: Record<string, unknown>) {
-    const next = await run(() =>
-      dispatch<Plan>("prepare_change", { kind, ...fields }),
+  async function prepare(
+    kind: string,
+    fields: Record<string, unknown>,
+    shouldAccept: () => boolean = () => true,
+  ) {
+    const next = await run(
+      () => dispatch<Plan>("prepare_change", { kind, ...fields }),
+      undefined,
+      shouldAccept,
     );
-    if (next) {
+    if (next && shouldAccept()) {
       setPlanKind(kind);
       if (kind === "save_link") {
         const domain = state.domains.find((d) => d.id === fields.domainId);
@@ -329,7 +342,9 @@ export default function App() {
           associations
             ? `关联链接：${associations} 条会一起更新`
             : "关联链接：0 条；不会影响手动填写的链接",
-          `同步账户：${pool.accountIds.map((id) => state.accounts.find((a) => a.id === id)?.label || id).join("、")}（已同步不等于已关联）`,
+          pool.accountIds.length
+            ? `已使用账户：${pool.accountIds.map((id) => state.accounts.find((a) => a.id === id)?.label || id).join("、")}`
+            : "已使用账户：尚无；创建链接时会自动配置到对应账户",
           `官网链接：${pool.official.prefix}邀请码${pool.official.suffix}`,
           ...pool.candidates.map(
             (candidate, index) =>
@@ -355,7 +370,7 @@ export default function App() {
         ]);
       setPlan(next);
     }
-    return Boolean(next);
+    return Boolean(next && shouldAccept());
   }
   async function apply() {
     if (!plan) return;
@@ -383,7 +398,7 @@ export default function App() {
       setPoolHealth({});
       if (appliedKind === "save_pool") setPoolSavedRevision((n) => n + 1);
       setPlan(null);
-      setLinkDraft(null);
+      if (appliedKind === "save_link") closeLink();
       setDomainOpen(appliedKind === "fix_domain_dns");
       setPreflight(null);
       setDnsPreflight(null);
@@ -429,6 +444,7 @@ export default function App() {
     }, "已复制短链接。");
   }
   function openLink(link?: Link, usePlatform = false) {
+    linkPrepareSequence.current += 1;
     setOriginalSlug(link?.slug || null);
     setLinkDraft(
       link
@@ -451,6 +467,14 @@ export default function App() {
             code: "",
           },
     );
+  }
+  function updateLinkDraft(fields: Partial<LinkDraft>) {
+    linkPrepareSequence.current += 1;
+    setLinkDraft((current) => (current ? { ...current, ...fields } : current));
+  }
+  function closeLink() {
+    linkPrepareSequence.current += 1;
+    setLinkDraft(null);
   }
   async function saveLink(event: FormEvent) {
     event.preventDefault();
@@ -477,6 +501,8 @@ export default function App() {
       setError("现有短链接不能更改名称。请新建一条链接。");
       return;
     }
+    const submittedDraft = { ...linkDraft };
+    const requestSequence = ++linkPrepareSequence.current;
     await prepare(
       "save_link",
       linkDraft.poolId
@@ -492,6 +518,9 @@ export default function App() {
             cnUrl: linkDraft.cnUrl,
             defaultUrl: linkDraft.defaultUrl,
           },
+      () =>
+        requestSequence === linkPrepareSequence.current &&
+        JSON.stringify(linkDraftRef.current) === JSON.stringify(submittedDraft),
     );
   }
   function beginDomainOperation() {
@@ -1048,8 +1077,8 @@ export default function App() {
       setRemoveAccount(null);
     }
   }
-  async function savePool(pool: Pool) {
-    return prepare("save_pool", { pool });
+  async function savePool(pool: Pool, shouldAccept?: () => boolean) {
+    return prepare("save_pool", { pool }, shouldAccept);
   }
   async function prepareMonitor(event: FormEvent) {
     event.preventDefault();
@@ -1118,6 +1147,14 @@ export default function App() {
     }
     if (action.kind === "delete_pool" && action.poolId) {
       await prepare("delete_pool", { poolId: action.poolId });
+      return;
+    }
+    if (
+      (action.kind === "resume_selftest_rotation" ||
+        action.kind === "recover_selftest_rotation") &&
+      action.accountId
+    ) {
+      await prepare(action.kind, { accountId: action.accountId });
       return;
     }
     if (action.kind === "resume_monitor" && action.accountId) {
@@ -1490,7 +1527,7 @@ export default function App() {
                 <strong>
                   有 {state.pendingActions.length} 项变更可继续处理
                 </strong>
-                <p>打开计划复核当前状态，再确认后续步骤。</p>
+                <p>打开计划复核当前状态，再确认后续步骤。应用不会在后台自动重试。</p>
                 {state.pendingActions.map((action, index) => (
                   <div
                     className="pending-action"
@@ -1501,8 +1538,13 @@ export default function App() {
                       className="button secondary"
                       disabled={
                         busy ||
-                        (!action.poolId && action.kind !== "resume_monitor") ||
-                        (!action.accountId && action.kind === "resume_monitor")
+                        ((action.kind === "resume_pool_sync" ||
+                          action.kind === "delete_pool") &&
+                          !action.poolId) ||
+                        ((action.kind === "resume_monitor" ||
+                          action.kind === "resume_selftest_rotation" ||
+                          action.kind === "recover_selftest_rotation") &&
+                          !action.accountId)
                       }
                       onClick={() => void resumePending(action)}
                     >
@@ -1510,6 +1552,10 @@ export default function App() {
                         ? "继续同步"
                         : action.kind === "resume_monitor"
                           ? "继续处理监测"
+                          : action.kind === "resume_selftest_rotation"
+                            ? "继续修复"
+                            : action.kind === "recover_selftest_rotation"
+                              ? "查看修复计划"
                           : "继续删除"}
                     </button>
                   </div>
@@ -1709,24 +1755,82 @@ export default function App() {
                                   </td>
                                   <td>
                                     <div className="route-lines">
-                                      <span>
-                                        <b>
-                                          {link.poolId ? "平台大陆" : "大陆"}
-                                        </b>
-                                        <span title={link.cnUrl}>
-                                          {link.cnUrl}
-                                        </span>
-                                      </span>
-                                      <span>
-                                        <b>
-                                          {link.poolId
-                                            ? "平台其他地区"
-                                            : "其他地区"}
-                                        </b>
-                                        <span title={link.defaultUrl}>
-                                          {link.defaultUrl}
-                                        </span>
-                                      </span>
+                                      {link.poolId ? (
+                                        (() => {
+                                          const pool = state.pools?.find(
+                                            (item) => item.id === link.poolId,
+                                          );
+                                          if (!pool)
+                                            return (
+                                              <span>
+                                                <b>平台地址</b>
+                                                <span>平台地址已移除</span>
+                                              </span>
+                                            );
+                                          const official = poolTargetUrl(
+                                            pool.official.prefix,
+                                            pool.official.suffix,
+                                            link.code,
+                                          );
+                                          const enabledCount =
+                                            pool.candidates.filter(
+                                              (candidate) => candidate.enabled,
+                                            ).length;
+                                          return (
+                                            <>
+                                              <span>
+                                                <b>官网链接</b>
+                                                <span title={official}>
+                                                  {official}
+                                                </span>
+                                              </span>
+                                              <details className="advanced">
+                                                <summary>
+                                                  大陆地址 · 已启用 {enabledCount} 个
+                                                </summary>
+                                                <div className="pool-health-row">
+                                                  {pool.candidates.map(
+                                                    (candidate, index) => {
+                                                      const url = poolTargetUrl(
+                                                        candidate.prefix,
+                                                        candidate.suffix,
+                                                        link.code,
+                                                      );
+                                                      return (
+                                                        <div key={candidate.id}>
+                                                          <strong>
+                                                            {index === 0
+                                                              ? "首选"
+                                                              : `备用 ${index}`}
+                                                            {!candidate.enabled &&
+                                                              "（已停用）"}
+                                                          </strong>{" "}
+                                                          · <code title={url}>{url}</code>
+                                                        </div>
+                                                      );
+                                                    },
+                                                  )}
+                                                </div>
+                                              </details>
+                                            </>
+                                          );
+                                        })()
+                                      ) : (
+                                        <>
+                                          <span>
+                                            <b>大陆</b>
+                                            <span title={link.cnUrl}>
+                                              {link.cnUrl}
+                                            </span>
+                                          </span>
+                                          <span>
+                                            <b>其他地区</b>
+                                            <span title={link.defaultUrl}>
+                                              {link.defaultUrl}
+                                            </span>
+                                          </span>
+                                        </>
+                                      )}
                                     </div>
                                   </td>
                                   <td className="date-cell">
@@ -2082,12 +2186,12 @@ export default function App() {
           title={originalSlug ? "编辑短链接" : "创建短链接"}
           eyebrow="LINK DETAILS"
           error={error}
-          onClose={() => setLinkDraft(null)}
+          onClose={closeLink}
           footer={
             <>
               <button
                 className="button ghost"
-                onClick={() => setLinkDraft(null)}
+                onClick={closeLink}
               >
                 取消
               </button>
@@ -2111,9 +2215,7 @@ export default function App() {
               所属域名
               <select
                 value={linkDraft.domainId}
-                onChange={(e) =>
-                  setLinkDraft({ ...linkDraft, domainId: e.target.value })
-                }
+                onChange={(e) => updateLinkDraft({ domainId: e.target.value })}
                 disabled={Boolean(originalSlug)}
                 required
               >
@@ -2128,9 +2230,7 @@ export default function App() {
               短链接名称
               <input
                 value={linkDraft.slug}
-                onChange={(e) =>
-                  setLinkDraft({ ...linkDraft, slug: e.target.value })
-                }
+                onChange={(e) => updateLinkDraft({ slug: e.target.value })}
                 placeholder="例如 welcome"
                 maxLength={32}
                 required
@@ -2146,7 +2246,7 @@ export default function App() {
               <button
                 type="button"
                 className={!linkDraft.poolId ? "selected" : ""}
-                onClick={() => setLinkDraft({ ...linkDraft, poolId: "" })}
+                onClick={() => updateLinkDraft({ poolId: "" })}
               >
                 手动填写
               </button>
@@ -2155,8 +2255,7 @@ export default function App() {
                 className={linkDraft.poolId ? "selected" : ""}
                 disabled={!state.pools?.length}
                 onClick={() =>
-                  setLinkDraft({
-                    ...linkDraft,
+                  updateLinkDraft({
                     poolId: linkDraft.poolId || state.pools?.[0]?.id || "",
                   })
                 }
@@ -2175,9 +2274,7 @@ export default function App() {
                   平台地址
                   <select
                     value={linkDraft.poolId}
-                    onChange={(e) =>
-                      setLinkDraft({ ...linkDraft, poolId: e.target.value })
-                    }
+                    onChange={(e) => updateLinkDraft({ poolId: e.target.value })}
                   >
                     {(state.pools || []).map((pool) => (
                       <option key={pool.id} value={pool.id}>
@@ -2190,16 +2287,14 @@ export default function App() {
                   此链接的邀请码
                   <input
                     value={linkDraft.code}
-                    onChange={(e) =>
-                      setLinkDraft({ ...linkDraft, code: e.target.value })
-                    }
+                    onChange={(e) => updateLinkDraft({ code: e.target.value })}
                     maxLength={128}
                     placeholder="例如 member_01"
                     required
                   />
                 </label>
                 <p className="form-note">
-                  这条链接使用选中的平台地址，并保留自己的邀请码。更改平台地址后，关联链接会一起更新。
+                  创建时会自动把所需平台配置同步到所选域名的账户；这条链接保留自己的邀请码。更改平台链接后，已关联短链接会一起更新。
                 </p>
               </>
             ) : (
@@ -2209,9 +2304,7 @@ export default function App() {
                   <input
                     type="url"
                     value={linkDraft.cnUrl}
-                    onChange={(e) =>
-                      setLinkDraft({ ...linkDraft, cnUrl: e.target.value })
-                    }
+                    onChange={(e) => updateLinkDraft({ cnUrl: e.target.value })}
                     placeholder="https://example.com/zh"
                     required
                   />
@@ -2221,9 +2314,7 @@ export default function App() {
                   <input
                     type="url"
                     value={linkDraft.defaultUrl}
-                    onChange={(e) =>
-                      setLinkDraft({ ...linkDraft, defaultUrl: e.target.value })
-                    }
+                    onChange={(e) => updateLinkDraft({ defaultUrl: e.target.value })}
                     placeholder="https://example.com/en"
                     required
                   />

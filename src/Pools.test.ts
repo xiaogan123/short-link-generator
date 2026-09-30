@@ -7,6 +7,7 @@ const base:Pool={id:'p1',name:'示例',official:{prefix:'https://example.com/pat
 describe('shared address templates',()=>{
   it('keeps codes in path or query and retains each code on composition',()=>{
     expect(poolValidation(base)).toBeNull();
+    expect(poolValidation({...base,accountIds:[]})).toBeNull();
     expect(composeTemplate(base.official.prefix,'one_1')).toBe('https://example.com/path/one_1');
     expect(composeTemplate(base.official.prefix,'two_2')).toBe('https://example.com/path/two_2');
   });

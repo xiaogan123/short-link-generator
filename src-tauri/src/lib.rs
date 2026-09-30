@@ -12,8 +12,9 @@ use futures_util::StreamExt;
 use hmac::{Hmac, Mac};
 use model::{
     Account, Candidate, Check, Database, DnsActionView, Domain, DomainCheck, DomainCheckLevel,
-    DomainDnsPreparation, DomainPreparation, Link, PendingMonitorChange, PendingPoolChange, Plan,
-    PlanKind, PlanView, Pool, PoolSyncStatus, Resources, State, Zone,
+    DomainDnsPreparation, DomainPreparation, Link, PendingMonitorChange, PendingPoolChange,
+    PendingSelftestRotation, Plan, PlanKind, PlanView, Pool, PoolSyncStatus, Resources,
+    SelftestRotationStatus, State, Zone,
 };
 use rand::{distributions::Alphanumeric, Rng, RngCore};
 use serde_json::{json, Value};
@@ -140,6 +141,13 @@ fn keyring_get(id: &str, kind: &str) -> Result<String, String> {
 fn keyring_set(id: &str, kind: &str, value: &str) -> Result<(), String> {
     #[cfg(test)]
     {
+        if mock_key_set_failures()
+            .lock()
+            .expect("test key set failures")
+            .contains(&format!("{kind}:{id}"))
+        {
+            return Err("测试注入：系统凭据保存失败".into());
+        }
         mock_keys()
             .lock()
             .expect("test key store")
@@ -202,6 +210,13 @@ fn mock_key_reads() -> &'static std::sync::Mutex<Vec<String>> {
     READS.get_or_init(|| std::sync::Mutex::new(Vec::new()))
 }
 
+#[cfg(test)]
+fn mock_key_set_failures() -> &'static std::sync::Mutex<HashSet<String>> {
+    static FAILURES: std::sync::OnceLock<std::sync::Mutex<HashSet<String>>> =
+        std::sync::OnceLock::new();
+    FAILURES.get_or_init(|| std::sync::Mutex::new(HashSet::new()))
+}
+
 async fn read_account_token(account_id: &str) -> Result<Zeroizing<String>, String> {
     let id = account_id.to_owned();
     // Native authorization can wait for user input. Keep it off async runtime workers;
@@ -209,6 +224,17 @@ async fn read_account_token(account_id: &str) -> Result<Zeroizing<String>, Strin
     tokio::task::spawn_blocking(move || keyring_get(&id, "token").map(Zeroizing::new))
         .await
         .map_err(|_| "系统授权未完成，请稍后重试".to_string())?
+}
+
+async fn read_optional_staged_selftest(
+    account_id: &str,
+) -> Result<Option<Zeroizing<String>>, String> {
+    let id = account_id.to_owned();
+    tokio::task::spawn_blocking(move || {
+        keyring_get_optional(&id, "selftest-pending").map(|value| value.map(Zeroizing::new))
+    })
+    .await
+    .map_err(|_| "系统授权未完成，请稍后重试".to_string())?
 }
 
 fn field<'a>(payload: &'a Value, name: &str) -> Result<&'a str, String> {
@@ -433,6 +459,9 @@ fn clear_journal(pending: &mut Vec<String>, id: &str) -> Result<(), String> {
     }
     Ok(())
 }
+fn selftest_rotation_prefix(account_id: &str) -> String {
+    format!("重置自检密钥 {account_id} (")
+}
 fn route_conflict(pattern: &str, host: &str, prefix: &str) -> bool {
     let p = pattern
         .trim_start_matches("http://")
@@ -594,6 +623,70 @@ impl Backend {
             return Err(error);
         }
         Ok(())
+    }
+
+    fn has_legacy_selftest_rotation(&self, account_id: &str) -> bool {
+        if self
+            .db
+            .pending_selftest_rotations
+            .iter()
+            .any(|pending| pending.account_id == account_id)
+        {
+            return false;
+        }
+        let prefix = selftest_rotation_prefix(account_id);
+        self.db.pending_operations.iter().any(|entry| {
+            entry.starts_with(&prefix)
+                && !self.db.pending_selftest_rotations.iter().any(|pending| {
+                    pending.account_id == account_id && journal_matches(entry, &pending.journal)
+                })
+        })
+    }
+
+    fn has_selftest_rotation(&self, account_id: &str) -> bool {
+        self.db
+            .pending_selftest_rotations
+            .iter()
+            .any(|pending| pending.account_id == account_id)
+            || self.has_legacy_selftest_rotation(account_id)
+    }
+
+    fn persist_rotation_mutation(
+        &mut self,
+        mutation: impl FnOnce(&mut Database) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let before = self.db.clone();
+        if let Err(error) = mutation(&mut self.db) {
+            self.db = before;
+            return Err(error);
+        }
+        if let Err(error) = self.persist() {
+            self.db = before;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn update_selftest_rotation(
+        &mut self,
+        account_id: &str,
+        status: SelftestRotationStatus,
+        note: &str,
+    ) -> Result<(), String> {
+        self.persist_rotation_mutation(|db| {
+            let pending = db
+                .pending_selftest_rotations
+                .iter_mut()
+                .find(|pending| pending.account_id == account_id)
+                .ok_or_else(|| "自检密钥恢复记录不存在".to_string())?;
+            pending.status = status;
+            let journal = pending.journal.clone();
+            set_journal_note(&mut db.pending_operations, &journal, note)?;
+            if let Some(account) = db.accounts.iter_mut().find(|a| a.id == account_id) {
+                account.needs_selftest_key = true;
+            }
+            Ok(())
+        })
     }
 
     async fn import_token(
@@ -1412,40 +1505,54 @@ impl Backend {
                 let domain_id = field(payload, "domainId")?.to_owned();
                 let domain = self.domain(&domain_id)?;
                 let slug = field(payload, "slug")?.to_owned();
-                let (cn_url, default_url, pool_id, code) =
-                    if let Some(pool_id) = payload["poolId"].as_str().filter(|s| !s.is_empty()) {
-                        let code = field(payload, "code")?;
-                        if !pools::valid_code(code) {
-                            return Err("邀请码无效".into());
-                        }
-                        let pool = self
-                            .db
-                            .pools
-                            .iter()
-                            .find(|p| p.id == pool_id)
-                            .ok_or("找不到此平台地址")?;
-                        if !pool.account_ids.contains(&domain.account_id) {
-                            return Err("此平台地址未授权给域名所属账号".into());
-                        }
-                        let candidate = pool
-                            .candidates
-                            .iter()
-                            .find(|c| c.enabled)
-                            .ok_or("这组平台地址没有已启用的大陆备用地址")?;
-                        (
-                            pools::compose(&model::Template::from(candidate), code)?,
-                            pools::compose(&pool.official, code)?,
-                            Some(pool_id.to_owned()),
-                            Some(code.to_owned()),
-                        )
-                    } else {
-                        (
-                            canonical_target(field(payload, "cnUrl")?)?,
-                            canonical_target(field(payload, "defaultUrl")?)?,
-                            None,
-                            None,
-                        )
-                    };
+                let (cn_url, default_url, pool_id, code) = if let Some(pool_id) =
+                    payload["poolId"].as_str().filter(|s| !s.is_empty())
+                {
+                    let code = field(payload, "code")?;
+                    if !pools::valid_code(code) {
+                        return Err("邀请码无效".into());
+                    }
+                    let pool = self
+                        .db
+                        .pools
+                        .iter()
+                        .find(|p| p.id == pool_id)
+                        .ok_or("找不到此平台地址")?;
+                    if self
+                        .db
+                        .pending_pool_changes
+                        .iter()
+                        .any(|p| p.pool.id == pool_id)
+                    {
+                        return Err("这组平台地址有未完成的更新，请先继续处理后再创建链接".into());
+                    }
+                    if self
+                        .db
+                        .pending_monitor_changes
+                        .iter()
+                        .any(|p| p.account_id == domain.account_id)
+                    {
+                        return Err("此域名账户的检测设置尚未完成，请先继续处理".into());
+                    }
+                    let candidate = pool
+                        .candidates
+                        .iter()
+                        .find(|c| c.enabled)
+                        .ok_or("这组平台地址没有已启用的大陆备用地址")?;
+                    (
+                        pools::compose(&model::Template::from(candidate), code)?,
+                        pools::compose(&pool.official, code)?,
+                        Some(pool_id.to_owned()),
+                        Some(code.to_owned()),
+                    )
+                } else {
+                    (
+                        canonical_target(field(payload, "cnUrl")?)?,
+                        canonical_target(field(payload, "defaultUrl")?)?,
+                        None,
+                        None,
+                    )
+                };
                 validate_slug(&slug)?;
                 let existing = self
                     .db
@@ -1463,7 +1570,7 @@ impl Backend {
                             .map(|pool| pool.name.as_str())
                             .unwrap_or(pool_id);
                         format!(
-                            "为 {} 的短码 {} 保存平台地址“{}”和邀请码 {}",
+                            "为 {} 的短码 {} 保存平台地址“{}”和邀请码 {}；自动将所需平台配置同步到此域名所属账户",
                             domain.host, slug, pool_name, code
                         )
                     } else {
@@ -1489,6 +1596,27 @@ impl Backend {
                     .map_err(|_| "平台地址数据格式无效".to_string())?;
                 if pool.id.is_empty() {
                     pool.id = random_id();
+                }
+                // The platform library is global. Account IDs are deployment
+                // receipts maintained here, never an authorization list supplied
+                // by the form. Preserve every prior deployment and live reference.
+                pool.account_ids = self
+                    .db
+                    .pools
+                    .iter()
+                    .find(|p| p.id == pool.id)
+                    .map(|p| p.account_ids.clone())
+                    .unwrap_or_default();
+                for link in self
+                    .db
+                    .links
+                    .iter()
+                    .filter(|l| l.pool_id.as_deref() == Some(pool.id.as_str()))
+                {
+                    let account_id = self.domain(&link.domain_id)?.account_id.clone();
+                    if !pool.account_ids.contains(&account_id) {
+                        pool.account_ids.push(account_id);
+                    }
                 }
                 if self
                     .db
@@ -1525,7 +1653,7 @@ impl Backend {
                 (
                     "保存平台地址",
                     vec![format!(
-                        "将平台地址“{}”同步到 {accounts} 个账号；现有 {refs} 条链接会使用更新后的设置",
+                        "保存全局平台地址“{}”，所有账户和域名均可选用；更新已使用的 {accounts} 个账户，现有 {refs} 条链接会使用新地址",
                         pool.name
                     )],
                     if refs > 0 {
@@ -1639,6 +1767,9 @@ impl Backend {
             "cleanup_account" => {
                 let id = field(payload, "accountId")?.to_owned();
                 let account = self.account(&id)?;
+                if self.has_selftest_rotation(&id) {
+                    return Err("此账号的自检密钥轮换尚未完成，请先从待处理操作恢复".into());
+                }
                 let resources = account.resources.as_ref().ok_or("此账号没有已登记资源")?;
                 if self.db.domains.iter().any(|d| d.account_id == id) {
                     return Err("此账号还有域名，请先移除域名".into());
@@ -1656,6 +1787,9 @@ impl Backend {
             "recover_account" => {
                 let id = field(payload, "accountId")?.to_owned();
                 self.account(&id)?;
+                if self.has_selftest_rotation(&id) {
+                    return Err("此账号的自检密钥轮换尚未完成，请先从待处理操作恢复".into());
+                }
                 (
                     "从账号找回",
                     vec![
@@ -1672,14 +1806,77 @@ impl Backend {
                 if account.resources.is_none() {
                     return Err("账号尚未创建专用转发程序".into());
                 }
+                if self.has_selftest_rotation(&id) {
+                    return Err("此账号已有未完成的自检密钥轮换，请从待处理操作恢复".into());
+                }
                 (
                     "重置自检密钥",
                     vec![
-                        "生成新密钥并更新云端转发程序".into(),
-                        "把新密钥存入系统凭据库".into(),
+                        "先把新密钥安全暂存到系统凭据库".into(),
+                        "验证云端资源后更新转发程序密钥".into(),
+                        "确认云端成功后启用本机密钥".into(),
                     ],
                     vec!["其他设备保存的旧自检密钥将失效".into()],
                     PlanKind::RotateSelftest { account_id: id },
+                )
+            }
+            "resume_selftest_rotation" => {
+                let id = field(payload, "accountId")?.to_owned();
+                let pending = self
+                    .db
+                    .pending_selftest_rotations
+                    .iter()
+                    .find(|pending| pending.account_id == id)
+                    .ok_or("此账号没有可恢复的自检密钥轮换")?;
+                let account = self.account(&id)?;
+                let resources = account.resources.as_ref().ok_or("账号没有 Worker")?;
+                if pending.script != resources.script || pending.namespace != resources.namespace {
+                    return Err("账号云端资源已变化，不能继续旧的自检密钥轮换".into());
+                }
+                (
+                    "恢复自检密钥轮换",
+                    vec![
+                        "读取系统凭据库中上次安全暂存的同一密钥".into(),
+                        if pending.status == SelftestRotationStatus::CloudApplied {
+                            "云端已确认更新，仅完成本机密钥启用".into()
+                        } else {
+                            "重新核对云端资源并用同一暂存密钥完成更新".into()
+                        },
+                    ],
+                    vec!["仅在确认此计划后继续，不会在后台自动重试".into()],
+                    PlanKind::ResumeSelftestRotation { account_id: id },
+                )
+            }
+            "recover_selftest_rotation" => {
+                let id = field(payload, "accountId")?.to_owned();
+                let account = self.account(&id)?;
+                let resources = account.resources.as_ref().ok_or("账号没有 Worker")?;
+                let missing_staging = self
+                    .db
+                    .pending_selftest_rotations
+                    .iter()
+                    .find(|pending| pending.account_id == id)
+                    .filter(|pending| pending.status == SelftestRotationStatus::StagingMissing);
+                if missing_staging.is_none() && !self.has_legacy_selftest_rotation(&id) {
+                    return Err("此账号没有需要旧版恢复的自检密钥操作".into());
+                }
+                if missing_staging.is_some_and(|pending| {
+                    pending.script != resources.script || pending.namespace != resources.namespace
+                }) {
+                    return Err("账号云端资源已变化，不能恢复旧的自检密钥轮换".into());
+                }
+                (
+                    "重新建立自检密钥",
+                    vec![
+                        "原操作没有可恢复的暂存密钥，将生成新密钥并先安全暂存".into(),
+                        "验证云端资源后用新密钥覆盖无法确认的旧值".into(),
+                        "确认云端成功后启用本机密钥".into(),
+                    ],
+                    vec![
+                        "此恢复会使其他设备保存的旧自检密钥失效".into(),
+                        "仅在确认此计划后写入云端".into(),
+                    ],
+                    PlanKind::RecoverSelftestRotation { account_id: id },
                 )
             }
             _ => return Err("不支持此变更类型".into()),
@@ -1734,6 +1931,7 @@ impl Backend {
                                 .as_ref()
                                 .is_some_and(|old| old.account_ids.iter().any(|a| a == id))
                     })
+                    || self.has_selftest_rotation(id)
                 {
                     return Err("此账号有未完成的云端操作，请先在待处理操作中恢复".into());
                 }
@@ -2206,7 +2404,15 @@ impl Backend {
     }
 
     async fn import_config(&mut self, json_text: &str) -> Result<Value, String> {
-        if !self.db.pending_monitor_changes.is_empty() || !self.db.pending_pool_changes.is_empty() {
+        if !self.db.pending_monitor_changes.is_empty()
+            || !self.db.pending_pool_changes.is_empty()
+            || !self.db.pending_selftest_rotations.is_empty()
+            || self
+                .db
+                .accounts
+                .iter()
+                .any(|account| self.has_legacy_selftest_rotation(&account.id))
+        {
             return Err("请先恢复未完成的云端操作再导入备份".into());
         }
         if json_text.len() > 2_000_000 {
@@ -2693,6 +2899,12 @@ impl Backend {
             PlanKind::CleanupAccount { account_id } => self.apply_cleanup(&account_id).await,
             PlanKind::RecoverAccount { account_id } => self.recover_account(&account_id).await,
             PlanKind::RotateSelftest { account_id } => self.apply_rotate(&account_id).await,
+            PlanKind::ResumeSelftestRotation { account_id } => {
+                self.resume_selftest_rotation(&account_id).await
+            }
+            PlanKind::RecoverSelftestRotation { account_id } => {
+                self.apply_legacy_selftest_recovery(&account_id).await
+            }
         }
     }
 
@@ -2978,12 +3190,10 @@ impl Backend {
         let domain = self.domain(domain_id)?.clone();
         let token = keyring_get(&domain.account_id, "token")?;
         let resources = self.ensure_domain_owned(&domain, &token).await?;
-        if let (Some(pool_id), Some(code)) = (pool_id, code) {
+        if let (Some(_), Some(code)) = (pool_id, code) {
             if !pools::valid_code(code) {
                 return Err("邀请码无效".into());
             }
-            self.ensure_pool_on_account(pool_id, &domain.account_id, &token, &resources)
-                .await?;
         }
         let key = format!("l:{}:{slug}", domain.host);
         let previous = self
@@ -3005,6 +3215,10 @@ impl Backend {
             if !remote_matches_link(&remote, local) {
                 return Err("云端链接目标已变化，请先找回".into());
             }
+        }
+        if let Some(pool_id) = pool_id {
+            self.ensure_pool_on_account(pool_id, &domain.account_id, &token, &resources)
+                .await?;
         }
         let link = Link {
             domain_id: domain_id.into(),
@@ -3058,36 +3272,108 @@ impl Backend {
         token: &str,
         resources: &Resources,
     ) -> Result<(), String> {
-        let pool = self
+        if self
+            .db
+            .pending_pool_changes
+            .iter()
+            .any(|p| p.pool.id == pool_id)
+        {
+            return Err("这组平台地址有未完成的更新，请先继续处理".into());
+        }
+        if self
+            .db
+            .pending_monitor_changes
+            .iter()
+            .any(|p| p.account_id == account_id)
+        {
+            return Err("此账户的检测设置尚未完成，请先继续处理".into());
+        }
+        let previous = self
             .db
             .pools
             .iter()
             .find(|p| p.id == pool_id)
             .cloned()
             .ok_or("找不到平台地址")?;
+        let mut pool = previous.clone();
         if !pool.account_ids.iter().any(|id| id == account_id) {
-            return Err("平台地址未授权给此账号".into());
+            pool.account_ids.push(account_id.to_owned());
         }
+        pools::validate_pool(&pool)?;
         let key = format!("p:{pool_id}");
         let remote = self
             .cloud
             .read_value(token, account_id, &resources.namespace, &key)
             .await
             .map_err(problem)?;
-        if let Some(raw) = remote {
-            let value: Value = serde_json::from_str(&raw).map_err(|_| "云端平台地址格式无效")?;
+        if let Some(raw) = &remote {
+            let value: Value = serde_json::from_str(raw).map_err(|_| "云端平台地址格式无效")?;
             if !pools::matching_cloud_value(&pool, &value) {
-                return Err("云端平台地址与本机版本不同，请先修复同步状态".into());
+                return Err(
+                    "云端平台地址与本机版本不同，请先找回或恢复同步，软件不会覆盖它".into(),
+                );
             }
-        } else {
-            let journal = format!(
-                "首次同步平台地址 {} / {} ({})",
-                pool_id,
-                account_id,
-                random_id()
-            );
-            self.journal_start(&journal)?;
-            if let Err(e) = self
+        } else if previous
+            .sync_status
+            .iter()
+            .any(|s| s.account_id == account_id && s.status == "synced")
+        {
+            return Err("已使用的平台地址在云端缺失，请先核对".into());
+        }
+        let monitor = self
+            .monitor_config_for(account_id, token, &resources.namespace, pool_id)
+            .await?;
+        let mut monitor_update = None;
+        if let Some(mut projected) = monitor {
+            let ids = projected["poolIds"]
+                .as_array_mut()
+                .ok_or("检测平台清单无效")?;
+            if !ids.iter().any(|id| id.as_str() == Some(pool_id)) {
+                ids.push(Value::String(pool_id.to_owned()));
+                validate_monitor_config(&projected)?;
+                monitor_update = Some(projected);
+            }
+        }
+        if remote.is_some()
+            && monitor_update.is_none()
+            && previous.account_ids.iter().any(|id| id == account_id)
+            && previous
+                .sync_status
+                .iter()
+                .any(|s| s.account_id == account_id && s.status == "synced")
+        {
+            return Ok(());
+        }
+        pool.sync_status.retain(|s| s.account_id != account_id);
+        pool.sync_status.push(PoolSyncStatus {
+            account_id: account_id.to_owned(),
+            status: "unsynced".into(),
+            message: "正在配置到当前域名账户".into(),
+        });
+        let journal = format!(
+            "首次同步平台地址 {} / {} ({})",
+            pool_id,
+            account_id,
+            random_id()
+        );
+        let before = self.db.clone();
+        self.db.pending_operations.push(journal.clone());
+        self.db.pending_pool_changes.push(PendingPoolChange {
+            pool: pool.clone(),
+            previous: Some(previous),
+            journal: journal.clone(),
+            deleting: false,
+        });
+        self.db.pools.retain(|p| p.id != pool_id);
+        self.db.pools.push(pool.clone());
+        // Persist resumable intent before the first cloud mutation. Other accounts
+        // are not read or modified by first use on this domain.
+        if let Err(error) = self.persist() {
+            self.db = before;
+            return Err(error);
+        }
+        if remote.is_none() {
+            if let Err(error) = self
                 .cloud
                 .write_value(
                     token,
@@ -3098,25 +3384,59 @@ impl Backend {
                 )
                 .await
             {
-                self.journal_note(&journal, "平台地址首次写入未完成")?;
-                return Err(e.message);
+                let status = self
+                    .db
+                    .pools
+                    .iter_mut()
+                    .find(|p| p.id == pool_id)
+                    .and_then(|p| {
+                        p.sync_status
+                            .iter_mut()
+                            .find(|s| s.account_id == account_id)
+                    })
+                    .ok_or("平台同步状态丢失")?;
+                status.status = if error.uncertain { "unknown" } else { "failed" }.into();
+                status.message = "配置尚未完成，请继续处理平台更新后再保存链接".into();
+                self.journal_note(&journal, "平台地址写入尚未确认；短链接未保存")?;
+                return Err(error.message);
             }
-            if let Some(status) = self
-                .db
-                .pools
-                .iter_mut()
-                .find(|p| p.id == pool_id)
-                .and_then(|p| {
-                    p.sync_status
-                        .iter_mut()
-                        .find(|s| s.account_id == account_id)
-                })
+        }
+        if let Some(monitor) = monitor_update {
+            if let Err(error) = self
+                .cloud
+                .write_value(
+                    token,
+                    account_id,
+                    &resources.namespace,
+                    "m:monitor",
+                    &monitor.to_string(),
+                )
+                .await
             {
-                status.status = "synced".into();
-                status.message = "首次使用时已同步".into();
+                self.journal_note(&journal, "平台地址已配置，检测清单尚未确认；短链接未保存")?;
+                return Err(error.message);
             }
-            self.persist()?;
-            self.journal_end(&journal)?;
+        }
+        let before_finish = self.db.clone();
+        let status = self
+            .db
+            .pools
+            .iter_mut()
+            .find(|p| p.id == pool_id)
+            .and_then(|p| {
+                p.sync_status
+                    .iter_mut()
+                    .find(|s| s.account_id == account_id)
+            })
+            .ok_or("平台同步状态丢失")?;
+        status.status = "synced".into();
+        status.message = "已用于此账户".into();
+        self.db
+            .pending_pool_changes
+            .retain(|p| p.pool.id != pool_id);
+        if let Err(error) = self.journal_end(&journal) {
+            self.db = before_finish;
+            return Err(error);
         }
         Ok(())
     }
@@ -4042,6 +4362,9 @@ impl Backend {
     }
 
     async fn apply_cleanup(&mut self, account_id: &str) -> Result<(), String> {
+        if self.has_selftest_rotation(account_id) {
+            return Err("此账号的自检密钥轮换尚未完成，请先从待处理操作恢复".into());
+        }
         if self.db.domains.iter().any(|d| d.account_id == account_id) {
             return Err("此账号仍有域名".into());
         }
@@ -4136,64 +4459,282 @@ impl Backend {
     }
 
     async fn apply_rotate(&mut self, account_id: &str) -> Result<(), String> {
+        self.start_selftest_rotation(account_id, false).await
+    }
+
+    async fn apply_legacy_selftest_recovery(&mut self, account_id: &str) -> Result<(), String> {
+        self.start_selftest_rotation(account_id, true).await
+    }
+
+    async fn start_selftest_rotation(
+        &mut self,
+        account_id: &str,
+        recovering_legacy: bool,
+    ) -> Result<(), String> {
         let resources = self
             .account(account_id)?
             .resources
             .clone()
             .ok_or("账号没有 Worker")?;
-        let token = keyring_get(account_id, "token")?;
-        self.verify_resource_source(&token, account_id, &resources)
-            .await?;
-        // A successful manifest and binding read are required before a secret write.
-        let manifest = self
-            .cloud
-            .read_value(&token, account_id, &resources.namespace, MANIFEST_KEY)
-            .await
-            .map_err(problem)?
-            .ok_or("云端资源清单缺失")?;
-        let parsed: Value =
-            serde_json::from_str(&manifest).map_err(|_| "云端资源清单损坏".to_string())?;
-        if parsed["accountId"] != account_id
-            || parsed["script"] != resources.script
-            || parsed["namespace"] != resources.namespace
+        let missing_staging = self
+            .db
+            .pending_selftest_rotations
+            .iter()
+            .find(|pending| pending.account_id == account_id)
+            .is_some_and(|pending| pending.status == SelftestRotationStatus::StagingMissing);
+        if self
+            .db
+            .pending_selftest_rotations
+            .iter()
+            .any(|pending| pending.account_id == account_id)
+            && !(recovering_legacy && missing_staging)
         {
-            return Err("云端资源归属不匹配".into());
+            return Err("此账号已有未完成的自检密钥轮换，请从待处理操作恢复".into());
         }
-        self.cloud
-            .script_settings(&token, account_id, &resources.script)
-            .await
-            .map_err(problem)?;
-        let mut key = [0_u8; 32];
-        rand::thread_rng().fill_bytes(&mut key);
-        let new_hex = hex::encode(key);
-        let journal = format!("重置自检密钥 {} ({})", account_id, random_id());
-        self.journal_start(&journal)?;
-        clear_credential_cache();
-        if let Err(e) = self
-            .cloud
-            .rotate_secret(&token, account_id, &resources.script, &new_hex)
-            .await
-        {
-            if e.uncertain {
-                self.journal_note(&journal, "密钥更新结果不确定")?;
+        if !missing_staging && recovering_legacy != self.has_legacy_selftest_rotation(account_id) {
+            return Err(if recovering_legacy {
+                "此账号没有需要旧版恢复的自检密钥操作"
             } else {
-                self.journal_end(&journal)?;
+                "此账号有未完成的旧版自检密钥操作，请从待处理操作恢复"
             }
-            return Err(e.message);
+            .into());
         }
-        if let Err(e) = keyring_set(account_id, "selftest", &new_hex) {
-            self.journal_note(&journal, "云端已更换密钥，但本机凭据保存失败")?;
-            return Err(e);
+
+        let mut key = Zeroizing::new([0_u8; 32]);
+        rand::thread_rng().fill_bytes(&mut *key);
+        let new_hex = Zeroizing::new(hex::encode(key.as_slice()));
+        keyring_set(account_id, "selftest-pending", &new_hex)?;
+
+        let saved = if missing_staging {
+            self.persist_rotation_mutation(|db| {
+                let pending = db
+                    .pending_selftest_rotations
+                    .iter_mut()
+                    .find(|pending| pending.account_id == account_id)
+                    .ok_or_else(|| "自检密钥恢复记录不存在".to_string())?;
+                pending.status = SelftestRotationStatus::Staged;
+                let journal = pending.journal.clone();
+                set_journal_note(
+                    &mut db.pending_operations,
+                    &journal,
+                    "已重新安全暂存密钥，等待确认云端更新",
+                )?;
+                Ok(())
+            })
+        } else {
+            let journal = format!("重置自检密钥 {} ({})", account_id, random_id());
+            let pending = PendingSelftestRotation {
+                account_id: account_id.into(),
+                script: resources.script,
+                namespace: resources.namespace,
+                journal: journal.clone(),
+                status: SelftestRotationStatus::Staged,
+            };
+            self.persist_rotation_mutation(|db| {
+                db.pending_selftest_rotations.push(pending);
+                db.pending_operations.push(journal);
+                Ok(())
+            })
+        };
+        if let Err(error) = saved {
+            let _ = keyring_delete(account_id, "selftest-pending");
+            return Err(error);
         }
-        if let Some(a) = self.db.accounts.iter_mut().find(|a| a.id == account_id) {
-            a.needs_selftest_key = false;
+
+        self.resume_selftest_rotation(account_id).await
+    }
+
+    fn rotation_failure(
+        &mut self,
+        account_id: &str,
+        status: SelftestRotationStatus,
+        note: &str,
+        error: String,
+    ) -> String {
+        match self.update_selftest_rotation(account_id, status, note) {
+            Ok(()) => error,
+            Err(persist_error) => format!("{error}；恢复状态保存失败：{persist_error}"),
         }
-        self.persist()?;
-        self.journal_end(&journal)
+    }
+
+    async fn resume_selftest_rotation(&mut self, account_id: &str) -> Result<(), String> {
+        let pending = self
+            .db
+            .pending_selftest_rotations
+            .iter()
+            .find(|pending| pending.account_id == account_id)
+            .cloned()
+            .ok_or("此账号没有可恢复的自检密钥轮换")?;
+        let resources = self
+            .account(account_id)?
+            .resources
+            .clone()
+            .ok_or("账号没有 Worker")?;
+        if pending.script != resources.script || pending.namespace != resources.namespace {
+            return Err("账号云端资源已变化，不能继续旧的自检密钥轮换".into());
+        }
+
+        let staged = match read_optional_staged_selftest(account_id).await {
+            Ok(Some(staged)) => staged,
+            Ok(None) => {
+                return Err(self.rotation_failure(
+                    account_id,
+                    SelftestRotationStatus::StagingMissing,
+                    "安全暂存密钥缺失，需要明确确认后重新建立",
+                    "系统凭据库中找不到安全暂存密钥".into(),
+                ));
+            }
+            Err(error) => {
+                return Err(self.rotation_failure(
+                    account_id,
+                    pending.status.clone(),
+                    "无法读取安全暂存密钥，已停止恢复",
+                    error,
+                ));
+            }
+        };
+
+        if pending.status != SelftestRotationStatus::CloudApplied {
+            let token = read_account_token(account_id).await.map_err(|error| {
+                self.rotation_failure(
+                    account_id,
+                    SelftestRotationStatus::DefinitiveFailure,
+                    "读取访问令牌失败，尚未写入云端",
+                    error,
+                )
+            })?;
+            if let Err(error) = self
+                .verify_resource_source(&token, account_id, &resources)
+                .await
+            {
+                return Err(self.rotation_failure(
+                    account_id,
+                    SelftestRotationStatus::DefinitiveFailure,
+                    "云端资源预检失败，尚未更新密钥",
+                    error,
+                ));
+            }
+            let manifest = match self
+                .cloud
+                .read_value(&token, account_id, &resources.namespace, MANIFEST_KEY)
+                .await
+            {
+                Ok(Some(manifest)) => manifest,
+                Ok(None) => {
+                    return Err(self.rotation_failure(
+                        account_id,
+                        SelftestRotationStatus::DefinitiveFailure,
+                        "云端资源清单缺失，尚未更新密钥",
+                        "云端资源清单缺失".into(),
+                    ));
+                }
+                Err(error) => {
+                    return Err(self.rotation_failure(
+                        account_id,
+                        SelftestRotationStatus::DefinitiveFailure,
+                        "读取云端资源清单失败，尚未更新密钥",
+                        error.message,
+                    ));
+                }
+            };
+            let parsed: Value = match serde_json::from_str(&manifest) {
+                Ok(parsed) => parsed,
+                Err(_) => {
+                    return Err(self.rotation_failure(
+                        account_id,
+                        SelftestRotationStatus::DefinitiveFailure,
+                        "云端资源清单损坏，尚未更新密钥",
+                        "云端资源清单损坏".into(),
+                    ));
+                }
+            };
+            if parsed["accountId"] != account_id
+                || parsed["script"] != resources.script
+                || parsed["namespace"] != resources.namespace
+            {
+                return Err(self.rotation_failure(
+                    account_id,
+                    SelftestRotationStatus::DefinitiveFailure,
+                    "云端资源归属不匹配，尚未更新密钥",
+                    "云端资源归属不匹配".into(),
+                ));
+            }
+            if let Err(error) = self
+                .cloud
+                .script_settings(&token, account_id, &resources.script)
+                .await
+            {
+                return Err(self.rotation_failure(
+                    account_id,
+                    SelftestRotationStatus::DefinitiveFailure,
+                    "读取 Worker 绑定失败，尚未更新密钥",
+                    error.message,
+                ));
+            }
+            if let Err(error) = self
+                .cloud
+                .rotate_secret(&token, account_id, &resources.script, &staged)
+                .await
+            {
+                let (status, note) = if error.uncertain {
+                    (
+                        SelftestRotationStatus::Uncertain,
+                        "云端密钥更新结果不确定，等待人工确认恢复",
+                    )
+                } else {
+                    (
+                        SelftestRotationStatus::DefinitiveFailure,
+                        "云端拒绝密钥更新，等待人工确认恢复",
+                    )
+                };
+                return Err(self.rotation_failure(account_id, status, note, error.message));
+            }
+            self.update_selftest_rotation(
+                account_id,
+                SelftestRotationStatus::CloudApplied,
+                "云端密钥已更新，正在启用本机密钥",
+            )?;
+        }
+
+        if let Err(error) = keyring_set(account_id, "selftest", &staged) {
+            return Err(self.rotation_failure(
+                account_id,
+                SelftestRotationStatus::CloudApplied,
+                "云端已更新，本机密钥启用失败",
+                error,
+            ));
+        }
+
+        let prefix = selftest_rotation_prefix(account_id);
+        self.persist_rotation_mutation(|db| {
+            if !db
+                .pending_selftest_rotations
+                .iter()
+                .any(|pending| pending.account_id == account_id)
+            {
+                return Err("自检密钥恢复记录不存在".into());
+            }
+            db.pending_selftest_rotations
+                .retain(|pending| pending.account_id != account_id);
+            db.pending_operations
+                .retain(|entry| !entry.starts_with(&prefix));
+            let account = db
+                .accounts
+                .iter_mut()
+                .find(|account| account.id == account_id)
+                .ok_or_else(|| "找不到此账号".to_string())?;
+            account.needs_selftest_key = false;
+            Ok(())
+        })?;
+        let _ = keyring_delete(account_id, "selftest-pending");
+        Ok(())
     }
 
     async fn recover_account(&mut self, account_id: &str) -> Result<(), String> {
-        if !self.db.pending_monitor_changes.is_empty() || !self.db.pending_pool_changes.is_empty() {
+        if !self.db.pending_monitor_changes.is_empty()
+            || !self.db.pending_pool_changes.is_empty()
+            || self.has_selftest_rotation(account_id)
+        {
             return Err("请先恢复未完成的云端操作再找回账号".into());
         }
         let token = keyring_get(account_id, "token")?;
@@ -4483,6 +5024,9 @@ impl Backend {
     ) -> Result<Option<SelftestSnapshot>, String> {
         validate_slug(slug)?;
         let domain = self.domain(domain_id)?;
+        if self.has_selftest_rotation(&domain.account_id) {
+            return Ok(None);
+        }
         let link = self
             .db
             .links
@@ -5003,6 +5547,8 @@ mod tests {
             .await;
         let server = MockServer::start().await;
         let dir = tempfile::tempdir().unwrap();
+        mock_keys().lock().unwrap().clear();
+        mock_key_set_failures().lock().unwrap().clear();
         keyring_set("acct1", "token", "test-token-value").unwrap();
         keyring_set("acct1", "selftest", &"a1".repeat(32)).unwrap();
         mock_key_reads().lock().unwrap().clear();
@@ -5036,6 +5582,7 @@ mod tests {
                 pools: vec![],
                 pending_pool_changes: vec![],
                 pending_monitor_changes: vec![],
+                pending_selftest_rotations: vec![],
                 pending_operations: vec![],
             },
             path: dir.path().join("state.json"),
@@ -5114,6 +5661,21 @@ mod tests {
                 ResponseTemplate::new(200)
                     .set_body_raw(source.as_bytes().to_vec(), "application/javascript"),
             )
+            .mount(server)
+            .await;
+    }
+    async fn mount_selftest_rotation(server: &MockServer, status: u16) {
+        let response = if status == 200 {
+            ok(json!({}))
+        } else {
+            ResponseTemplate::new(status)
+        };
+        Mock::given(method("PUT"))
+            .and(path(
+                "/client/v4/accounts/acct1/workers/scripts/edge-one/secrets",
+            ))
+            .respond_with(response)
+            .expect(1)
             .mount(server)
             .await;
     }
@@ -7048,6 +7610,343 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn global_pool_is_saved_locally_without_account_permission_selection() {
+        let (server, mut backend, _dir) = fixture().await;
+        let mut pool = sample_pool();
+        pool.account_ids = vec!["unrelated-account".into()];
+        let plan = backend
+            .prepare_change(&json!({"kind":"save_pool","pool":pool}))
+            .unwrap();
+        backend
+            .dispatch("apply_plan", &json!({"planId":plan["id"]}))
+            .await
+            .unwrap();
+        assert!(backend.db.pools[0].account_ids.is_empty());
+        assert!(backend.db.pending_pool_changes.is_empty());
+        assert!(server.received_requests().await.unwrap().is_empty());
+        assert!(mock_key_reads().lock().unwrap().is_empty());
+        backend.db.pools[0].account_ids.push("acct1".into());
+        let mut edited = backend.db.pools[0].clone();
+        edited.account_ids.clear();
+        edited.name = "更新名称".into();
+        backend
+            .prepare_change(&json!({"kind":"save_pool","pool":edited}))
+            .unwrap();
+        let PlanKind::SavePool { pool: planned } = &backend.plans.last().unwrap().kind else {
+            panic!("wrong plan")
+        };
+        assert_eq!(planned.account_ids, vec!["acct1"]);
+    }
+
+    #[tokio::test]
+    async fn global_pool_first_link_syncs_only_its_domain_account_before_link() {
+        let (server, mut backend, _dir) = fixture().await;
+        backend.db.domains.push(domain());
+        let mut pool = sample_pool();
+        pool.account_ids.clear();
+        backend.db.pools.push(pool);
+        let mut other = backend.db.accounts[0].clone();
+        other.id = "acct2".into();
+        backend.db.accounts.push(other);
+        mount_resource(&server, include_str!("../../edge/worker.mjs")).await;
+        mount_owned_domain(&server).await;
+        for name in ["p%3Apool1", "l%3Aexample.com%3Aglobal"] {
+            let target =
+                format!("/client/v4/accounts/acct1/storage/kv/namespaces/ns1/values/{name}");
+            Mock::given(method("GET"))
+                .and(path(target.clone()))
+                .respond_with(ResponseTemplate::new(404))
+                .mount(&server)
+                .await;
+            Mock::given(method("PUT"))
+                .and(path(target))
+                .respond_with(ok(json!({})))
+                .mount(&server)
+                .await;
+        }
+        let plan = backend.prepare_change(&json!({"kind":"save_link","domainId":"domain1","slug":"global","poolId":"pool1","code":"DEMO"})).unwrap();
+        assert!(server.received_requests().await.unwrap().is_empty());
+        backend
+            .dispatch("apply_plan", &json!({"planId":plan["id"]}))
+            .await
+            .unwrap();
+        assert_eq!(backend.db.links[0].code.as_deref(), Some("DEMO"));
+        assert_eq!(backend.db.pools[0].account_ids, vec!["acct1"]);
+        assert_eq!(backend.db.pools[0].sync_status[0].status, "synced");
+        assert!(backend.db.pending_pool_changes.is_empty());
+        let req = server.received_requests().await.unwrap();
+        assert!(req.iter().all(|r| !r.url.path().contains("acct2")));
+        let writes: Vec<_> = req.iter().filter(|r| r.method.as_str() == "PUT").collect();
+        assert_eq!(writes.len(), 2);
+        assert!(writes[0].url.path().ends_with("p%3Apool1"));
+        assert!(writes[1].url.path().ends_with("l%3Aexample.com%3Aglobal"));
+        assert!(!mock_key_reads()
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|id| id.contains("acct2")));
+    }
+
+    #[tokio::test]
+    async fn global_pool_failed_first_use_keeps_intent_and_does_not_write_link() {
+        let (server, mut backend, _dir) = fixture().await;
+        backend.db.domains.push(domain());
+        let mut pool = sample_pool();
+        pool.account_ids.clear();
+        backend.db.pools.push(pool);
+        mount_resource(&server, include_str!("../../edge/worker.mjs")).await;
+        mount_owned_domain(&server).await;
+        Mock::given(method("GET"))
+            .and(path_regex("/values/(p%3Apool1|l%3Aexample.com%3Aglobal)$"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path_regex("/values/p%3Apool1$"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        let plan = backend.prepare_change(&json!({"kind":"save_link","domainId":"domain1","slug":"global","poolId":"pool1","code":"DEMO"})).unwrap();
+        assert!(backend
+            .dispatch("apply_plan", &json!({"planId":plan["id"]}))
+            .await
+            .unwrap_err()
+            .contains("503"));
+        assert!(backend.db.links.is_empty());
+        assert_eq!(backend.db.pending_pool_changes.len(), 1);
+        let disk: Database = serde_json::from_slice(&fs::read(&backend.path).unwrap()).unwrap();
+        assert_eq!(disk.pending_pool_changes.len(), 1);
+        assert!(server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .all(|r| r.method.as_str() != "PUT" || r.url.path().ends_with("p%3Apool1")));
+        assert!(backend.prepare_change(&json!({"kind":"save_link","domainId":"domain1","slug":"global","poolId":"pool1","code":"DEMO"})).is_err());
+        server.reset().await;
+        mount_resource(&server, include_str!("../../edge/worker.mjs")).await;
+        let pending = backend.db.pending_pool_changes[0].pool.clone();
+        Mock::given(method("GET"))
+            .and(path_regex("/values/p%3Apool1$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(pools::cloud_value(&pending).to_string()),
+            )
+            .mount(&server)
+            .await;
+        backend.apply_save_pool(pending).await.unwrap();
+        assert!(backend.db.pending_pool_changes.is_empty());
+        assert_eq!(backend.db.pools[0].sync_status[0].status, "synced");
+        assert!(server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .all(|r| r.method.as_str() == "GET"));
+    }
+
+    #[tokio::test]
+    async fn global_pool_first_use_updates_current_monitor_and_preserves_other_receipts() {
+        let (server, mut backend, _dir) = fixture().await;
+        backend.db.accounts[0].monitor_enabled = true;
+        backend.db.accounts[0].monitor_endpoint = Some("https://probe.example/check".into());
+        let mut pool = sample_pool();
+        pool.account_ids = vec!["acct2".into()];
+        pool.sync_status = vec![PoolSyncStatus {
+            account_id: "acct2".into(),
+            status: "synced".into(),
+            message: "已同步".into(),
+        }];
+        let revision = pool.updated.clone();
+        backend.db.pools.push(pool);
+        let resource = backend.db.accounts[0].resources.clone().unwrap();
+        Mock::given(method("GET"))
+            .and(path_regex("/values/p%3Apool1$"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex("/values/m%3Amonitor$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"endpoint":"https://probe.example/check","poolIds":[]})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path_regex("/values/(p%3Apool1|m%3Amonitor)$"))
+            .respond_with(ok(json!({})))
+            .mount(&server)
+            .await;
+        backend
+            .ensure_pool_on_account("pool1", "acct1", "test-token-value", &resource)
+            .await
+            .unwrap();
+        assert_eq!(backend.db.pools[0].account_ids, vec!["acct2", "acct1"]);
+        assert_eq!(backend.db.pools[0].updated, revision);
+        assert!(backend.db.pools[0]
+            .sync_status
+            .iter()
+            .all(|s| s.status == "synced"));
+        let req = server.received_requests().await.unwrap();
+        assert!(req.iter().all(|r| r.url.path().contains("acct1")));
+        let monitor = req
+            .iter()
+            .find(|r| r.method.as_str() == "PUT" && r.url.path().ends_with("m%3Amonitor"))
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&monitor.body).unwrap()["poolIds"],
+            json!(["pool1"])
+        );
+    }
+
+    #[tokio::test]
+    async fn global_pool_prewrite_persist_failure_and_remote_conflict_never_write() {
+        let (server, mut backend, _dir) = fixture().await;
+        let mut pool = sample_pool();
+        pool.account_ids.clear();
+        backend.db.pools.push(pool);
+        let resources = backend.db.accounts[0].resources.clone().unwrap();
+        Mock::given(method("GET"))
+            .and(path_regex("/values/p%3Apool1$"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"different":"configuration"})),
+            )
+            .mount(&server)
+            .await;
+        assert!(backend
+            .ensure_pool_on_account("pool1", "acct1", "test-token-value", &resources)
+            .await
+            .unwrap_err()
+            .contains("版本不同"));
+        assert!(backend.db.pending_pool_changes.is_empty());
+        server.reset().await;
+        Mock::given(method("GET"))
+            .and(path_regex("/values/p%3Apool1$"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        backend.fail_persist_at.store(
+            backend
+                .persist_count
+                .load(std::sync::atomic::Ordering::SeqCst)
+                + 1,
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        assert!(backend
+            .ensure_pool_on_account("pool1", "acct1", "test-token-value", &resources)
+            .await
+            .is_err());
+        assert!(backend.db.pending_pool_changes.is_empty());
+        assert!(backend.db.pools[0].account_ids.is_empty());
+        assert!(server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .all(|r| r.method.as_str() == "GET"));
+    }
+
+    #[tokio::test]
+    async fn global_pool_edit_updates_every_used_account_without_changing_codes() {
+        let (server, mut backend, _dir) = fixture().await;
+        let mut other = backend.db.accounts[0].clone();
+        other.id = "acct2".into();
+        other.resources = Some(Resources {
+            script: "edge-two".into(),
+            namespace: "ns2".into(),
+        });
+        backend.db.accounts.push(other);
+        keyring_set("acct2", "token", "second-token-value").unwrap();
+        let mut old = sample_pool();
+        old.account_ids = vec!["acct1".into(), "acct2".into()];
+        old.sync_status = old
+            .account_ids
+            .iter()
+            .map(|id| PoolSyncStatus {
+                account_id: id.clone(),
+                status: "synced".into(),
+                message: "已同步".into(),
+            })
+            .collect();
+        backend.db.pools.push(old.clone());
+        backend.db.domains.push(domain());
+        let mut other_domain = domain();
+        other_domain.id = "domain2".into();
+        other_domain.account_id = "acct2".into();
+        other_domain.host = "example.org".into();
+        backend.db.domains.push(other_domain);
+        for (domain_id, code) in [("domain1", "DEMO_A"), ("domain2", "DEMO_B")] {
+            backend.db.links.push(Link {
+                domain_id: domain_id.into(),
+                slug: "shared".into(),
+                cn_url: String::new(),
+                default_url: String::new(),
+                updated: now(),
+                pool_id: Some("pool1".into()),
+                code: Some(code.into()),
+            });
+        }
+        for (account, script, namespace) in
+            [("acct1", "edge-one", "ns1"), ("acct2", "edge-two", "ns2")]
+        {
+            let base = format!("/client/v4/accounts/{account}");
+            Mock::given(method("GET")).and(path(format!("{base}/storage/kv/namespaces/{namespace}/values/m%3Aconfig")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({"schema":SCHEMA,"accountId":account,"script":script,"namespace":namespace,"sourceHash":bundled_source_hash()}))).mount(&server).await;
+            Mock::given(method("GET")).and(path(format!("{base}/workers/scripts/{script}/settings")))
+                .respond_with(ok(json!({"bindings":[{"type":"kv_namespace","name":"LINKS","namespace_id":namespace},{"type":"secret_text","name":"SELFTEST_KEY"}]}))).mount(&server).await;
+            Mock::given(method("GET"))
+                .and(path(format!("{base}/workers/scripts/{script}/content/v2")))
+                .respond_with(ResponseTemplate::new(200).set_body_raw(
+                    include_str!("../../edge/worker.mjs").as_bytes(),
+                    "application/javascript",
+                ))
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path(format!(
+                    "{base}/storage/kv/namespaces/{namespace}/values/p%3Apool1"
+                )))
+                .respond_with(ResponseTemplate::new(200).set_body_json(pools::cloud_value(&old)))
+                .mount(&server)
+                .await;
+            Mock::given(method("PUT"))
+                .and(path(format!(
+                    "{base}/storage/kv/namespaces/{namespace}/values/p%3Apool1"
+                )))
+                .respond_with(ok(json!({})))
+                .mount(&server)
+                .await;
+        }
+        let mut edit = old;
+        edit.account_ids.clear();
+        edit.candidates[0].prefix = "https://new.example/path/".into();
+        let plan = backend
+            .prepare_change(&json!({"kind":"save_pool","pool":edit}))
+            .unwrap();
+        backend
+            .dispatch("apply_plan", &json!({"planId":plan["id"]}))
+            .await
+            .unwrap();
+        let req = server.received_requests().await.unwrap();
+        let writes: Vec<_> = req.iter().filter(|r| r.method.as_str() == "PUT").collect();
+        assert_eq!(writes.len(), 2);
+        assert!(
+            writes.iter().any(|r| r.url.path().contains("acct1"))
+                && writes.iter().any(|r| r.url.path().contains("acct2"))
+        );
+        assert!(writes
+            .iter()
+            .all(
+                |r| serde_json::from_slice::<Value>(&r.body).unwrap()["candidates"][0]["prefix"]
+                    == "https://new.example/path/"
+            ));
+        assert_eq!(backend.db.links[0].code.as_deref(), Some("DEMO_A"));
+        assert_eq!(backend.db.links[1].code.as_deref(), Some("DEMO_B"));
+        assert!(backend.db.pending_pool_changes.is_empty());
+    }
+
+    #[tokio::test]
     async fn pool_write_503_remains_journaled_and_unsynced() {
         let (server, mut backend, _dir) = fixture().await;
         mount_resource(&server, include_str!("../../edge/worker.mjs")).await;
@@ -7562,6 +8461,251 @@ mod tests {
             .collect();
         assert!(signed.iter().any(|h| h.contains(".US.")));
         assert!(signed.iter().any(|h| h.contains(".CN.")));
+    }
+
+    #[tokio::test]
+    async fn selftest_rotation_staging_failure_makes_no_cloud_request() {
+        let (server, mut backend, _dir) = fixture().await;
+        mock_key_set_failures()
+            .lock()
+            .unwrap()
+            .insert("selftest-pending:acct1".into());
+        let error = backend.apply_rotate("acct1").await.unwrap_err();
+        assert!(error.contains("系统凭据保存失败"));
+        assert!(server.received_requests().await.unwrap().is_empty());
+        assert!(backend.db.pending_selftest_rotations.is_empty());
+        assert_eq!(keyring_get("acct1", "selftest").unwrap(), "a1".repeat(32));
+    }
+
+    #[tokio::test]
+    async fn selftest_rotation_initial_persist_failure_rolls_back_without_cloud_write() {
+        let (server, mut backend, _dir) = fixture().await;
+        backend
+            .fail_persist_at
+            .store(1, std::sync::atomic::Ordering::SeqCst);
+        let error = backend.apply_rotate("acct1").await.unwrap_err();
+        assert!(error.contains("本机配置保存失败"));
+        assert!(server.received_requests().await.unwrap().is_empty());
+        assert!(backend.db.pending_selftest_rotations.is_empty());
+        assert!(keyring_get_optional("acct1", "selftest-pending")
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn selftest_rotation_definitive_cloud_failure_stays_pending() {
+        let (server, mut backend, _dir) = fixture().await;
+        mount_resource(&server, include_str!("../../edge/worker.mjs")).await;
+        mount_selftest_rotation(&server, 403).await;
+        let error = backend.apply_rotate("acct1").await.unwrap_err();
+        assert!(error.contains("403"));
+        assert_eq!(backend.db.pending_selftest_rotations.len(), 1);
+        assert_eq!(
+            backend.db.pending_selftest_rotations[0].status,
+            SelftestRotationStatus::DefinitiveFailure
+        );
+        assert_eq!(keyring_get("acct1", "selftest").unwrap(), "a1".repeat(32));
+        let state = State::from(&backend.db);
+        assert!(state.accounts[0].needs_selftest_key);
+        assert_eq!(state.pending_actions[0].kind, "resume_selftest_rotation");
+    }
+
+    #[tokio::test]
+    async fn selftest_rotation_uncertain_failure_resumes_with_same_staged_key() {
+        let (server, mut backend, _dir) = fixture().await;
+        mount_resource(&server, include_str!("../../edge/worker.mjs")).await;
+        mount_selftest_rotation(&server, 503).await;
+        let error = backend.apply_rotate("acct1").await.unwrap_err();
+        assert!(error.contains("503"));
+        assert_eq!(
+            backend.db.pending_selftest_rotations[0].status,
+            SelftestRotationStatus::Uncertain
+        );
+        let staged = keyring_get("acct1", "selftest-pending").unwrap();
+        let disk = String::from_utf8(fs::read(&backend.path).unwrap()).unwrap();
+        assert!(!disk.contains(&staged));
+        assert_eq!(keyring_get("acct1", "selftest").unwrap(), "a1".repeat(32));
+
+        server.reset().await;
+        mount_resource(&server, include_str!("../../edge/worker.mjs")).await;
+        mount_selftest_rotation(&server, 200).await;
+        backend.resume_selftest_rotation("acct1").await.unwrap();
+        assert_eq!(keyring_get("acct1", "selftest").unwrap(), staged);
+        assert!(backend.db.pending_selftest_rotations.is_empty());
+        assert!(!backend.db.accounts[0].needs_selftest_key);
+        let requests = server.received_requests().await.unwrap();
+        let request = requests
+            .iter()
+            .find(|request| request.method.as_str() == "PUT")
+            .unwrap();
+        let body: Value = serde_json::from_slice(&request.body).unwrap();
+        assert_eq!(body["text"], staged);
+    }
+
+    #[tokio::test]
+    async fn selftest_rotation_cloud_applied_recovery_only_promotes_local_key() {
+        let (server, mut backend, _dir) = fixture().await;
+        mount_resource(&server, include_str!("../../edge/worker.mjs")).await;
+        mount_selftest_rotation(&server, 200).await;
+        mock_key_set_failures()
+            .lock()
+            .unwrap()
+            .insert("selftest:acct1".into());
+        let error = backend.apply_rotate("acct1").await.unwrap_err();
+        assert!(error.contains("系统凭据保存失败"));
+        assert_eq!(
+            backend.db.pending_selftest_rotations[0].status,
+            SelftestRotationStatus::CloudApplied
+        );
+        let staged = keyring_get("acct1", "selftest-pending").unwrap();
+        mock_key_set_failures().lock().unwrap().clear();
+        server.reset().await;
+        backend.resume_selftest_rotation("acct1").await.unwrap();
+        assert!(server.received_requests().await.unwrap().is_empty());
+        assert_eq!(keyring_get("acct1", "selftest").unwrap(), staged);
+        assert!(backend.db.pending_selftest_rotations.is_empty());
+    }
+
+    #[tokio::test]
+    async fn legacy_selftest_recovery_clears_only_exact_account_journals() {
+        let (server, mut backend, _dir) = fixture().await;
+        let mut other = backend.db.accounts[0].clone();
+        other.id = "acct10".into();
+        other.resources = None;
+        other.has_resources = false;
+        backend.db.accounts.push(other);
+        backend.db.pending_operations = vec![
+            "重置自检密钥 acct1 (old)：云端已更换密钥，但本机凭据保存失败".into(),
+            "重置自检密钥 acct10 (other)：云端已更换密钥，但本机凭据保存失败".into(),
+        ];
+        let before = State::from(&backend.db);
+        assert!(before.accounts[0].needs_selftest_key);
+        assert!(before.accounts[1].needs_selftest_key);
+        assert_eq!(
+            before
+                .pending_actions
+                .iter()
+                .filter(|action| action.kind == "recover_selftest_rotation")
+                .count(),
+            2
+        );
+        mount_resource(&server, include_str!("../../edge/worker.mjs")).await;
+        mount_selftest_rotation(&server, 200).await;
+        backend
+            .apply_legacy_selftest_recovery("acct1")
+            .await
+            .unwrap();
+        assert_eq!(
+            backend.db.pending_operations,
+            vec!["重置自检密钥 acct10 (other)：云端已更换密钥，但本机凭据保存失败"]
+        );
+        assert!(!backend.db.accounts[0].needs_selftest_key);
+        assert!(State::from(&backend.db).accounts[1].needs_selftest_key);
+    }
+
+    #[tokio::test]
+    async fn pending_selftest_rotation_blocks_destructive_paths_and_resource_mismatch() {
+        let (_server, mut backend, _dir) = fixture().await;
+        let journal = "重置自检密钥 acct1 (pending)".to_string();
+        backend.db.pending_operations.push(journal.clone());
+        backend
+            .db
+            .pending_selftest_rotations
+            .push(PendingSelftestRotation {
+                account_id: "acct1".into(),
+                script: "old-script".into(),
+                namespace: "old-namespace".into(),
+                journal,
+                status: SelftestRotationStatus::Staged,
+            });
+        keyring_set("acct1", "selftest-pending", &"b2".repeat(32)).unwrap();
+        assert!(backend.resume_selftest_rotation("acct1").await.is_err());
+        assert!(backend
+            .dispatch("remove_account", &json!({"accountId":"acct1"}))
+            .await
+            .is_err());
+        assert!(backend
+            .prepare_change(&json!({"kind":"cleanup_account","accountId":"acct1"}))
+            .is_err());
+        assert!(backend
+            .prepare_change(&json!({"kind":"recover_account","accountId":"acct1"}))
+            .is_err());
+        assert!(backend.import_config("{}").await.is_err());
+        assert!(keyring_get_optional("acct1", "selftest-pending")
+            .unwrap()
+            .is_some());
+        assert_eq!(backend.db.pending_selftest_rotations.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn selftest_rotation_final_persist_failure_keeps_cloud_applied_recoverable() {
+        let (server, mut backend, _dir) = fixture().await;
+        mount_resource(&server, include_str!("../../edge/worker.mjs")).await;
+        mount_selftest_rotation(&server, 200).await;
+        backend
+            .fail_persist_at
+            .store(3, std::sync::atomic::Ordering::SeqCst);
+
+        let error = backend.apply_rotate("acct1").await.unwrap_err();
+        assert!(error.contains("本机配置保存失败"));
+        assert_eq!(
+            backend.db.pending_selftest_rotations[0].status,
+            SelftestRotationStatus::CloudApplied
+        );
+        let staged = keyring_get("acct1", "selftest-pending").unwrap();
+        assert_eq!(keyring_get("acct1", "selftest").unwrap(), staged);
+        assert!(State::from(&backend.db).accounts[0].needs_selftest_key);
+
+        server.reset().await;
+        backend.resume_selftest_rotation("acct1").await.unwrap();
+        assert!(server.received_requests().await.unwrap().is_empty());
+        assert!(backend.db.pending_selftest_rotations.is_empty());
+        assert!(!backend.db.accounts[0].needs_selftest_key);
+    }
+
+    #[tokio::test]
+    async fn missing_staged_selftest_key_requires_explicit_replacement_plan() {
+        let (server, mut backend, _dir) = fixture().await;
+        let journal = "重置自检密钥 acct1 (missing)".to_string();
+        backend.db.pending_operations.push(journal.clone());
+        backend
+            .db
+            .pending_selftest_rotations
+            .push(PendingSelftestRotation {
+                account_id: "acct1".into(),
+                script: "edge-one".into(),
+                namespace: "ns1".into(),
+                journal,
+                status: SelftestRotationStatus::CloudApplied,
+            });
+
+        let error = backend.resume_selftest_rotation("acct1").await.unwrap_err();
+        assert!(error.contains("找不到安全暂存密钥"));
+        assert_eq!(
+            backend.db.pending_selftest_rotations[0].status,
+            SelftestRotationStatus::StagingMissing
+        );
+        let state = State::from(&backend.db);
+        assert_eq!(state.pending_actions[0].kind, "recover_selftest_rotation");
+        let plan = backend
+            .prepare_change(&json!({
+                "kind":"recover_selftest_rotation",
+                "accountId":"acct1"
+            }))
+            .unwrap();
+        assert!(plan["steps"][0].as_str().unwrap().contains("生成新密钥"));
+
+        mount_resource(&server, include_str!("../../edge/worker.mjs")).await;
+        mount_selftest_rotation(&server, 200).await;
+        backend
+            .apply_legacy_selftest_recovery("acct1")
+            .await
+            .unwrap();
+        assert!(backend.db.pending_selftest_rotations.is_empty());
+        assert!(keyring_get_optional("acct1", "selftest-pending")
+            .unwrap()
+            .is_none());
+        assert_ne!(keyring_get("acct1", "selftest").unwrap(), "a1".repeat(32));
     }
 
     #[test]
