@@ -125,7 +125,7 @@ describe('desktop primary flows in explicit preview', () => {
     expect(screen.getByRole('heading',{name:'Cloudflare 账户'})).toBeTruthy();
     fireEvent.click(screen.getByRole('button', { name: '检查更新' }));
     const update = await screen.findByRole('dialog', { name: '应用更新' });
-    expect(within(update).getByText('更新渠道尚未启用。请使用正式发行渠道获取新版本。')).toBeTruthy();
+    expect(within(update).getByText(/当前版本：/).textContent).toBe('当前版本：0.0.0-preview。更新渠道尚未启用，请使用正式发行渠道获取新版本。');
   });
 
   it('shows and confirms a prepared plan before changing a link', async () => {

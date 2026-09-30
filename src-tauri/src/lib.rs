@@ -39,6 +39,22 @@ fn bundled_source_hash() -> String {
 
 pub struct AppState(Mutex<Backend>);
 
+async fn lock_backend<'a>(
+    state: &'a AppState,
+    action: &str,
+) -> Result<tokio::sync::MutexGuard<'a, Backend>, String> {
+    if matches!(
+        action,
+        "refresh_domains" | "refresh_accounts" | "prepare_domain" | "prepare_domain_dns"
+    ) {
+        state.0.try_lock().map_err(|_| {
+            "上一个操作仍在进行，请稍候；若有系统授权窗口，请先完成或取消，无需重复点击".to_string()
+        })
+    } else {
+        Ok(state.0.lock().await)
+    }
+}
+
 struct Backend {
     db: Database,
     path: PathBuf,
@@ -105,6 +121,10 @@ fn random_name(prefix: &str) -> String {
 fn keyring_get(id: &str, kind: &str) -> Result<String, String> {
     #[cfg(test)]
     {
+        mock_key_reads()
+            .lock()
+            .expect("test reads")
+            .push(format!("{kind}:{id}"));
         return mock_keys()
             .lock()
             .expect("test key store")
@@ -174,6 +194,21 @@ fn mock_keys() -> &'static std::sync::Mutex<std::collections::HashMap<String, St
     static KEYS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, String>>> =
         std::sync::OnceLock::new();
     KEYS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+#[cfg(test)]
+fn mock_key_reads() -> &'static std::sync::Mutex<Vec<String>> {
+    static READS: std::sync::OnceLock<std::sync::Mutex<Vec<String>>> = std::sync::OnceLock::new();
+    READS.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+async fn read_refresh_token(account_id: &str) -> Result<Zeroizing<String>, String> {
+    let id = account_id.to_owned();
+    // Native authorization can wait for user input. Keep it off async runtime workers;
+    // do not time out the prompt and leave a second authorization queued behind it.
+    tokio::task::spawn_blocking(move || keyring_get(&id, "token").map(Zeroizing::new))
+        .await
+        .map_err(|_| "系统授权未完成，请稍后重试".to_string())?
 }
 
 fn field<'a>(payload: &'a Value, name: &str) -> Result<&'a str, String> {
@@ -463,7 +498,9 @@ impl Backend {
         fs::rename(&tmp, &self.path).map_err(|_| "无法提交配置".to_string())
     }
     fn state(&self) -> Value {
-        serde_json::to_value(State::from(&self.db)).unwrap_or(Value::Null)
+        let mut state = serde_json::to_value(State::from(&self.db)).unwrap_or(Value::Null);
+        state["appVersion"] = json!(env!("CARGO_PKG_VERSION"));
+        state
     }
     fn account(&self, id: &str) -> Result<&Account, String> {
         self.db
@@ -681,11 +718,18 @@ impl Backend {
             .collect()
     }
 
-    async fn refresh_accounts(&mut self) -> Result<Value, String> {
+    async fn refresh_accounts(&mut self, choice: Option<&str>) -> Result<Value, String> {
+        if let Some(id) = choice {
+            self.account(id)?;
+        }
         let mut refreshed = self.db.accounts.clone();
-        for item in &mut refreshed {
+        for item in refreshed
+            .iter_mut()
+            .filter(|item| choice.is_none_or(|id| item.id == id))
+        {
             let id = item.id.clone();
-            let token = keyring_get(&id, "token")
+            let token = read_refresh_token(&id)
+                .await
                 .map_err(|error| format!("无法刷新账户「{}」：{error}", item.label))?;
             let account = self
                 .cloud
@@ -708,6 +752,40 @@ impl Backend {
         let previous = std::mem::replace(&mut self.db.accounts, refreshed);
         if let Err(error) = self.persist() {
             self.db.accounts = previous;
+            return Err(error);
+        }
+        Ok(self.state())
+    }
+
+    async fn refresh_domains(&mut self, choice: Option<&str>) -> Result<Value, String> {
+        let id = match choice {
+            Some(id) => {
+                self.account(id)?;
+                id.to_owned()
+            }
+            None if self.db.accounts.len() == 1 => self.db.accounts[0].id.clone(),
+            None => return Err("请选择要刷新域名的 Cloudflare 账户".into()),
+        };
+        let label = self.account(&id)?.label.clone();
+        let token = read_refresh_token(&id)
+            .await
+            .map_err(|error| format!("无法读取账户「{label}」：{error}；未刷新域名列表"))?;
+        let zones = tokio::time::timeout(Duration::from_secs(60), self.fetch_zones(&token, &id))
+            .await
+            .map_err(|_| format!("账户「{label}」的域名读取超时，原列表已保留；请检查网络后重试"))?
+            .map_err(|error| format!("无法刷新账户「{label}」的域名：{error}"))?;
+        let index = self
+            .db
+            .accounts
+            .iter()
+            .position(|account| account.id == id)
+            .ok_or("找不到此账号")?;
+        let previous = self.db.accounts[index].clone();
+        self.db.accounts[index].zone_count = zones.len();
+        self.db.accounts[index].zones = zones;
+        self.db.accounts[index].checked_at = Some(now());
+        if let Err(error) = self.persist() {
+            self.db.accounts[index] = previous;
             return Err(error);
         }
         Ok(self.state())
@@ -763,16 +841,21 @@ impl Backend {
         }
         // A cache miss does not prove that a newly added zone is absent. Refresh
         // accessible zones before reporting a missing domain; never widen token access.
+        let lookup_choice = choice.map(str::to_owned)
+            .or_else(|| (cached.len() == 1).then(|| cached[0].account_id.clone()))
+            .or_else(|| (self.db.accounts.len() == 1).then(|| self.db.accounts[0].id.clone()))
+            .ok_or("请先选择此域名所属的 Cloudflare 账户，再检查或刷新域名；这样只需读取一个账户的授权")?;
         let accounts: Vec<_> = self
             .db
             .accounts
             .iter()
-            .filter(|account| choice.is_none_or(|id| account.id == id))
+            .filter(|account| account.id == lookup_choice)
             .map(|account| (account.id.clone(), account.label.clone()))
             .collect();
         let mut refreshed = Vec::new();
         for (id, label) in accounts {
-            let token = keyring_get(&id, "token")
+            let token = read_refresh_token(&id)
+                .await
                 .map_err(|error| format!("无法刷新账户「{label}」的域名：{error}"))?;
             let zones = self.fetch_zones(&token, &id).await.map_err(|error| {
                 format!("无法刷新账户「{label}」的域名：{error}；可选择此域名所属账户后重试")
@@ -843,12 +926,18 @@ impl Backend {
         zone_id: &str,
         zone_name: &str,
         host: &str,
+        expected: &[domain_check::DnsRecordFingerprint],
     ) -> Result<(), String> {
         let all = self
             .cloud
             .list_pages(token, &format!("zones/{zone_id}/dns_records"))
             .await
             .map_err(problem)?;
+        let observed = domain_check::dns_fingerprint(&all, host)
+            .map_err(|message| format!("完整 DNS 清单格式无效：{message}；请重新检查"))?;
+        if observed != expected {
+            return Err("DNS 记录已变化，请重新检查并生成新计划".into());
+        }
         if let Some(message) = domain_check::placeholder_conflict(&all, host, zone_name) {
             return Err(message);
         }
@@ -938,6 +1027,7 @@ impl Backend {
                                         &candidate.zone_id,
                                         &zone_name,
                                         &host,
+                                        &records,
                                     )
                                     .await
                                 {
@@ -946,7 +1036,7 @@ impl Backend {
                                         checks.push(DomainCheck {
                                             label: "DNS".into(),
                                             ok: true,
-                                            message: "该主机名没有 DNS 记录；可确认后创建 Worker 专用橙云占位记录".into(),
+                                            message: "这个域名还没有用于打开网址的解析，可以补齐；现有邮件及验证设置会保留".into(),
                                             level: DomainCheckLevel::Warning,
                                         });
                                         actions.push(DnsActionView {
@@ -955,9 +1045,9 @@ impl Backend {
                                             name: host.clone(),
                                         });
                                         plan = Some(self.make_plan(
-                                            "创建 Worker DNS 占位记录",
+                                            "补齐网站解析",
                                             vec![format!(
-                                                "仅在 {host} 仍无任何 DNS 记录且无通配符或 NS 子域委派时，创建 AAAA 记录 100:: 并开启 Cloudflare 代理"
+                                                "仅在 {host} 仍无 A、AAAA 或 CNAME 地址记录、现有非网站记录未变化且无通配符或 NS 子域委派时，创建 AAAA 记录 100:: 并开启 Cloudflare 代理"
                                             )],
                                             vec![format!(
                                                 "此操作会让 {host} 整个主机名的 HTTP/HTTPS 流量进入 Cloudflare；不会修改其他主机名、邮件记录或已有记录，完成后仍需单独添加短链接目录"
@@ -966,7 +1056,7 @@ impl Backend {
                                                 account_id: candidate.account_id.clone(),
                                                 zone_id: candidate.zone_id.clone(),
                                                 host: host.clone(),
-                                                snapshot: domain_check::DnsSnapshot::Missing,
+                                                snapshot: domain_check::DnsSnapshot::Missing(records),
                                             },
                                         ));
                                     }
@@ -1101,35 +1191,25 @@ impl Backend {
         let dns_path = format!("zones/{zone_id}/dns_records?name={}", cloud::encode(host));
         let dns = self.cloud.list_pages(&token, &dns_path).await;
         let (ok, message) = match dns {
-            Ok(items) => {
-                let exact: Vec<_> = items
-                    .iter()
-                    .filter(|record| record["name"].as_str() == Some(host))
-                    .collect();
-                let address: Vec<_> = exact
-                    .iter()
-                    .filter(|record| {
-                        matches!(record["type"].as_str(), Some("A" | "AAAA" | "CNAME"))
-                    })
-                    .collect();
-                let unsupported = address.iter().any(|record| record["proxiable"] == false);
-                let ok = !address.is_empty()
-                    && !unsupported
-                    && address.iter().all(|record| record["proxied"] == true);
-                (
-                    ok,
-                    if ok {
-                        "DNS 已代理"
-                    } else if exact.is_empty() {
-                        "该主机名缺少 DNS 记录；可先准备 DNS 修复计划"
-                    } else if address.is_empty() || unsupported {
-                        "该主机名的现有记录不支持 Cloudflare 代理，不能自动接入"
-                    } else {
-                        "该主机名有地址记录尚未开启 Cloudflare 代理；可先准备 DNS 修复计划"
-                    },
-                )
-            }
-            Err(_) => (false, "无法读取 DNS 记录；未确认当前状态，不能准备接入计划"),
+            Ok(items) => match domain_check::classify_dns_records(&items, host) {
+                Ok(domain_check::DnsClassification::Ready) => (true, "DNS 已代理".into()),
+                Ok(domain_check::DnsClassification::Missing) => (
+                    false,
+                    "这个域名还没有用于打开网址的解析，可以先检查 DNS 并补齐；现有邮件及验证设置会保留".into(),
+                ),
+                Ok(domain_check::DnsClassification::NeedsProxy) => (
+                    false,
+                    "该主机名有地址记录尚未开启 Cloudflare 代理；可先准备 DNS 修复计划"
+                        .into(),
+                ),
+                Ok(domain_check::DnsClassification::Unsupported(message))
+                | Ok(domain_check::DnsClassification::Conflict(message)) => (false, message),
+                Err(message) => (false, format!("DNS 记录格式无效：{message}")),
+            },
+            Err(_) => (
+                false,
+                "无法读取 DNS 记录；未确认当前状态，不能准备接入计划".into(),
+            ),
         };
         checks.push(domain_check::hard_check("DNS", ok, message));
         let routes = self
@@ -1669,7 +1749,18 @@ impl Backend {
                 self.persist()?;
                 Ok(self.state())
             }
-            "refresh_accounts" => self.refresh_accounts().await,
+            "refresh_accounts" | "refresh_domains" => {
+                let choice = match payload.get("accountId") {
+                    None | Some(Value::Null) => None,
+                    Some(Value::String(id)) if !id.is_empty() => Some(id.as_str()),
+                    _ => return Err("请选择有效的 Cloudflare 账户".into()),
+                };
+                if action == "refresh_domains" {
+                    self.refresh_domains(choice).await
+                } else {
+                    self.refresh_accounts(choice).await
+                }
+            }
             "prepare_domain" => self.prepare_domain(payload).await,
             "prepare_domain_dns" => self.prepare_domain_dns(payload).await,
             "prepare_change" => self.prepare_change(payload),
@@ -1842,11 +1933,11 @@ impl Backend {
         let (token, zone_name) = self.confirmed_zone_token(account_id, zone_id, host).await?;
         let current = self.exact_dns_records(&token, zone_id, host).await?;
         match &snapshot {
-            domain_check::DnsSnapshot::Missing => {
-                if !current.is_empty() {
+            domain_check::DnsSnapshot::Missing(expected) => {
+                if &current != expected {
                     return Err("DNS 记录已变化，请重新准备修复计划".into());
                 }
-                self.placeholder_is_safe(&token, zone_id, &zone_name, host)
+                self.placeholder_is_safe(&token, zone_id, &zone_name, host, expected)
                     .await?;
             }
             domain_check::DnsSnapshot::EnableProxy(expected) => {
@@ -1865,7 +1956,7 @@ impl Backend {
         let journal = format!("修复 DNS {host} ({})", random_id());
         self.journal_start(&journal)?;
         match snapshot {
-            domain_check::DnsSnapshot::Missing => {
+            domain_check::DnsSnapshot::Missing(_) => {
                 let result = self
                     .cloud
                     .post(
@@ -2057,10 +2148,14 @@ impl Backend {
             option_env!("SLG_UPDATER_PUBLIC_KEY"),
             option_env!("SLG_UPDATER_ENDPOINT"),
         ) else {
-            return Ok(json!({"status":"unavailable","message":"此版本未配置更新通道"}));
+            return Ok(
+                json!({"status":"unavailable","currentVersion":env!("CARGO_PKG_VERSION"),"message":"此版本未配置更新通道"}),
+            );
         };
         if pubkey.is_empty() {
-            return Ok(json!({"status":"unavailable","message":"此版本未配置更新通道"}));
+            return Ok(
+                json!({"status":"unavailable","currentVersion":env!("CARGO_PKG_VERSION"),"message":"此版本未配置更新通道"}),
+            );
         }
         let url = url::Url::parse(endpoint).map_err(|_| "更新地址配置无效".to_string())?;
         if url.scheme() != "https" {
@@ -2081,18 +2176,24 @@ impl Backend {
             .await
             .map_err(|_| "无法检查更新，请稍后再试".to_string())?;
         let Some(update) = available else {
-            return Ok(json!({"status":"up_to_date","message":"当前已是最新版本"}));
+            return Ok(
+                json!({"status":"up_to_date","currentVersion":env!("CARGO_PKG_VERSION"),"message":"当前已是最新版本"}),
+            );
         };
         if !install {
-            return Ok(json!({"status":"available","version":update.version,
-                "notes":update.body,"message":"发现新版本"}));
+            return Ok(
+                json!({"status":"available","currentVersion":env!("CARGO_PKG_VERSION"),"version":update.version,
+                "notes":update.body,"message":"发现新版本"}),
+            );
         }
         update
             .download_and_install(|_, _| {}, || {})
             .await
             .map_err(|_| "更新下载或安装失败".to_string())?;
-        Ok(json!({"status":"installed","version":update.version,
-            "message":"更新已安装，请重新启动应用"}))
+        Ok(
+            json!({"status":"installed","currentVersion":env!("CARGO_PKG_VERSION"),"version":update.version,
+            "message":"更新已安装，请重新启动应用"}),
+        )
     }
 
     async fn import_config(&mut self, json_text: &str) -> Result<Value, String> {
@@ -4795,7 +4896,7 @@ async fn dispatch(request: Value, state: tauri::State<'_, AppState>) -> Result<V
                 "message":"本机没有自检密钥，请先单独确认重置密钥","checks":[] })),
         };
     }
-    let mut backend = state.0.lock().await;
+    let mut backend = lock_backend(&state, &action).await?;
     backend.dispatch(&action, &payload).await
 }
 
@@ -4895,6 +4996,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         keyring_set("acct1", "token", "test-token-value").unwrap();
         keyring_set("acct1", "selftest", &"a1".repeat(32)).unwrap();
+        mock_key_reads().lock().unwrap().clear();
         let account = Account {
             id: "acct1".into(),
             label: "账号 1".into(),
@@ -5230,6 +5332,7 @@ mod tests {
         assert_eq!(prepared["dnsStatus"], "missing");
         assert_eq!(prepared["actions"][0]["kind"], "createPlaceholder");
         assert_eq!(prepared["canApply"], true);
+        assert_eq!(prepared["plan"]["title"], "补齐网站解析");
         let plan_id = prepared["plan"]["id"].as_str().unwrap();
         backend
             .dispatch("apply_plan", &json!({"planId":plan_id}))
@@ -5246,6 +5349,245 @@ mod tests {
             body,
             json!({"type":"AAAA","name":"example.com","content":"100::","ttl":1,"proxied":true})
         );
+    }
+
+    #[tokio::test]
+    async fn non_address_dns_records_are_preserved_when_creating_placeholder() {
+        let (server, mut backend, _dir) = fixture().await;
+        let records = json!([
+            {"id":"mx-one","name":"example.com","type":"MX",
+                "content":"mail.example.org","proxied":false,"proxiable":false},
+            {"id":"txt-one","name":"example.com","type":"TXT",
+                "content":"verification=example","proxied":false,"proxiable":false},
+            {"id":"caa-one","name":"example.com","type":"CAA",
+                "content":"0 issue example.org","proxied":false,"proxiable":false}
+        ]);
+        mount_zone_owner(&server).await;
+        mount_exact_dns(&server, records.clone()).await;
+        mount_full_dns(&server, records).await;
+        Mock::given(method("POST"))
+            .and(path("/client/v4/zones/zone1/dns_records"))
+            .respond_with(ok(
+                json!({"id":"placeholder","name":"example.com","type":"AAAA",
+                "content":"100::","proxied":true,"proxiable":true}),
+            ))
+            .mount(&server)
+            .await;
+
+        let prepared = backend
+            .dispatch("prepare_domain_dns", &json!({"input":"example.com"}))
+            .await
+            .unwrap();
+        assert_eq!(prepared["dnsStatus"], "missing");
+        assert_eq!(prepared["actions"][0]["kind"], "createPlaceholder");
+        assert_eq!(prepared["canApply"], true);
+        backend
+            .dispatch(
+                "apply_plan",
+                &json!({"planId":prepared["plan"]["id"].as_str().unwrap()}),
+            )
+            .await
+            .unwrap();
+
+        let writes: Vec<_> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|request| matches!(request.method.as_str(), "POST" | "PATCH" | "DELETE"))
+            .collect();
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0].method.as_str(), "POST");
+        let body: Value = serde_json::from_slice(&writes[0].body).unwrap();
+        assert_eq!(
+            body,
+            json!({"type":"AAAA","name":"example.com","content":"100::","ttl":1,"proxied":true})
+        );
+    }
+
+    #[tokio::test]
+    async fn non_address_dns_change_blocks_placeholder_write() {
+        let (server, mut backend, _dir) = fixture().await;
+        let original = json!([
+            {"id":"mx-one","name":"example.com","type":"MX",
+                "content":"mail.example.org","proxied":false,"proxiable":false},
+            {"id":"txt-one","name":"example.com","type":"TXT",
+                "content":"verification=first","proxied":false,"proxiable":false}
+        ]);
+        mount_zone_owner(&server).await;
+        mount_exact_dns(&server, original.clone()).await;
+        mount_full_dns(&server, original).await;
+        let prepared = backend
+            .dispatch("prepare_domain_dns", &json!({"input":"example.com"}))
+            .await
+            .unwrap();
+        assert_eq!(prepared["dnsStatus"], "missing");
+        let plan_id = prepared["plan"]["id"].as_str().unwrap().to_owned();
+
+        server.reset().await;
+        mount_zone_owner(&server).await;
+        mount_exact_dns(
+            &server,
+            json!([
+                {"id":"mx-one","name":"example.com","type":"MX",
+                    "content":"mail.example.org","proxied":false,"proxiable":false},
+                {"id":"txt-one","name":"example.com","type":"TXT",
+                    "content":"verification=changed","proxied":false,"proxiable":false}
+            ]),
+        )
+        .await;
+        let error = backend
+            .dispatch("apply_plan", &json!({"planId":plan_id}))
+            .await
+            .unwrap_err();
+        assert!(error.contains("DNS 记录已变化"));
+        assert!(server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .all(|request| !matches!(request.method.as_str(), "POST" | "PATCH" | "DELETE")));
+    }
+
+    #[tokio::test]
+    async fn non_address_dns_priority_change_blocks_placeholder_write() {
+        let (server, mut backend, _dir) = fixture().await;
+        let original = json!([{"id":"mx-one","name":"example.com","type":"MX",
+            "content":"mail.example.org","priority":10,"ttl":300,
+            "proxied":false,"proxiable":false}]);
+        mount_zone_owner(&server).await;
+        mount_exact_dns(&server, original.clone()).await;
+        mount_full_dns(&server, original).await;
+        let prepared = backend
+            .dispatch("prepare_domain_dns", &json!({"input":"example.com"}))
+            .await
+            .unwrap();
+        let plan_id = prepared["plan"]["id"].as_str().unwrap().to_owned();
+
+        server.reset().await;
+        let changed = json!([{"id":"mx-one","name":"example.com","type":"MX",
+            "content":"mail.example.org","priority":50,"ttl":300,
+            "proxied":false,"proxiable":false}]);
+        mount_zone_owner(&server).await;
+        mount_exact_dns(&server, changed.clone()).await;
+        mount_full_dns(&server, changed).await;
+        let error = backend
+            .dispatch("apply_plan", &json!({"planId":plan_id}))
+            .await
+            .unwrap_err();
+        assert!(error.contains("DNS 记录已变化"));
+        assert!(server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .all(|request| !matches!(request.method.as_str(), "POST" | "PATCH" | "DELETE")));
+    }
+
+    #[tokio::test]
+    async fn full_zone_newer_non_address_content_blocks_placeholder_write() {
+        let (server, mut backend, _dir) = fixture().await;
+        let original = json!([{"id":"mx-one","name":"example.com","type":"MX",
+            "content":"mail.example.org","priority":10,"ttl":300,
+            "proxied":false,"proxiable":false}]);
+        mount_zone_owner(&server).await;
+        mount_exact_dns(&server, original.clone()).await;
+        mount_full_dns(&server, original.clone()).await;
+        let prepared = backend
+            .dispatch("prepare_domain_dns", &json!({"input":"example.com"}))
+            .await
+            .unwrap();
+        let plan_id = prepared["plan"]["id"].as_str().unwrap().to_owned();
+
+        server.reset().await;
+        let changed = json!([{"id":"mx-one","name":"example.com","type":"MX",
+            "content":"changed-mail.example.org","priority":10,"ttl":300,
+            "proxied":false,"proxiable":false}]);
+        mount_zone_owner(&server).await;
+        mount_exact_dns(&server, original).await;
+        mount_full_dns(&server, changed).await;
+        let error = backend
+            .dispatch("apply_plan", &json!({"planId":plan_id}))
+            .await
+            .unwrap_err();
+        assert!(error.contains("DNS 记录已变化"));
+        assert!(server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .all(|request| !matches!(request.method.as_str(), "POST" | "PATCH" | "DELETE")));
+    }
+
+    #[tokio::test]
+    async fn full_zone_mismatch_blocks_placeholder_plan_during_prepare() {
+        let (server, mut backend, _dir) = fixture().await;
+        let exact = json!([{"id":"mx-one","name":"example.com","type":"MX",
+            "content":"mail.example.org","priority":10,"ttl":300,
+            "proxied":false,"proxiable":false}]);
+        let full = json!([{"id":"mx-one","name":"example.com","type":"MX",
+            "content":"changed-mail.example.org","priority":10,"ttl":300,
+            "proxied":false,"proxiable":false}]);
+        mount_zone_owner(&server).await;
+        mount_exact_dns(&server, exact).await;
+        mount_full_dns(&server, full).await;
+
+        let prepared = backend
+            .dispatch("prepare_domain_dns", &json!({"input":"example.com"}))
+            .await
+            .unwrap();
+        assert_eq!(prepared["dnsStatus"], "conflict");
+        assert_eq!(prepared["canApply"], false);
+        assert!(prepared.get("plan").is_none());
+        assert!(prepared["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|check| check["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("DNS 记录已变化"))));
+        assert!(server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .all(|request| !matches!(request.method.as_str(), "POST" | "PATCH" | "DELETE")));
+    }
+
+    #[tokio::test]
+    async fn domain_preflight_reports_non_address_records_as_missing_web_address() {
+        let (server, mut backend, _dir) = fixture().await;
+        mount_domain_hard_checks(
+            &server,
+            json!([
+                {"name":"example.com","type":"MX","proxied":false,"proxiable":false},
+                {"name":"example.com","type":"TXT","proxied":false,"proxiable":false},
+                {"name":"example.com","type":"CAA","proxied":false,"proxiable":false}
+            ]),
+            json!([]),
+        )
+        .await;
+
+        let prepared = backend
+            .dispatch(
+                "prepare_domain",
+                &json!({"input":"example.com","prefix":"go"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(prepared["canApply"], false);
+        let dns = prepared["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|check| check["label"] == "DNS")
+            .unwrap();
+        assert_eq!(dns["level"], "error");
+        assert!(dns["message"]
+            .as_str()
+            .unwrap()
+            .contains("还没有用于打开网址的解析"));
+        assert!(!dns["message"].as_str().unwrap().contains("不支持"));
     }
 
     #[tokio::test]
@@ -5383,7 +5725,7 @@ mod tests {
         let error = backend
             .dispatch(
                 "prepare_domain",
-                &json!({"input":"example.org","prefix":"go"}),
+                &json!({"input":"example.org","prefix":"go","accountId":"acct2"}),
             )
             .await
             .unwrap_err();
@@ -5444,6 +5786,143 @@ mod tests {
         assert_eq!(state["accounts"][0]["cloudflareName"], "Cloud Example");
         assert_eq!(state["accounts"][0]["zones"][0]["id"], "zone-new");
         assert!(state["accounts"][0]["zones"][0].get("accountId").is_none());
+    }
+
+    fn add_second_refresh_account(backend: &mut Backend) {
+        let mut second = backend.db.accounts[0].clone();
+        second.id = "acct2".into();
+        second.label = "Second account".into();
+        second.zones.clear();
+        second.zone_count = 0;
+        backend.db.accounts.push(second);
+        keyring_set("acct2", "token", "second-test-token").unwrap();
+    }
+
+    #[tokio::test]
+    async fn refresh_domains_reads_only_selected_token_and_zone_api() {
+        let (server, mut backend, _dir) = fixture().await;
+        add_second_refresh_account(&mut backend);
+        keyring_delete("acct1", "token").unwrap();
+        let other = serde_json::to_value(&backend.db.accounts[0]).unwrap();
+        Mock::given(method("GET"))
+            .and(path("/client/v4/zones"))
+            .and(query_param("account.id", "acct2"))
+            .and(header_regex("authorization", "Bearer second-test-token"))
+            .respond_with(ok(
+                json!([{"id":"zone-two","name":"example.org","status":"active"}]),
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let result = backend
+            .dispatch("refresh_domains", &json!({"accountId":"acct2"}))
+            .await
+            .unwrap();
+        assert_eq!(result["accounts"][1]["zones"][0]["name"], "example.org");
+        assert_eq!(result["accounts"][1]["label"], "Second account");
+        assert_eq!(result["appVersion"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(
+            serde_json::to_value(&backend.db.accounts[0]).unwrap(),
+            other
+        );
+        assert_eq!(*mock_key_reads().lock().unwrap(), vec!["token:acct2"]);
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn refresh_domains_and_unknown_host_require_account_without_reading_credentials() {
+        let (server, mut backend, _dir) = fixture().await;
+        add_second_refresh_account(&mut backend);
+        for (action, payload) in [
+            ("refresh_domains", json!({})),
+            (
+                "prepare_domain",
+                json!({"input":"example.org","prefix":"go"}),
+            ),
+            ("prepare_domain_dns", json!({"input":"example.org"})),
+            ("refresh_domains", json!({"accountId":"unknown"})),
+            ("refresh_domains", json!({"accountId":12})),
+        ] {
+            assert!(backend.dispatch(action, &payload).await.is_err());
+        }
+        assert!(mock_key_reads().lock().unwrap().is_empty());
+        assert!(server.received_requests().await.unwrap().is_empty());
+        assert!(backend.plans.is_empty());
+    }
+
+    #[tokio::test]
+    async fn refresh_domains_uses_single_account_and_preserves_cache_on_failure() {
+        let (server, mut backend, _dir) = fixture().await;
+        let before = serde_json::to_value(&backend.db.accounts).unwrap();
+        Mock::given(method("GET"))
+            .and(path("/client/v4/zones"))
+            .respond_with(ResponseTemplate::new(403))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let error = backend
+            .dispatch("refresh_domains", &json!({}))
+            .await
+            .unwrap_err();
+        assert!(error.contains("无法刷新账户"));
+        assert_eq!(serde_json::to_value(&backend.db.accounts).unwrap(), before);
+        assert_eq!(*mock_key_reads().lock().unwrap(), vec!["token:acct1"]);
+    }
+
+    #[tokio::test]
+    async fn refresh_domains_rolls_back_when_local_save_fails() {
+        let (server, mut backend, _dir) = fixture().await;
+        let before = serde_json::to_value(&backend.db.accounts).unwrap();
+        backend
+            .fail_persist_at
+            .store(1, std::sync::atomic::Ordering::SeqCst);
+        Mock::given(method("GET"))
+            .and(path("/client/v4/zones"))
+            .respond_with(ok(json!([])))
+            .expect(1)
+            .mount(&server)
+            .await;
+        assert!(backend
+            .dispatch("refresh_domains", &json!({}))
+            .await
+            .unwrap_err()
+            .contains("保存失败"));
+        assert_eq!(serde_json::to_value(&backend.db.accounts).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn refresh_domains_missing_credential_stops_without_cloud_request() {
+        let (server, mut backend, _dir) = fixture().await;
+        keyring_delete("acct1", "token").unwrap();
+        let error = backend
+            .dispatch("refresh_domains", &json!({}))
+            .await
+            .unwrap_err();
+        assert!(error.contains("未刷新域名列表"));
+        assert_eq!(*mock_key_reads().lock().unwrap(), vec!["token:acct1"]);
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn repeated_domain_operations_fail_promptly_instead_of_queuing_authorization() {
+        let (_server, backend, _dir) = fixture().await;
+        let state = AppState(Mutex::new(backend));
+        let guard = state.0.lock().await;
+        for action in [
+            "refresh_domains",
+            "refresh_accounts",
+            "prepare_domain",
+            "prepare_domain_dns",
+        ] {
+            let result =
+                tokio::time::timeout(Duration::from_millis(100), lock_backend(&state, action))
+                    .await
+                    .unwrap();
+            assert!(result.err().unwrap().contains("上一个操作仍在进行"));
+        }
+        assert!(mock_key_reads().lock().unwrap().is_empty());
+        drop(guard);
+        assert!(lock_backend(&state, "refresh_domains").await.is_ok());
     }
 
     #[tokio::test]
@@ -5572,7 +6051,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dns_record_change_blocks_write_and_existing_non_address_record_is_not_overwritten() {
+    async fn dns_record_change_blocks_write_and_unknown_record_is_not_overwritten() {
         let (server, mut backend, _dir) = fixture().await;
         let original = json!({"id":"dns-one","name":"example.com","type":"A",
             "content":"192.0.2.10","proxied":false,"proxiable":true});
@@ -5607,8 +6086,8 @@ mod tests {
         mount_zone_owner(&server).await;
         mount_exact_dns(
             &server,
-            json!([{"id":"txt-one","name":"example.com","type":"TXT",
-            "content":"verification=example","proxied":false,"proxiable":false}]),
+            json!([{"id":"https-one","name":"example.com","type":"HTTPS",
+            "content":"1 . alpn=h3","proxied":false,"proxiable":false}]),
         )
         .await;
         let blocked = backend

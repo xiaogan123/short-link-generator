@@ -7,13 +7,20 @@ pub struct DnsRecordFingerprint {
     pub name: String,
     pub record_type: String,
     pub content: String,
+    pub ttl: Option<Value>,
+    pub priority: Option<Value>,
+    pub data: Option<Value>,
+    pub settings: Option<Value>,
     pub proxied: bool,
     pub proxiable: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DnsSnapshot {
-    Missing,
+    // Missing means that the host has no web address record. Keep any safe
+    // non-address records in the snapshot so observed mail or validation
+    // changes block the reviewed write.
+    Missing(Vec<DnsRecordFingerprint>),
     EnableProxy(Vec<DnsRecordFingerprint>),
 }
 
@@ -24,6 +31,22 @@ pub enum DnsAssessment {
     DnsOnly(Vec<DnsRecordFingerprint>),
     Unsupported(String),
     Conflict(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DnsClassification {
+    Ready,
+    Missing,
+    NeedsProxy,
+    Unsupported(String),
+    Conflict(String),
+}
+
+#[derive(Clone, Copy)]
+struct DnsRecordState<'a> {
+    record_type: &'a str,
+    proxied: bool,
+    proxiable: bool,
 }
 
 pub fn dns_fingerprint(items: &[Value], host: &str) -> Result<Vec<DnsRecordFingerprint>, String> {
@@ -52,6 +75,12 @@ pub fn dns_fingerprint(items: &[Value], host: &str) -> Result<Vec<DnsRecordFinge
             name: host.to_owned(),
             record_type: record_type.to_owned(),
             content: content.to_owned(),
+            // Snapshot only fields that configure the DNS answer. Provider
+            // timestamps and other response metadata are intentionally excluded.
+            ttl: optional_config(item, "ttl"),
+            priority: optional_config(item, "priority"),
+            data: optional_config(item, "data"),
+            settings: optional_config(item, "settings"),
             proxied,
             proxiable,
         });
@@ -62,42 +91,93 @@ pub fn dns_fingerprint(items: &[Value], host: &str) -> Result<Vec<DnsRecordFinge
     Ok(records)
 }
 
-pub fn assess_dns(records: &[DnsRecordFingerprint]) -> DnsAssessment {
+fn optional_config(item: &Value, key: &str) -> Option<Value> {
+    item.get(key).filter(|value| !value.is_null()).cloned()
+}
+
+pub fn classify_dns_records(items: &[Value], host: &str) -> Result<DnsClassification, String> {
+    let records = items
+        .iter()
+        .filter(|item| item["name"].as_str() == Some(host))
+        .map(|item| {
+            let record_type = item["type"].as_str().ok_or("DNS 记录缺少类型")?;
+            Ok(DnsRecordState {
+                record_type,
+                proxied: item["proxied"].as_bool().unwrap_or(false),
+                proxiable: item["proxiable"]
+                    .as_bool()
+                    .unwrap_or(matches!(record_type, "A" | "AAAA" | "CNAME")),
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok(classify_dns_states(&records))
+}
+
+fn classify_dns_states(records: &[DnsRecordState<'_>]) -> DnsClassification {
     if records.is_empty() {
-        return DnsAssessment::Missing;
+        return DnsClassification::Missing;
     }
     if records.iter().any(|record| record.record_type == "NS") {
-        return DnsAssessment::Conflict("该主机名存在 NS 委派，不能由应用接管 DNS".into());
+        return DnsClassification::Conflict("该主机名存在 NS 委派，不能由应用接管 DNS".into());
+    }
+    if records.iter().any(|record| {
+        !matches!(
+            record.record_type,
+            "A" | "AAAA" | "CNAME" | "MX" | "TXT" | "CAA"
+        )
+    }) {
+        return DnsClassification::Unsupported(
+            "这个域名还有其他类型的 DNS 设置，应用无法确认能否安全共存；请先人工检查".into(),
+        );
     }
     let address_records: Vec<_> = records
         .iter()
-        .filter(|record| matches!(record.record_type.as_str(), "A" | "AAAA" | "CNAME"))
+        .filter(|record| matches!(record.record_type, "A" | "AAAA" | "CNAME"))
         .collect();
     if address_records.is_empty() {
-        return DnsAssessment::Unsupported(
-            "该主机名已有不可代理的 DNS 记录，应用不会添加或覆盖地址记录".into(),
-        );
+        return DnsClassification::Missing;
     }
     let has_cname = address_records
         .iter()
         .any(|record| record.record_type == "CNAME");
     if has_cname && address_records.len() != 1 {
-        return DnsAssessment::Conflict("同一主机名的 CNAME 与其他地址记录冲突".into());
+        return DnsClassification::Conflict("同一主机名的 CNAME 与其他地址记录冲突".into());
     }
     if address_records.iter().any(|record| !record.proxiable) {
-        return DnsAssessment::Unsupported(
+        return DnsClassification::Unsupported(
             "云端标记至少一条地址记录不支持代理，应用不会强行修改".into(),
         );
     }
-    let pending: Vec<_> = address_records
-        .into_iter()
-        .filter(|record| !record.proxied)
-        .cloned()
-        .collect();
-    if pending.is_empty() {
-        DnsAssessment::Ready
+    if address_records.iter().all(|record| record.proxied) {
+        DnsClassification::Ready
     } else {
-        DnsAssessment::DnsOnly(pending)
+        DnsClassification::NeedsProxy
+    }
+}
+
+pub fn assess_dns(records: &[DnsRecordFingerprint]) -> DnsAssessment {
+    let states: Vec<_> = records
+        .iter()
+        .map(|record| DnsRecordState {
+            record_type: &record.record_type,
+            proxied: record.proxied,
+            proxiable: record.proxiable,
+        })
+        .collect();
+    match classify_dns_states(&states) {
+        DnsClassification::Ready => DnsAssessment::Ready,
+        DnsClassification::Missing => DnsAssessment::Missing,
+        DnsClassification::NeedsProxy => DnsAssessment::DnsOnly(
+            records
+                .iter()
+                .filter(|record| {
+                    matches!(record.record_type.as_str(), "A" | "AAAA" | "CNAME") && !record.proxied
+                })
+                .cloned()
+                .collect(),
+        ),
+        DnsClassification::Unsupported(message) => DnsAssessment::Unsupported(message),
+        DnsClassification::Conflict(message) => DnsAssessment::Conflict(message),
     }
 }
 
@@ -111,14 +191,18 @@ pub fn placeholder_conflict(all_records: &[Value], host: &str, zone_name: &str) 
         let Some(record_type) = item["type"].as_str() else {
             return Some("DNS 区域记录格式无效，无法安全创建占位记录".into());
         };
-        if name == host {
-            return Some("完整区域清单显示该主机名已有 DNS 记录，不能创建占位记录".into());
-        }
         if record_type == "NS"
-            && name != zone_name
-            && (host == name || host.ends_with(&format!(".{name}")))
+            && (name == host || (name != zone_name && host.ends_with(&format!(".{name}"))))
         {
             return Some(format!("{name} 存在 NS 子域委派，应用不会在其下创建记录"));
+        }
+        if name == host {
+            if matches!(record_type, "MX" | "TXT" | "CAA") {
+                continue;
+            }
+            return Some(format!(
+                "完整区域清单显示该主机名已有 {record_type} 记录，不能创建占位记录"
+            ));
         }
         if let Some(suffix) = name.strip_prefix("*.") {
             if host.ends_with(&format!(".{suffix}")) {
@@ -371,6 +455,138 @@ mod tests {
     }
 
     #[test]
+    fn dns_assessment_treats_mail_and_validation_records_as_missing_web_address() {
+        let records = dns_fingerprint(
+            &[
+                dns_record("mx-one", "MX", "mail.example.org", false, false),
+                dns_record("txt-one", "TXT", "verification=example", false, false),
+                dns_record("caa-one", "CAA", "0 issue example.org", false, false),
+            ],
+            "example.com",
+        )
+        .unwrap();
+        assert_eq!(assess_dns(&records), DnsAssessment::Missing);
+
+        let unknown = dns_fingerprint(
+            &[dns_record(
+                "https-one",
+                "HTTPS",
+                "1 . alpn=h3",
+                false,
+                false,
+            )],
+            "example.com",
+        )
+        .unwrap();
+        assert!(matches!(
+            assess_dns(&unknown),
+            DnsAssessment::Unsupported(_)
+        ));
+        let mixed_unknown = dns_fingerprint(
+            &[
+                dns_record("a-one", "A", "192.0.2.10", true, true),
+                dns_record("https-one", "HTTPS", "1 . alpn=h3", false, false),
+            ],
+            "example.com",
+        )
+        .unwrap();
+        assert!(matches!(
+            assess_dns(&mixed_unknown),
+            DnsAssessment::Unsupported(_)
+        ));
+
+        let delegated = dns_fingerprint(
+            &[dns_record("ns-one", "NS", "ns1.example.org", false, false)],
+            "example.com",
+        )
+        .unwrap();
+        assert!(matches!(assess_dns(&delegated), DnsAssessment::Conflict(_)));
+    }
+
+    #[test]
+    fn cname_can_coexist_with_mail_records_but_not_other_addresses() {
+        let ready = dns_fingerprint(
+            &[
+                dns_record("cname-one", "CNAME", "origin.example.org", true, true),
+                dns_record("mx-one", "MX", "mail.example.org", false, false),
+                dns_record("txt-one", "TXT", "verification=example", false, false),
+            ],
+            "example.com",
+        )
+        .unwrap();
+        assert_eq!(assess_dns(&ready), DnsAssessment::Ready);
+
+        let grey = dns_fingerprint(
+            &[dns_record(
+                "cname-one",
+                "CNAME",
+                "origin.example.org",
+                false,
+                true,
+            )],
+            "example.com",
+        )
+        .unwrap();
+        assert!(matches!(assess_dns(&grey), DnsAssessment::DnsOnly(_)));
+    }
+
+    #[test]
+    fn dns_fingerprint_tracks_config_fields_but_ignores_provider_timestamps() {
+        let original = serde_json::json!([{
+            "id":"mx-one",
+            "name":"example.com",
+            "type":"MX",
+            "content":"mail.example.org",
+            "ttl":300,
+            "priority":10,
+            "data":{"priority":10,"target":"mail.example.org"},
+            "settings":{"ipv4_only":false},
+            "proxied":false,
+            "proxiable":false,
+            "modified_on":"2026-09-30T00:00:00Z"
+        }]);
+        let expected = dns_fingerprint(original.as_array().unwrap(), "example.com").unwrap();
+
+        let mut timestamp_only = original.clone();
+        timestamp_only[0]["modified_on"] = serde_json::json!("2026-09-30T00:01:00Z");
+        assert_eq!(
+            dns_fingerprint(timestamp_only.as_array().unwrap(), "example.com").unwrap(),
+            expected
+        );
+
+        for (field, value) in [
+            ("ttl", serde_json::json!(600)),
+            ("priority", serde_json::json!(50)),
+            (
+                "data",
+                serde_json::json!({"priority":50,"target":"mail.example.org"}),
+            ),
+            ("settings", serde_json::json!({"ipv4_only":true})),
+        ] {
+            let mut changed = original.clone();
+            changed[0][field] = value;
+            assert_ne!(
+                dns_fingerprint(changed.as_array().unwrap(), "example.com").unwrap(),
+                expected,
+                "{field} must be part of the reviewed DNS snapshot"
+            );
+        }
+    }
+
+    #[test]
+    fn placeholder_guard_allows_exact_mail_and_validation_records() {
+        let records = vec![
+            dns_record("mx-one", "MX", "mail.example.org", false, false),
+            dns_record("txt-one", "TXT", "verification=example", false, false),
+            dns_record("caa-one", "CAA", "0 issue example.org", false, false),
+        ];
+        assert_eq!(
+            placeholder_conflict(&records, "example.com", "example.com"),
+            None
+        );
+    }
+
+    #[test]
     fn placeholder_guard_rejects_parent_delegation_and_wildcard() {
         let delegated = vec![serde_json::json!({
             "id":"ns-one","name":"child.example.com","type":"NS","content":"ns1.example.org"
@@ -387,6 +603,14 @@ mod tests {
             placeholder_conflict(&wildcard, "go.example.com", "example.com")
                 .unwrap()
                 .contains("通配符")
+        );
+        let exact_delegation = vec![serde_json::json!({
+            "id":"ns-two","name":"go.example.com","type":"NS","content":"ns1.example.org"
+        })];
+        assert!(
+            placeholder_conflict(&exact_delegation, "go.example.com", "example.com")
+                .unwrap()
+                .contains("NS")
         );
     }
 

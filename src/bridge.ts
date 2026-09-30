@@ -6,6 +6,7 @@ export const preview = new URLSearchParams(window.location.search).get('preview'
 const now = () => new Date().toISOString();
 const uid = () => Math.random().toString(36).slice(2, 10);
 const demoState: State = {
+  appVersion: '0.0.0-preview',
   accounts: [
     { id: 'demo-a', label: '示例账户 · 团队', cloudflareName: 'Example team', zones: [{id:'demo-zone-1',name:'example.com',status:'active'},{id:'demo-zone-2',name:'example.org',status:'active'}], zoneCount: 2, checkedAt: now(), hasResources: true, needsSelftestKey: false },
     { id: 'demo-b', label: '示例账户 · 个人', cloudflareName: 'Example personal', zones: [{id:'demo-zone-3',name:'example.net',status:'active'}], zoneCount: 1, checkedAt: now(), hasResources: false, needsSelftestKey: true },
@@ -34,7 +35,15 @@ function makePlan(title: string, steps: string[], warnings: string[], action: st
 function previewDispatch(action: Action, payload: Record<string, unknown>): unknown {
   if (action === 'get_state') return clone();
   if (action === 'token_template') return 'https://dash.cloudflare.com/profile/api-tokens';
-  if (action === 'refresh_accounts') { local.accounts = local.accounts.map(a => ({ ...a, checkedAt: now() })); return clone(); }
+  if (action === 'refresh_accounts') { const accountId=typeof payload.accountId==='string' ? payload.accountId : ''; local.accounts = local.accounts.map(a => !accountId || a.id === accountId ? ({ ...a, checkedAt: now() }) : a); return clone(); }
+  if (action === 'refresh_domains') {
+    const accountId=String(payload.accountId || '');
+    if (!accountId) throw new Error('请选择要刷新域名的 Cloudflare 账户。');
+    const account=local.accounts.find(item=>item.id===accountId);
+    if (!account) throw new Error('所选 Cloudflare 账户已不可用。');
+    local.accounts=local.accounts.map(item=>item.id===accountId ? {...item,checkedAt:now()} : item);
+    return clone();
+  }
   if (action === 'import_token') {
     const token = String(payload.token || '').trim();
     if (!token) throw new Error('请先粘贴令牌。');
@@ -121,7 +130,7 @@ function previewDispatch(action: Action, payload: Record<string, unknown>): unkn
   if (action === 'resume_monitor') return makePlan('继续处理检测服务',['复核待处理的检测配置并继续'],['本地预览不会连接云服务。'],'resume_monitor',{accountId:payload.accountId});
   if (action === 'export_config') return JSON.stringify({ version: 1, domains: local.domains.map(d => ({ host: d.host, prefix: d.prefix })), links: local.links }, null, 2);
   if (action === 'import_config') throw new Error('本地预览无法验证远端归属，请在桌面应用中导入备份。');
-  if (action === 'check_update') return { status: 'unavailable' };
+  if (action === 'check_update') return { status: 'unavailable', currentVersion: local.appVersion };
   if (action === 'install_update') throw new Error('本地预览无法安装更新。');
   throw new Error('未知操作。');
 }

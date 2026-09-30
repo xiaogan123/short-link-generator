@@ -22,10 +22,10 @@ it('keeps a DNS repair plan open while applying, so its late result cannot prepa
   const form=screen.getByRole('dialog',{name:'添加域名'});
   fireEvent.change(within(form).getByPlaceholderText('go.example.com'),{target:{value:'old.example.com'}});
   fireEvent.click(within(form).getByRole('button',{name:'检查并接入'}));
-  fireEvent.click(await within(form).findByRole('button',{name:'检查 DNS 与代理'}));
-  fireEvent.click(await within(form).findByRole('button',{name:'查看 DNS 占位计划'}));
+  fireEvent.click(await within(form).findByRole('button',{name:'检查并补齐网站解析'}));
+  fireEvent.click(await within(form).findByRole('button',{name:'补齐解析并继续'}));
   const plan=screen.getByRole('dialog',{name:'修复 DNS'});
-  fireEvent.click(within(plan).getByRole('button',{name:'确认并执行'}));
+  fireEvent.click(within(plan).getByRole('button',{name:'确认修改并继续检查'}));
   await waitFor(()=>expect(control.resolveApply).toBeTypeOf('function'));
   fireEvent.keyDown(document,{key:'Escape'});
   fireEvent.mouseDown(plan.parentElement!);
@@ -34,6 +34,7 @@ it('keeps a DNS repair plan open while applying, so its late result cannot prepa
   expect(screen.queryByRole('dialog',{name:'添加域名'})).toBeNull();
   control.domainReady=true;
   await act(async()=>{control.resolveApply!(state);});
+  expect(await screen.findByText('解析设置已提交，正在继续检查域名。')).toBeTruthy();
   const reopened=await screen.findByRole('dialog',{name:'添加域名'});
   expect((within(reopened).getByPlaceholderText('go.example.com') as HTMLInputElement).value).toBe('old.example.com');
   expect(control.calls.filter(call=>call.action==='prepare_domain').at(-1)?.payload.input).toBe('old.example.com');
@@ -48,7 +49,7 @@ it('shows ready DNS as a pass and refreshes local state without applying a domai
   fireEvent.change(within(form).getByPlaceholderText('go.example.com'),{target:{value:'ready.example.com'}});
   fireEvent.click(within(form).getByRole('button',{name:'检查并接入'}));
   fireEvent.click(await within(form).findByRole('button',{name:'检查 DNS 与代理'}));
-  expect(await within(form).findByText('DNS 已就绪，无需设置')).toBeTruthy();
+  expect(await within(form).findByText('网站解析已就绪')).toBeTruthy();
   expect(control.calls.filter(call=>call.action==='get_state').length).toBeGreaterThan(1);
   expect(within(form).queryByRole('button',{name:/查看.*计划/})).toBeNull();
 });
@@ -61,6 +62,6 @@ it('refreshes cached zones after a DNS result that still needs repair',async()=>
   fireEvent.change(within(form).getByPlaceholderText('go.example.com'),{target:{value:'repair.example.com'}});
   fireEvent.click(within(form).getByRole('button',{name:'检查并接入'}));
   fireEvent.click(await within(form).findByRole('button',{name:'检查 DNS 与代理'}));
-  expect(await within(form).findByText('缺少 DNS 记录')).toBeTruthy();
+  expect(await within(form).findByText('需要补齐网站解析')).toBeTruthy();
   expect(control.calls.filter(call=>call.action==='get_state').length).toBeGreaterThan(2);
 });
