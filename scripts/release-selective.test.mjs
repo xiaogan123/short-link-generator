@@ -395,11 +395,18 @@ test('release workflow is manual, selective, and scans before one-day upload', (
   assert.equal(steps[smoke].env.SLG_UPDATER_PUBLIC_KEY, '${{ vars.UPDATER_PUBLIC_KEY }}');
   assert.equal(steps[smoke].env.SLG_MACOS_CERT_SHA256, '${{ vars.MACOS_SIGNING_CERT_SHA256 }}');
   const packageStep = steps.find(step => step.id === 'package');
+  const signerStep = steps.find(step => step.name === 'Prepare pinned macOS signing tool');
+  assert.ok(steps.indexOf(signerStep) < steps.indexOf(packageStep));
+  assert.equal(signerStep.if, "runner.os == 'macOS'");
+  assert.equal(signerStep.env, undefined);
+  assert.equal(signerStep.run, 'node scripts/rcodesign-tool.mjs --install');
+  assert.match(packageStep.run, /ulimit -S -c 0\s+ulimit -H -c 0\s+node scripts\/stable-macos-sign/);
   assert.match(packageStep.run, /stable-macos-sign\.mjs -- npm run tauri/);
   assert.match(packageStep.env.SLG_MACOS_SIGNING_P12_BASE64, /runner\.os == 'macOS'/);
   assert.equal(steps[scan].id, 'privacy');
   assert.match(steps[scan].env.SLG_MACOS_SIGNING_P12_BASE64, /runner\.os == 'macOS'/);
   assert.match(steps[scan].env.SLG_MACOS_SIGNING_P12_PASSWORD, /runner\.os == 'macOS'/);
+  assert.match(steps[scan].run, /ulimit -S -c 0\s+ulimit -H -c 0/);
   assert.equal(steps[scan].if, "${{ !cancelled() && steps.package.outcome == 'success' }}");
   assert.equal(steps[upload].if, "${{ !cancelled() && steps.native_smoke.outcome == 'success' && steps.privacy.outcome == 'success' }}");
   assert.equal(steps[upload].with['retention-days'], 1);

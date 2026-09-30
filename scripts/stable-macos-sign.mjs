@@ -1,18 +1,27 @@
 import { createPrivateKey, randomBytes } from 'node:crypto';
-import { spawn } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { spawn, execFileSync } from 'node:child_process';
+import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, isAbsolute, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { X509Certificate } from 'node:crypto';
-import { certificateInfo, cleanSigningEnvironment, verifyMacSigning } from './macos-signature.mjs';
+import { certificateInfo, cleanSigningEnvironment, stableRequirement, verifyMacSigning } from './macos-signature.mjs';
+import { signingToolEnvironment } from './macos-codesign.mjs';
+import { verifyRcodesignTool } from './rcodesign-tool.mjs';
 
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 const shellQuote = value => `'${value.replace(/'/g, `'"'"'`)}'`;
 const fail = (stage = 'configuration') => Object.assign(new Error(`Isolated macOS signing failed at ${stage}; no candidate is approved.`), { stage });
 
-// Share the same boundary with public-certificate inspection subprocesses.
-export const cleanBuildEnvironment = cleanSigningEnvironment;
+// Only the packaging process needs the updater signer. Inspection and native
+// security tools use cleanSigningEnvironment without these private inputs.
+export function cleanBuildEnvironment(env) {
+  const clean = cleanSigningEnvironment(env);
+  for (const name of ['TAURI_SIGNING_PRIVATE_KEY', 'TAURI_SIGNING_PRIVATE_KEY_PASSWORD']) {
+    if (env[name] !== undefined) clean[name] = env[name];
+  }
+  return clean;
+}
 
 function privateFile(path, cwd) {
   const actual = realpathSync(path);
@@ -42,9 +51,10 @@ export function loadMaterial(env, cwd) {
 }
 
 // Captures all tool output. Neither tool errors nor command arguments may print secret material.
-export function runCaptured(command, args, { env, input, timeout = 60_000 } = {}) {
+export function runCaptured(command, args, { env, input, timeout = 60_000, onChild } = {}) {
   return new Promise((resolveResult, reject) => {
     const child = spawn(command, args, { env, stdio: ['pipe', 'pipe', 'pipe'] });
+    onChild?.(child);
     const chunks = [];
     let size = 0;
     let failed = false;
@@ -59,8 +69,9 @@ export function runCaptured(command, args, { env, input, timeout = 60_000 } = {}
     child.on('error', () => { failed = true; });
     child.on('close', code => {
       clearTimeout(timer);
-      if (failed || code !== 0) reject(fail());
-      else resolveResult(Buffer.concat(chunks));
+      onChild?.(null);
+      if (failed || code !== 0) { for (const chunk of chunks) chunk.fill(0); reject(fail()); }
+      else { const output = Buffer.concat(chunks); for (const chunk of chunks) chunk.fill(0); resolveResult(output); }
     });
     child.stdin.end(input);
   });
@@ -108,110 +119,126 @@ async function runBuild(command, env, cwd, state) {
 }
 
 export async function withStableSigning({ command, env = process.env, cwd = process.cwd(), platform = process.platform,
-  run = runCaptured, build = runBuild, verify = verifyMacSigning, materialLoader = loadMaterial, tempRoot = tmpdir() }) {
-  if (platform !== 'darwin' || !command?.length || !/^[a-f0-9]{64}$/.test(env.SLG_MACOS_CERT_SHA256 ?? '')) throw fail();
-  const clean = cleanBuildEnvironment(env);
+  arch = process.arch, run = runCaptured, build = runBuild, verify = verifyMacSigning, materialLoader = loadMaterial,
+  materialPreparer = prepareMaterial, verifyTool = verifyRcodesignTool, tempRoot = tmpdir(), removeTemp = path => rmSync(path, { recursive: true, force: true }) }) {
+  if (platform !== 'darwin' || !command?.length || !/^[a-f0-9]{64}$/.test(env.SLG_MACOS_CERT_SHA256 ?? '') ||
+      !env.SLG_RCODESIGN_PATH || env.SLG_MACOS_OPENSSL !== undefined) throw fail();
+  const targetIndex = command.indexOf('--target');
+  if (!['arm64', 'x64'].includes(arch) || command.filter(value => value === '--target').length > 1 ||
+      command.some(value => value.startsWith('--target=')) ||
+      (targetIndex >= 0 && command[targetIndex + 1] !== ({ arm64: 'aarch64-apple-darwin', x64: 'x86_64-apple-darwin' })[arch])) throw fail();
   const temp = mkdtempSync(join(tempRoot, 'slg-macos-sign-'));
-  chmodSync(temp, 0o700);
-  const keychain = join(temp, 'release-signing.keychain-db');
-  const security = (args) => run('/usr/bin/security', args, { env: clean });
-  const state = { child: null, interrupted: false };
-  // A signal received during a tool invocation must stop the next key operation.
-  // Cleanup deliberately uses security() directly so cancellation cannot prevent it.
-  const signingSecurity = async args => {
-    if (state.interrupted) throw fail('interrupted');
-    const output = await security(args);
-    if (state.interrupted) throw fail('interrupted');
-    return output;
-  };
+  const toolEnv = signingToolEnvironment({ ...env, TMPDIR: temp });
+  const inventoryEnv = signingToolEnvironment(env);
+  const state = { child: null, toolChild: null, interrupted: false };
   let killTimer;
   const stop = () => {
     state.interrupted = true;
+    state.toolChild?.kill('SIGKILL');
     if (state.child?.pid) {
       const pid = state.child.pid;
       try { process.kill(-pid, 'SIGTERM'); } catch {}
       killTimer ??= setTimeout(() => { try { process.kill(-pid, 'SIGKILL'); } catch {} }, 5000);
     }
   };
-  process.on('SIGTERM', stop); process.on('SIGINT', stop);
-  let beforeList;
-  let beforeDefault;
-  let result;
-  let failure;
-  let stage = 'material';
-  let cleanupFailed = false;
+  const check = () => { if (state.interrupted) throw fail('interrupted'); };
+  const checkedRun = async (cmd, args, options = {}) => {
+    check();
+    const result = await run(cmd, args, { ...options, onChild: child => { state.toolChild = child; } });
+    check(); return result;
+  };
+  const inventory = async () => ({
+    searchList: (await run('/usr/bin/security', ['list-keychains', '-d', 'user'], { env: inventoryEnv })).toString(),
+    defaultKeychain: (await run('/usr/bin/security', ['default-keychain', '-d', 'user'], { env: inventoryEnv })).toString(),
+  });
+  for (const name of ['SIGTERM', 'SIGINT', 'SIGHUP']) process.on(name, stop);
+  let before, result, tool, operationFailure, cleanupFailure;
+  let stage = 'configuration';
   try {
-    const material = materialLoader(env, cwd);
-    const prepared = await prepareMaterial(material, env.SLG_MACOS_CERT_SHA256, { run, env: clean, temp,
-      openssl: env.SLG_MACOS_OPENSSL ?? '/usr/bin/openssl' });
-    stage = 'searchlist';
-    beforeList = (await security(['list-keychains', '-d', 'user'])).toString();
-    beforeDefault = (await security(['default-keychain', '-d', 'user'])).toString();
-    if (state.interrupted) throw fail();
-    // Only randomly generated, single-build passwords enter security's argv; never the long-term password.
-    const keychainPassword = randomBytes(32).toString('base64url');
-    stage = 'import';
-    await signingSecurity(['create-keychain', '-p', keychainPassword, keychain]);
-    await signingSecurity(['unlock-keychain', '-p', keychainPassword, keychain]);
-    await signingSecurity(['import', prepared.importPath, '-k', keychain, '-P', prepared.importPassword, '-T', '/usr/bin/codesign']);
-    rmSync(prepared.importPath);
-    await signingSecurity(['set-key-partition-list', '-S', 'apple-tool:,apple:', '-s', '-k', keychainPassword, keychain]);
-    stage = 'searchlist';
-    if (beforeList !== (await security(['list-keychains', '-d', 'user'])).toString() ||
-        beforeDefault !== (await security(['default-keychain', '-d', 'user'])).toString()) throw fail();
+    chmodSync(temp, 0o700);
+    stage = 'core-limits';
+    const limits = (await checkedRun('/bin/sh', ['-c', 'ulimit -S -c; ulimit -H -c'], { env: toolEnv })).toString().trim();
+    if (limits !== '0\n0') throw fail();
+    stage = 'signer-tool';
+    tool = await verifyTool(env.SLG_RCODESIGN_PATH, { arch, platform,
+      run: (cmd, args, options) => checkedRun(cmd, args, { ...options, env: toolEnv }) });
+    check();
+    const privateTool = join(realpathSync(temp), 'rcodesign');
+    copyFileSync(tool.path, privateTool); chmodSync(privateTool, 0o500);
+    const copiedTool = await verifyTool(privateTool, { arch, platform,
+      run: (cmd, args, options) => checkedRun(cmd, args, { ...options, env: toolEnv }) });
+    if (copiedTool.sha256 !== tool.sha256 || copiedTool.version !== tool.version || copiedTool.arch !== tool.arch) throw fail();
+    tool = copiedTool;
+    check();
+    stage = 'searchlist'; before = await inventory(); check();
+    stage = 'material';
+    const prepared = await materialPreparer(materialLoader(env, cwd), env.SLG_MACOS_CERT_SHA256,
+      { run: checkedRun, env: toolEnv, temp, openssl: '/usr/bin/openssl' });
+    check();
+    if (!prepared.importPassword || /[\r\n\0]/.test(prepared.importPassword)) throw fail();
+    const passwordPath = join(temp, 'signing-password.txt');
+    writeFileSync(passwordPath, prepared.importPassword, { mode: 0o600, flag: 'wx' });
+    delete prepared.importPassword;
+    stage = 'requirement';
+    const requirementPath = join(temp, 'designated-requirement.bin');
+    await checkedRun('/usr/bin/csreq', ['-r', `=${stableRequirement(prepared.certificateSha1)}`, '-b', requirementPath], { env: toolEnv });
+    chmodSync(requirementPath, 0o600);
     const outputRoot = resolve(cwd, env.CARGO_TARGET_DIR || 'src-tauri/target');
+    const home = join(temp, 'home'); const buildTemp = join(temp, 'build-temp');
+    mkdirSync(home, { mode: 0o700 }); mkdirSync(buildTemp, { mode: 0o700 });
     const contextPath = join(temp, 'context.json');
-    writeFileSync(contextPath, JSON.stringify({ keychain, outputRoot, certificateSha1: prepared.certificateSha1 }), { mode: 0o600 });
-    const bin = join(temp, 'bin'); mkdirSync(bin);
-    writeFileSync(join(bin, 'codesign'), `#!/bin/sh\nexec ${shellQuote(process.execPath)} ${shellQuote(join(scriptDir, 'macos-codesign.mjs'))} "$@"\n`, { mode: 0o700 });
-    if (state.interrupted) throw fail();
-    stage = 'build';
-    await build(command, { ...clean, APPLE_SIGNING_IDENTITY: prepared.certificateSha1,
-      SLG_PRIVATE_SIGNING_CONTEXT: contextPath, PATH: `${bin}${sep === '/' ? ':' : ';'}${clean.PATH ?? ''}` }, cwd, state);
-    if (state.interrupted) throw fail();
-    stage = 'verify';
+    writeFileSync(contextPath, JSON.stringify({ schema: 1, outputRoot, materialRoot: temp, home, temp: buildTemp,
+      certificateSha1: prepared.certificateSha1, certificateSha256: prepared.certificateSha256,
+      p12Path: prepared.importPath, passwordPath, requirementPath, tool,
+      entitlementsRoots: [realpathSync(cwd), realpathSync(buildTemp)] }), { mode: 0o600, flag: 'wx' });
+    const bin = join(temp, 'bin'); mkdirSync(bin, { mode: 0o700 });
+    // Tauri retains its updater inputs; the adapter starts with an empty environment.
+    const shim = `#!/bin/sh\nexec /usr/bin/env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin LANG=C LC_ALL=C HOME=${shellQuote(home)} TMPDIR=${shellQuote(buildTemp)} SLG_PRIVATE_SIGNING_CONTEXT=${shellQuote(contextPath)} ${shellQuote(process.execPath)} ${shellQuote(join(scriptDir, 'macos-codesign.mjs'))} "$@"\n`;
+    writeFileSync(join(bin, 'codesign'), shim, { mode: 0o700, flag: 'wx' });
+    check(); stage = 'build';
+    await build(command, { ...cleanBuildEnvironment(env), APPLE_SIGNING_IDENTITY: prepared.certificateSha1,
+      TMPDIR: buildTemp, SLG_PRIVATE_SIGNING_CONTEXT: contextPath,
+      PATH: `${bin}:${cleanSigningEnvironment(env).PATH ?? '/usr/bin:/bin'}` }, cwd, state);
+    check(); stage = 'verify';
     const targetAt = command.indexOf('--target');
     const target = targetAt < 0 ? '' : command[targetAt + 1];
     if (targetAt >= 0 && !['aarch64-apple-darwin', 'x86_64-apple-darwin'].includes(target)) throw fail();
     const bundle = join(outputRoot, target, 'release', 'bundle', 'macos');
     const apps = readdirSync(bundle).filter(name => name.endsWith('.app'));
     if (apps.length !== 1) throw fail();
-    result = verify(join(bundle, apps[0]), env.SLG_MACOS_CERT_SHA256);
-  } catch {
-    failure = fail(state.interrupted ? 'interrupted' : stage);
-  } finally {
-    if ((failure || state.interrupted) && state.groupPid) {
+    result = verify(join(bundle, apps[0]), env.SLG_MACOS_CERT_SHA256, (cmd, args, options) =>
+      execFileSync(cmd, args, { ...options, env: toolEnv, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 60_000, killSignal: 'SIGKILL' }));
+    check();
+  } catch (error) { operationFailure = state.interrupted ? 'interrupted' : error.stage === 'interrupted' ? 'interrupted' : stage; }
+  finally {
+    if ((operationFailure || state.interrupted) && state.groupPid) {
       try { process.kill(-state.groupPid, 'SIGKILL'); } catch {}
     }
+    try { removeTemp(temp); if (existsSync(temp)) throw fail(); }
+    catch { cleanupFailure = 'cleanup'; }
     try {
-      if (existsSync(keychain)) {
-        try { await security(['lock-keychain', keychain]); } catch {}
-        await security(['delete-keychain', keychain]);
-      }
-    } catch { failure = fail('cleanup'); cleanupFailed = true; }
-    try {
-      if (beforeList !== undefined && (beforeList !== (await security(['list-keychains', '-d', 'user'])).toString() ||
-          beforeDefault !== (await security(['default-keychain', '-d', 'user'])).toString())) failure = fail('searchlist');
-    } catch { failure = fail('searchlist'); }
-    try {
-      if (!cleanupFailed) rmSync(temp, { recursive: true, force: true });
-      else writeFileSync(join(temp, 'cleanup-required.json'), JSON.stringify({ stage: 'cleanup', encryptedTemporaryKeychainRetained: true }), { mode: 0o600 });
-    } catch { failure = fail('cleanup'); }
-    finally {
-      clearTimeout(killTimer);
-      process.removeListener('SIGTERM', stop); process.removeListener('SIGINT', stop);
-    }
+      if (before && JSON.stringify(await inventory()) !== JSON.stringify(before)) cleanupFailure ??= 'searchlist';
+    } catch { cleanupFailure ??= 'searchlist'; }
+    clearTimeout(killTimer);
+    for (const name of ['SIGTERM', 'SIGINT', 'SIGHUP']) process.removeListener(name, stop);
   }
-  if (failure || state.interrupted) throw failure || fail('interrupted');
-  return { nativeSigning: result, isolatedKeychainRemoved: true, searchListUnchanged: true, defaultKeychainUnchanged: true };
+  if (operationFailure || cleanupFailure || state.interrupted) {
+    const error = fail(operationFailure ?? cleanupFailure ?? 'interrupted');
+    error.cleanupStage = cleanupFailure ?? null;
+    throw error;
+  }
+  return { nativeSigning: result, backend: 'rcodesign', signerVersion: tool.version, signerSha256: tool.sha256,
+    signerArch: tool.arch, temporarySigningFilesRemoved: true, searchListUnchanged: true,
+    defaultKeychainUnchanged: true, keychainWrites: 0, trustWrites: 0 };
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   const args = process.argv.slice(2);
   const command = args[0] === '--' ? args.slice(1) : [];
   withStableSigning({ command }).then(result => console.log(JSON.stringify(result))).catch(error => {
-    const stage = ['configuration','material','import','build','verify','cleanup','searchlist','interrupted'].includes(error.stage) ? error.stage : 'cleanup';
-    console.error(JSON.stringify({ ok: false, stage, candidateApproved: false }));
+    const stages = ['configuration', 'core-limits', 'signer-tool', 'material', 'requirement', 'build', 'verify', 'cleanup', 'searchlist', 'interrupted'];
+    console.error(JSON.stringify({ ok: false, stage: stages.includes(error.stage) ? error.stage : 'cleanup',
+      cleanupStage: stages.includes(error.cleanupStage) ? error.cleanupStage : null, candidateApproved: false }));
     process.exitCode = 1;
   });
 }

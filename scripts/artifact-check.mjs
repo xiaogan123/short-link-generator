@@ -3,14 +3,14 @@ import { resolve, join, relative, dirname, isAbsolute } from 'node:path';
 import { tmpdir, homedir } from 'node:os';
 import { execFileSync } from 'node:child_process';
 import { inspect, loadWords } from './privacy-check.mjs';
-import { artifactInspectionEnvironment, containsReleaseSecret, macSigningSecretPatterns, releaseSecretPatterns } from './release-secret-material.mjs';
+import { artifactInspectionEnvironment, containsReleaseSecret, macSigningSecretPatterns, macPrivateKeySecretPatterns, releaseSecretPatterns } from './release-secret-material.mjs';
 import { extractMacUpdater } from './macos-artifact.mjs';
 const root=resolve(process.argv[2] ?? '');
 if (!process.argv[2] || !existsSync(root)) throw new Error('Supply the candidate bundle directory.');
 const words=loadWords(resolve(homedir(),'.config/short-link-generator/denylist.txt'),true);
 if(process.env.GITHUB_ACTIONS==='true'&&!process.env.SLG_RELEASE_PRIVATE_KEY)throw new Error('Release signing-key inspection is required on the hosted runner.');
 if(process.env.GITHUB_ACTIONS==='true'&&process.platform==='darwin'&&(!process.env.SLG_MACOS_SIGNING_P12_BASE64||!process.env.SLG_MACOS_SIGNING_P12_PASSWORD))throw new Error('macOS signing-material inspection is required on the hosted runner.');
-const secretPatterns=[...releaseSecretPatterns(process.env.SLG_RELEASE_PRIVATE_KEY),...(process.platform==='darwin'?macSigningSecretPatterns(process.env):[])];
+const secretPatterns=[];
 const failures=[];let files=0;let expanded=0;
 const run=(cmd,args)=>execFileSync(cmd,args,{stdio:'pipe',maxBuffer:16*1024*1024,env:artifactInspectionEnvironment(process.env)});
 const outside=(base,path)=>{const r=relative(base,path);return r==='..'||r.startsWith('..'+(process.platform==='win32'?'\\':'/'))||isAbsolute(r);};
@@ -52,7 +52,14 @@ function scan(path,base,depth=0) {
     throw new Error('Unsupported compressed artifact must be explicitly inspected.');
   }
 }
-scan(root,root);
-if(files===0)throw new Error('No artifact files were inspected.');
-console.log(JSON.stringify({files,expanded,privateDenylist:'enforced',failures},null,2));
-if(failures.length)process.exitCode=1;
+try {
+  secretPatterns.push(...releaseSecretPatterns(process.env.SLG_RELEASE_PRIVATE_KEY));
+  if(process.platform==='darwin') {
+    secretPatterns.push(...macSigningSecretPatterns(process.env));
+    secretPatterns.push(...macPrivateKeySecretPatterns(process.env));
+  }
+  scan(root,root);
+  if(files===0)throw new Error('No artifact files were inspected.');
+  console.log(JSON.stringify({files,expanded,privateDenylist:'enforced',failures},null,2));
+  if(failures.length)process.exitCode=1;
+} finally { for(const pattern of secretPatterns)pattern.fill(0); }

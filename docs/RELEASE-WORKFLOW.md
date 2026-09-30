@@ -60,19 +60,23 @@ GITHUB_REPOSITORY="xiaogan123/short-link-generator" RELEASE_TAG="v$(node -p 'req
 | `SLG_MACOS_SIGNING_P12_PATH` 或 `SLG_MACOS_SIGNING_P12_BASE64` | 本地加密 P12 的绝对私有路径，或 CI 进程中的 base64；二选一。 |
 | `SLG_MACOS_SIGNING_P12_PASSWORD_FILE` 或 `SLG_MACOS_SIGNING_P12_PASSWORD` | 私有口令文件或进程环境；二选一，不把口令写进命令行。 |
 | `SLG_MACOS_CERT_SHA256` | 预期公开证书 DER 的 SHA-256；本地、原生验收和汇总必须相同。 |
-| `SLG_MACOS_OPENSSL` | 可选 OpenSSL 程序路径，默认使用系统 OpenSSL。 |
+| `SLG_RCODESIGN_PATH` | 已验证的原生 `rcodesign` 0.29.0 绝对路径；取得工具时不加载任何发行秘密。 |
 
 设置好这些进程输入后，本地构建命令为：
 
 ```sh
+ulimit -S -c 0
+ulimit -H -c 0
 node scripts/stable-macos-sign.mjs -- npm run tauri -- build --config release-config.json --bundles app,dmg
 ```
 
-wrapper 在进程内核对 P12 口令、证书自签名、用途、私钥匹配及公开指纹，再用一次性随机口令重封装到私有临时目录。未加密私钥不落盘，长期口令不进入 argv。专用临时签名库的随机口令和临时 P12 随机口令需要传给 `security` 的 argv，同用户高权限进程可能在短暂窗口观察它们；这不包含长期口令。构建输出不打印这些命令或原始密钥工具错误。失败只报告 `material` / `import` / `build` / `verify` / `cleanup` / `searchlist` / `interrupted` 等阶段。
+`scripts/rcodesign-tool.mjs` 固定上游版本及 ARM、Intel 各自的压缩包和可执行文件 SHA-256，只提取已知普通文件，并用 macOS 检查架构与上游签名。CI 在取得签名秘密之前下载工具；本地可通过同一模块准备工具。构建入口再次核验实际文件，拒绝自动升级、未知工具和架构不匹配。固定哈希与上游签名不等于可复现构建证明，更新工具版本需重新审查。
 
-签名 shim 固定指定临时库和精确证书指纹，对外层应用嵌入“固定 identifier 且固定证书指纹”的 designated requirement（DR）。不设置默认库、搜索列表或全局根信任，不调整真实用户凭据 ACL；导入授权和 partition list 仅限本次临时签名私钥。构建前后只读比较搜索列表与默认库，若出现差异则失败且不整表覆盖恢复，以免覆盖其他进程的修改。正常完成、构建失败和可处理的中断都会清理临时库；若系统拒绝删除，保留私有目录中的 `cleanup-required.json` 并拒绝候选。强制终止或断电也可能留下该私有目录，需单独确认后清理，不能声称所有异常都已清理。
+wrapper 在进程内核对 P12 口令、证书自签名、用途、私钥匹配及公开指纹，再用一次性随机口令重封装到仅所有者可访问的临时目录。未加密私钥不落盘，长期及临时口令均不进入 argv。签名器从权限受限的临时文件读取输入，禁止网络请求和隐式配置；原生验签仍由 Apple 工具完成。签名子进程不继承更新私钥、加载器选项或任意签名配置。JavaScript 字符串及第三方进程内存不能保证安全擦除，关闭 core dump 也不替代主机安全。
 
-GitHub 的 `release` 环境需新增 `MACOS_SIGNING_P12_BASE64`、`MACOS_SIGNING_P12_PASSWORD` 两个 secret，以及公开变量 `MACOS_SIGNING_CERT_SHA256`。只有 macOS 构建步骤取得签名秘密；Windows 构建保持原方式。不新增 Apple ID、公证秘密或完整平台矩阵。先在本机测量签名增量时间，再按既有额度纪律估算所选 macOS runner 分钟数；此流程本身不授权触发 CI。
+签名 shim 对外层应用嵌入“固定 identifier 且固定证书指纹”的 designated requirement（DR），按 Tauri 的顺序处理内部代码。整个签名流程不创建签名钥匙串、不导入私钥、不修改系统信任或真实凭据 ACL，也不需要构建者确认钥匙串授权。构建前后只读比较搜索列表与默认库，若出现差异则失败，不整表覆盖恢复。正常完成、构建失败和可处理的中断都会清理临时文件；清理失败会拒绝候选。强制终止或断电可能留下私有临时目录，需确认相关进程退出后单独清理，不能宣称所有异常均已清理。
+
+GitHub 的 `release` 环境需新增 `MACOS_SIGNING_P12_BASE64`、`MACOS_SIGNING_P12_PASSWORD` 两个 secret，以及公开变量 `MACOS_SIGNING_CERT_SHA256`。只有 macOS 打包和隐私扫描步骤取得签名秘密；Windows 构建保持原方式。隐私扫描在内存中比较加密容器、口令以及实际解密私钥的 PKCS1/PKCS8 DER、PEM 和常见编码，扫描结束清理可写缓冲区，公开证书不当作秘密。解包和验签子进程不继承这些输入。不新增 Apple ID 或公证秘密；先完成本机验证，再按既有额度纪律估算所选原生 runner 消耗，此流程本身不授权触发 CI。
 
 原生验收从实际候选应用导出公开证书，核实自签名与预期 SHA-256，执行完整性验签，并检查与求值实际 DR。`nativeSigning` 记录 `identity: "self-signed"`、`notarization: "not-notarized"`、证书 `certificateSha256` / `certificateSha1`、固定 `identifier`、`designatedRequirement` 及其 SHA-256，并记录均为 `true` 的 `identityVerified` / `signatureVerified` / `requirementVerified` / `certificateSelfSignatureVerified`。汇总提供相同 `SLG_MACOS_CERT_SHA256`，才接受这些记录；只有 identifier、CN、cdhash 或替代证书的记录均拒绝。安装包和更新包仍须各自绑定实际散列与独立更新签名。
 

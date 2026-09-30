@@ -86,6 +86,9 @@ jobs:
           SLG_UPDATER_PUBLIC_KEY: ${{ vars.UPDATER_PUBLIC_KEY }}
           SLG_UPDATER_ENDPOINT: https://github.com/${{ github.repository }}/releases/latest/download/latest.json
         run: node scripts/release-config.mjs
+      - name: Prepare pinned macOS signing tool
+        if: runner.os == 'macOS'
+        run: node scripts/rcodesign-tool.mjs --install
       - name: Build installers locally on native runner
         id: package
         env:
@@ -97,6 +100,8 @@ jobs:
         shell: bash
         run: |
           if [ "$RUNNER_OS" = "macOS" ]; then
+            ulimit -S -c 0
+            ulimit -H -c 0
             node scripts/stable-macos-sign.mjs -- npm run tauri -- build --target ${{ matrix.target }} --config release-config.json --bundles ${{ matrix.bundles }}
           else
             npm run tauri -- build --target ${{ matrix.target }} --config release-config.json --bundles ${{ matrix.bundles }}
@@ -116,7 +121,13 @@ jobs:
           SLG_RELEASE_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           SLG_MACOS_SIGNING_P12_BASE64: ${{ runner.os == 'macOS' && secrets.MACOS_SIGNING_P12_BASE64 || '' }}
           SLG_MACOS_SIGNING_P12_PASSWORD: ${{ runner.os == 'macOS' && secrets.MACOS_SIGNING_P12_PASSWORD || '' }}
-        run: node scripts/artifact-check.mjs src-tauri/target/${{ matrix.target }}/release/bundle
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            ulimit -S -c 0
+            ulimit -H -c 0
+          fi
+          node scripts/artifact-check.mjs src-tauri/target/${{ matrix.target }}/release/bundle
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: ${{ !cancelled() && steps.native_smoke.outcome == 'success' && steps.privacy.outcome == 'success' }}
         with:

@@ -11,8 +11,12 @@ const hex = (value, size) => typeof value === 'string' && new RegExp(`^[a-f0-9]{
 export function cleanSigningEnvironment(env) {
   const clean = { ...env };
   for (const name of Object.keys(clean)) {
-    if (name.startsWith('SLG_MACOS_SIGNING_') || name.startsWith('SLG_INTERNAL_') || name.startsWith('APPLE_')) delete clean[name];
+    if (name.startsWith('SLG_MACOS_SIGNING_') || name.startsWith('SLG_INTERNAL_') ||
+        name.startsWith('TAURI_SIGNING_') || name.startsWith('APPLE_') ||
+        name.startsWith('RCODESIGN_') || name.startsWith('DYLD_') ||
+        name === 'SLG_RELEASE_PRIVATE_KEY' || name === 'SLG_PRIVATE_SIGNING_CONTEXT') delete clean[name];
   }
+  for (const name of ['NODE_OPTIONS', 'NODE_PATH', 'OPENSSL_CONF', 'OPENSSL_ENGINES', 'OPENSSL_MODULES', 'BASH_ENV', 'ENV']) delete clean[name];
   delete clean.RUST_LOG;
   delete clean.TAURI_LOG_LEVEL;
   return clean;
@@ -65,7 +69,9 @@ export function verifyMacSigning(app, expectedSha256, run = (cmd, args, options)
     const match = /^\s*(?:#\s*)?designated => (.+)$/m.exec(output);
     if (!match) throw new Error('Missing designated requirement.');
     const prefix = join(temp, 'certificate-');
-    inspect('/usr/bin/codesign', ['--display', '--extract-certificates', prefix, app]);
+    // This option's prefix is optional; codesign requires '=' to bind it rather
+    // than treating a separate argument as another object to inspect.
+    inspect('/usr/bin/codesign', ['--display', `--extract-certificates=${prefix}`, app]);
     if (!existsSync(`${prefix}0`) || existsSync(`${prefix}1`)) throw new Error('Expected one self-signed certificate.');
     const info = certificateInfo(readFileSync(`${prefix}0`), expectedSha256);
     const requirement = validateRequirement(match[1], info.certificateSha1);
