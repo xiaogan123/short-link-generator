@@ -120,7 +120,7 @@ it('creates a local platform without exposing account authorization controls',as
   render(<App/>);
   await screen.findByRole('heading',{name:'短链接'});
   fireEvent.click(screen.getByRole('button',{name:/^平台地址$/}));
-  expect(screen.getByText('已用于 0 个账户 · 关联链接 0 条 · 已启用大陆访问地址 1 个')).toBeTruthy();
+  expect(screen.getByText('关联短链接 0 条 · 已启用大陆访问地址 1 个')).toBeTruthy();
   fireEvent.click(screen.getByRole('button',{name:'添加平台地址'}));
   const editor=screen.getByRole('dialog',{name:'添加平台地址'});
   expect(within(editor).queryByText('同步到哪些账户')).toBeNull();

@@ -277,6 +277,7 @@ export default function App() {
   const [updateStatus, setUpdateStatus] = useState<UpdateStatus | null>(null);
   const [manageAccount, setManageAccount] = useState<Account | null>(null);
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  const mainRef = useRef<HTMLElement>(null);
   const [clock, setClock] = useState(Date.now());
   const isDomainPlan = planKind === "add_domain" || planKind === "fix_domain_dns";
   const domainPreparationExpired = Boolean(
@@ -341,6 +342,9 @@ export default function App() {
     const timer = window.setInterval(() => setClock(Date.now()), 60000);
     return () => window.clearInterval(timer);
   }, []);
+  useEffect(() => {
+    if (mainRef.current) mainRef.current.scrollTop = 0;
+  }, [page]);
   useEffect(() => {
     const now = Date.now();
     const expiry = Math.min(...[
@@ -1899,7 +1903,7 @@ export default function App() {
           </button>
         </div>
       </aside>
-      <main className="main">
+      <main className="main" ref={mainRef}>
         <div className="topbar">
           <div className="breadcrumbs">
             <button

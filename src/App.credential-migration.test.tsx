@@ -157,11 +157,11 @@ it('changing domain account removes the old account migration entry',async()=>{
 function addPool(){control.state={...control.state!,pools:[{id:'pool',name:'原平台',official:{prefix:'https://example.com/join/',suffix:''},candidates:[{id:'c',prefix:'https://example.org/join/',suffix:'',enabled:true}],updated:'2026-09-30',accountIds:['a','b']}]};}
 it('unconfigured legacy monitoring does not block current-account pool health reads',async()=>{
   addPool();control.state!.accounts[0].monitorEnabled=false;control.state!.accounts[1].monitorEnabled=true;
-  await start();fireEvent.click(screen.getByRole('button',{name:'平台地址'}));fireEvent.click(screen.getByRole('button',{name:'查看检测状态'}));
+  await start();fireEvent.click(screen.getByRole('button',{name:'平台地址'}));fireEvent.click(screen.getByRole('button',{name:'查看网址检测'}));
   await waitFor(()=>expect(calls('check_pool_health')).toHaveLength(1));expect(calls('prepare_change')).toHaveLength(0);
 });
 it('an enabled legacy monitor still requires migration before pool health reads',async()=>{
-  addPool();control.state!.accounts[0].monitorEnabled=true;await start();fireEvent.click(screen.getByRole('button',{name:'平台地址'}));fireEvent.click(screen.getByRole('button',{name:'查看检测状态'}));
+  addPool();control.state!.accounts[0].monitorEnabled=true;await start();fireEvent.click(screen.getByRole('button',{name:'平台地址'}));fireEvent.click(screen.getByRole('button',{name:'查看网址检测'}));
   expect(calls('check_pool_health')).toHaveLength(0);expect(screen.getByRole('button',{name:'更新本机授权'})).toBeTruthy();
 });
 it('an unrelated legacy account does not block backup selection and backend scope validation',async()=>{

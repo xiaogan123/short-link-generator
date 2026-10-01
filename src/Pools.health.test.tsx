@@ -34,3 +34,23 @@ it('keeps the official address and all ordered mainland targets in one readable 
   expect((within(card).getByRole('button',{name:'删除'}) as HTMLButtonElement).disabled).toBe(true);
   expect(card.textContent).not.toContain('注册');
 });
+
+it('shows sync per account without mistaking saved configuration for a reachable website',()=>{
+  const pool:Pool={id:'p',name:'示例平台',official:{prefix:'https://example.com/join/',suffix:''},candidates:[{id:'c',prefix:'https://example.org/join/',suffix:'',enabled:true}],updated:'',accountIds:['a','b','c'],syncStatus:[
+    {accountId:'a',status:'synced',message:'已保存'},
+    {accountId:'b',status:'failed',message:'保存未完成'},
+    {accountId:'c',status:'unknown',message:'尚未确认'},
+    {accountId:'d',status:'synced',message:'未关联的旧状态'},
+  ]};
+  const accounts=['a','b','c','d'].map(id=>({id,label:`备注 ${id}`,cloudflareName:`Example ${id}`,zoneCount:1,checkedAt:null,hasResources:true,needsSelftestKey:false}));
+  render(<Pools pools={[pool]} accounts={accounts} linkCount={()=>1} onSave={async()=>true} onDelete={()=>{}} busy={false} health={{}} onCheckHealth={()=>{}} planOpen={false} savedRevision={0}/>);
+  const sync=screen.getByRole('region',{name:'配置同步'});
+  expect(within(sync).getByText('Example a · 已同步配置')).toBeTruthy();
+  expect(within(sync).getByText(/Example b · 同步失败/)).toBeTruthy();
+  expect(within(sync).getByText('Example c · 同步结果待确认')).toBeTruthy();
+  expect(within(sync).getByText('Example d · 首次使用时自动同步')).toBeTruthy();
+  expect(screen.getByText('状态未知')).toBeTruthy();
+  expect(screen.queryByText('各账户检测通过')).toBeNull();
+  expect(screen.queryByText('Example d · 已同步配置')).toBeNull();
+  expect(sync.textContent).toContain('配置已同步不代表网址已通过访问检测');
+});
