@@ -12,18 +12,25 @@ const SERVICE: &str = "SLG_NATIVE_CREDENTIAL_TEST_SERVICE";
 const ACCOUNT: &str = "SLG_NATIVE_CREDENTIAL_TEST_ACCOUNT";
 const INITIAL: &str = "synthetic-initial-value";
 const UPDATED: &str = "synthetic-updated-value";
+const KINDS: [&str; 4] = ["token", "selftest", "probe", "selftest-pending"];
 
 struct CredentialCleanup {
     service: String,
-    account: String,
+    suffix: String,
 }
 
 impl Drop for CredentialCleanup {
     fn drop(&mut self) {
-        if let Ok(entry) = keyring::Entry::new(&self.service, &self.account) {
-            let _ = entry.delete_credential();
+        for kind in KINDS {
+            if let Ok(entry) = keyring::Entry::new(&self.service, &account(kind, &self.suffix)) {
+                let _ = entry.delete_credential();
+            }
         }
     }
+}
+
+fn account(kind: &str, suffix: &str) -> String {
+    format!("{kind}:{suffix}")
 }
 
 struct ChildGuard(Child);
@@ -35,7 +42,7 @@ impl Drop for ChildGuard {
     }
 }
 
-fn run_child(mode: &str, service: &str, account: &str) {
+fn run_child(mode: &str, service: &str, suffix: &str) {
     let child = Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
@@ -43,7 +50,7 @@ fn run_child(mode: &str, service: &str, account: &str) {
         ])
         .env(MODE, mode)
         .env(SERVICE, service)
-        .env(ACCOUNT, account)
+        .env(ACCOUNT, suffix)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -69,38 +76,53 @@ fn native_credential_child() {
         return;
     };
     let service = std::env::var(SERVICE).unwrap();
-    let account = std::env::var(ACCOUNT).unwrap();
-    let entry = keyring::Entry::new(&service, &account).unwrap();
-    match mode.as_str() {
-        "read_then_write" => {
-            assert!(entry.get_password().is_ok_and(|value| value == INITIAL));
-            entry.set_password(UPDATED).unwrap();
+    let suffix = std::env::var(ACCOUNT).unwrap();
+    for kind in KINDS {
+        let entry = keyring::Entry::new(&service, &account(kind, &suffix)).unwrap();
+        match mode.as_str() {
+            "write_initial" => {
+                assert!(matches!(entry.get_password(), Err(keyring::Error::NoEntry)));
+                entry.set_password(INITIAL).unwrap();
+            }
+            "read_then_update" => {
+                assert!(entry.get_password().is_ok_and(|value| value == INITIAL));
+                entry.set_password(UPDATED).unwrap();
+            }
+            "read_then_delete" => {
+                assert!(entry.get_password().is_ok_and(|value| value == UPDATED));
+                entry.delete_credential().unwrap();
+            }
+            "confirm_missing" => {
+                assert!(matches!(entry.get_password(), Err(keyring::Error::NoEntry)));
+            }
+            _ => panic!("unknown synthetic credential child mode"),
         }
-        "confirm_missing" => {
-            assert!(matches!(entry.get_password(), Err(keyring::Error::NoEntry)));
-        }
-        _ => panic!("unknown synthetic credential child mode"),
     }
 }
 
 #[test]
-fn credential_manager_persists_across_processes_and_deletes() {
+fn credential_manager_four_kinds_persist_across_cold_processes_and_delete() {
     let nonce = rand::random::<u64>();
     let service = format!(
         "org.shortlink.generator.synthetic-test.{}.{}",
         std::process::id(),
         nonce
     );
-    let account = format!("token:synthetic-{nonce}");
+    let suffix = format!("synthetic-{nonce}");
     let _cleanup = CredentialCleanup {
         service: service.clone(),
-        account: account.clone(),
+        suffix: suffix.clone(),
     };
-    let entry = keyring::Entry::new(&service, &account).unwrap();
-    entry.set_password(INITIAL).unwrap();
-
-    run_child("read_then_write", &service, &account);
-    assert!(entry.get_password().is_ok_and(|value| value == UPDATED));
-    entry.delete_credential().unwrap();
-    run_child("confirm_missing", &service, &account);
+    run_child("write_initial", &service, &suffix);
+    run_child("read_then_update", &service, &suffix);
+    for kind in KINDS {
+        let entry = keyring::Entry::new(&service, &account(kind, &suffix)).unwrap();
+        assert!(entry.get_password().is_ok_and(|value| value == UPDATED));
+    }
+    run_child("read_then_delete", &service, &suffix);
+    run_child("confirm_missing", &service, &suffix);
+    for kind in KINDS {
+        let entry = keyring::Entry::new(&service, &account(kind, &suffix)).unwrap();
+        assert!(matches!(entry.get_password(), Err(keyring::Error::NoEntry)));
+    }
 }

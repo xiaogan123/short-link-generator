@@ -34,6 +34,11 @@ test('untrusted PR jobs cannot access release secrets and native checks are expl
  const ci=YAML.parse(readFileSync('.github/workflows/ci.yml','utf8'));
  const release=YAML.parse(readFileSync('.github/workflows/release.yml','utf8'));
  assert.equal(ci.permissions.contents,'read');assert.equal(ci.jobs.native.if,"github.event_name == 'workflow_dispatch'");
+ assert.equal(ci.on.workflow_dispatch.inputs.include_source.type,'boolean');
+ assert.equal(ci.on.workflow_dispatch.inputs.include_source.default,true);
+ assert.equal(ci.jobs.source.if,"github.event_name != 'workflow_dispatch' || inputs.include_source");
+ assert.ok(ci.jobs.native.steps.some(step=>step.run?.startsWith('cargo test ')&&step.run.endsWith(' -- --show-output')));
+ assert.equal(ci.jobs.native.needs,undefined);
  assert.ok(!JSON.stringify(ci).includes('secrets.'));assert.ok(!release.on.pull_request);
  for(const job of Object.values(release.jobs))assert.equal(job.environment,'release');
  assert.ok(JSON.stringify(release.jobs.build.steps).includes('needs.prepare.outputs.sha'));

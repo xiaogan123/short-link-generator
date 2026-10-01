@@ -200,17 +200,34 @@ async fn probe_transport_timeout_is_distinct_and_does_not_expose_url() {
 
 #[tokio::test]
 async fn probe_transport_connection_failure_is_distinct_and_sanitized() {
+    use tokio::io::AsyncWriteExt;
+
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
-    drop(listener);
+    // Keep the port bound. A closed ephemeral port can produce a platform-
+    // specific refusal or timeout; a plaintext reply during TLS is a stable
+    // connector failure after a real local accept.
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = tokio::time::timeout(Duration::from_secs(10), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        let _ = stream.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n").await;
+        let _ = stream.shutdown().await;
+    });
     let error = probe_response(
-        &local_client(Duration::from_secs(1)),
-        reqwest::Url::parse(&format!("http://{address}/synthetic-private-path")).unwrap(),
+        &local_client(Duration::from_secs(10)),
+        reqwest::Url::parse(&format!("https://{address}/synthetic-private-path")).unwrap(),
         None,
     )
     .await
     .unwrap_err();
-    assert!(error.message.contains("连接或 TLS"));
+    server.await.unwrap();
+    assert!(
+        error.message.contains("连接或 TLS"),
+        "sanitized transport classification: {}",
+        error.message
+    );
     assert!(!error.message.contains("synthetic-private-path"));
     assert!(!error.message.contains(&address.to_string()));
     assert!(!error.uncertain);

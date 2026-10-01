@@ -9,6 +9,10 @@ on:
         type: choice
         options: [mac-arm, mac-intel, windows]
         default: windows
+      include_source:
+        description: Also run Linux source checks; disable only when reusing reviewed passing evidence
+        type: boolean
+        default: true
 permissions:
   contents: read
 concurrency:
@@ -16,6 +20,7 @@ concurrency:
   cancel-in-progress: true
 jobs:
   source:
+    if: github.event_name != 'workflow_dispatch' || inputs.include_source
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     steps:
@@ -63,5 +68,5 @@ jobs:
       - run: npm ci
       - run: npm run build
       - run: cargo fmt --manifest-path src-tauri/Cargo.toml --check
-      - run: cargo test --manifest-path src-tauri/Cargo.toml --locked --target ${{ inputs.platform == 'windows' && 'x86_64-pc-windows-msvc' || inputs.platform == 'mac-intel' && 'x86_64-apple-darwin' || 'aarch64-apple-darwin' }}
+      - run: cargo test --manifest-path src-tauri/Cargo.toml --locked --target ${{ inputs.platform == 'windows' && 'x86_64-pc-windows-msvc' || inputs.platform == 'mac-intel' && 'x86_64-apple-darwin' || 'aarch64-apple-darwin' }} -- --show-output
       - run: cargo clippy --manifest-path src-tauri/Cargo.toml --locked --target ${{ inputs.platform == 'windows' && 'x86_64-pc-windows-msvc' || inputs.platform == 'mac-intel' && 'x86_64-apple-darwin' || 'aarch64-apple-darwin' }} --all-targets -- -D warnings

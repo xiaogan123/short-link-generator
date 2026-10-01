@@ -213,8 +213,13 @@ mod tests {
         let ordinary_file = dir.path().join("ordinary");
         fs::write(&ordinary_file, b"synthetic").unwrap();
         match symlink_file(&ordinary_file, &linked_lock) {
-            Ok(()) => assert!(ConfigurationLease::acquire(&target).is_err()),
-            Err(error) if error.kind() == ErrorKind::PermissionDenied => {}
+            Ok(()) => {
+                println!("file-symlink rejection branch: executed");
+                assert!(ConfigurationLease::acquire(&target).is_err());
+            }
+            Err(error) if error.kind() == ErrorKind::PermissionDenied => {
+                println!("file-symlink rejection branch: skipped (permission denied)");
+            }
             Err(error) => panic!("file symlink creation failed: {error}"),
         }
     }
