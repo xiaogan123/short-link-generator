@@ -2330,39 +2330,31 @@ export default function App() {
                 ) : (
                   <div className="domain-cards">
                     {state.domains.map((domain) => (
-                      <div className="domain-card" key={domain.id}>
+                      <article className="domain-card" key={domain.id} aria-label={`${domain.host} 域名`}>
                         <div className="domain-symbol">
                           <Globe size={22} />
                         </div>
                         <div className="domain-card-main">
                           <h3>{domain.host}</h3>
-                          <p>
-                            链接路径 <strong>/{domain.prefix}/</strong> ·{" "}
-                            {accountById.get(domain.accountId)?.label ||
-                              "未知账户"}
-                          </p>
-                          <span>
-                            {
-                              state.links.filter(
-                                (l) => l.domainId === domain.id,
-                              ).length
-                            }{" "}
-                            条链接
-                          </span>
+                          <div className="domain-facts">
+                            <span>链接目录 <strong>/{domain.prefix}/</strong></span>
+                            <span>已创建 <strong>{state.links.filter((l) => l.domainId === domain.id).length}</strong> 条链接</span>
+                            <span>所属账户 <strong>{accountById.get(domain.accountId)?.label || "未知账户"}</strong></span>
+                          </div>
                         </div>
                         <div className="card-actions">
-                          {!state.links.some((link) => link.domainId === domain.id) && (
-                            <button
-                              className="button secondary"
-                              onClick={() => {
-                                setPage("links");
-                                setFilter(domain.id);
-                                openLink(undefined, false, domain.id);
-                              }}
-                            >
-                              创建第一条短链接
-                            </button>
-                          )}
+                          <button
+                            className="button secondary"
+                            onClick={() => {
+                              setPage("links");
+                              setFilter(domain.id);
+                              openLink(undefined, false, domain.id);
+                            }}
+                          >
+                            {state.links.some((link) => link.domainId === domain.id)
+                              ? "创建短链接"
+                              : "创建第一条短链接"}
+                          </button>
                           <button
                             className="button ghost"
                             onClick={() => {
@@ -2386,7 +2378,7 @@ export default function App() {
                             移除域名
                           </button>
                         </div>
-                      </div>
+                      </article>
                     ))}
                   </div>
                 )}
@@ -2450,64 +2442,56 @@ export default function App() {
                 ) : (
                   <div className="account-cards">
                     {state.accounts.map((account) => (
-                      <div className="account-card" key={account.id}>
+                      <article className="account-card" key={account.id} aria-label={`${account.cloudflareName || account.label} 账户`}>
                         <div className="account-symbol">
                           <Key size={22} />
                         </div>
                         <div className="account-main">
-                          <div className="account-title">
-                            <h3>{account.cloudflareName || account.label}</h3>
-                            {account.needsCredentialMigration && (
-                              <StatusPill tone="amber">
-                                需要更新本机授权
-                              </StatusPill>
-                            )}
-                            {account.needsSelftestKey ? (
-                              <StatusPill tone="amber">
-                                检测密钥待恢复
-                              </StatusPill>
-                            ) : (
-                              !account.needsCredentialMigration &&
-                              <StatusPill>已连接</StatusPill>
-                            )}
+                          <div className="account-card-head">
+                            <div className="account-title">
+                              <h3>{account.cloudflareName || account.label}</h3>
+                              {account.needsCredentialMigration && (
+                                <StatusPill tone="amber">需要更新本机授权</StatusPill>
+                              )}
+                              {account.needsSelftestKey ? (
+                                <StatusPill tone="amber">检测密钥待恢复</StatusPill>
+                              ) : (
+                                !account.needsCredentialMigration && <StatusPill>已连接</StatusPill>
+                              )}
+                            </div>
+                            <div className="account-card-actions">
+                              {migrationAction(account.id)}
+                              <button
+                                className="button secondary"
+                                disabled={mutation === "prepare_credentials"}
+                                aria-label={`管理 ${account.label}`}
+                                onClick={() => setManageAccount(account)}
+                              >
+                                管理账户
+                              </button>
+                            </div>
                           </div>
-                          <p>
-                            {account.cloudflareName && (
-                              <>本机备注：{account.label} · </>
-                            )}
-                            账户 ID：…{account.id.slice(-8)} · Cloudflare 内{" "}
-                            {account.zoneCount} 个站点 · 已连接{" "}
-                            {
-                              state.domains.filter(
-                                (d) => d.accountId === account.id,
-                              ).length
-                            }{" "}
-                            个域名 · 检查于 {formatDate(account.checkedAt)}
-                          </p>
-                          <span className="monitor-status">
-                            检测服务：
-                            {account.monitorEnabled
-                              ? `已启用 · ${account.monitorEndpoint || "地址未提供"}`
-                              : "未启用"}
+                          <dl className="account-facts">
+                            {account.cloudflareName && <div><dt>本机备注</dt><dd>{account.label}</dd></div>}
+                            <div><dt>账户 ID</dt><dd>…{account.id.slice(-8)}</dd></div>
+                            <div><dt>Cloudflare 内</dt><dd>{account.zoneCount} 个站点</dd></div>
+                            <div><dt>接入域名</dt><dd>{state.domains.filter((d) => d.accountId === account.id).length} 个域名</dd></div>
+                            <div><dt>上次检查</dt><dd>{formatDate(account.checkedAt)}</dd></div>
+                          </dl>
+                          <div className="account-service">
+                            <span className="monitor-status">
+                              检测服务：{account.monitorEnabled
+                                ? `已启用 · ${account.monitorEndpoint || "地址未提供"}`
+                                : "未启用"}
+                            </span>
                             {account.needsMonitorKey && (
                               <strong>
-                                {" "}
-                                ·
                                 本机密钥缺失；云端监测可能仍在运行，请先停用再重新配置
                               </strong>
                             )}
-                          </span>
+                          </div>
                         </div>
-                        {migrationAction(account.id)}
-                        <button
-                          className="button ghost"
-                          disabled={mutation === "prepare_credentials"}
-                          aria-label={`管理 ${account.label}`}
-                          onClick={() => setManageAccount(account)}
-                        >
-                          管理
-                        </button>
-                      </div>
+                      </article>
                     ))}
                   </div>
                 )}
@@ -2777,6 +2761,10 @@ export default function App() {
             onSubmit={(e) => void checkDomain(e)}
             className="form-grid"
           >
+            <div className="form-section-heading">
+              <strong>选择域名与链接目录</strong>
+              <span>检查当前配置后，再核对接入计划。</span>
+            </div>
             <label>
               Cloudflare 账户
               <select
@@ -2800,14 +2788,11 @@ export default function App() {
                 ))}
               </select>
               <small>
-                多账户时，刷新域名列表前必须先选择账户；更换账户后需重新检查。
+                {state.accounts.length > 1 && !domainDraft.accountId
+                  ? "可输入域名自动匹配账户；刷新域名列表时需先明确选择账户。"
+                  : "更换账户后需重新检查当前配置。"}
               </small>
             </label>
-            {state.accounts.length > 1 && !domainDraft.accountId && (
-              <p className="inline-warning">
-                有多个 Cloudflare 账户；刷新域名列表前请先选择一个账户。
-              </p>
-            )}
             <div className="form-two">
               <label>
                 域名
@@ -2923,11 +2908,10 @@ export default function App() {
                 Cloudflare 启用。
               </small>
             </div>
-            <p className="form-note">
-              带 www 和不带 www
-              的域名需要分别添加。未启用域名不会出现在可选列表中。
-            </p>
-            <p className="form-note">会先按本机网络检查；若 VPN 返回虚拟地址，会自动用公共 DNS 重查一次。</p>
+            <div className="domain-setup-notes">
+              <p>带 www 和不带 www 的域名需要分别添加；未启用域名不会出现在可选列表中。</p>
+              <p>先按本机网络检查；若 VPN 返回虚拟地址，会自动用公共 DNS 重查一次。</p>
+            </div>
             <details className="domain-network-options">
               <summary>网络检查选项</summary>
               <label className="domain-network-checkbox">
@@ -3210,24 +3194,31 @@ export default function App() {
             onSubmit={(e) => void importToken(e)}
           >
             {updateTokenAccount ? (
-              <p className="form-note">
-                将只更新{" "}
-                <strong>
-                  {updateTokenAccount.cloudflareName ||
-                    updateTokenAccount.label}
-                </strong>
-                （账户 ID：…{updateTokenAccount.id.slice(-8)}
-                ）的本机令牌，其他账户不变。令牌必须包含这个 Cloudflare 账户，否则不会保存。
-              </p>
+              <div className="token-current-account">
+                <strong>正在更新 {updateTokenAccount.cloudflareName || updateTokenAccount.label}</strong>
+                <p className="form-note">
+                  将只更新此账户（账户 ID：…{updateTokenAccount.id.slice(-8)}）的本机令牌，其他账户不变。令牌必须包含这个 Cloudflare 账户，否则不会保存。
+                </p>
+              </div>
             ) : (
-              <p className="form-note">
-                先在浏览器登录要连接的 Cloudflare 账户，再创建 API
-                令牌并粘贴到这里。软件会向 Cloudflare
-                验证令牌，并交给操作系统保存。
-              </p>
+              <div className="token-step">
+                <span className="token-step-number">1</span>
+                <div className="token-step-content">
+                  <strong>在 Cloudflare 准备令牌</strong>
+                  <p className="form-note">先在浏览器登录要连接的 Cloudflare 账户，再创建 API 令牌。</p>
+                  <button
+                    className="button bordered opener"
+                    type="button"
+                    onClick={() => void openTemplate()}
+                  >
+                    <ArrowSquareOut size={17} />
+                    在系统浏览器中打开令牌模板
+                  </button>
+                </div>
+              </div>
             )}
-            {updateTokenAccount ? (
-              <>
+            {updateTokenAccount && (
+              <div className="token-existing-help">
                 <p className="form-note">
                   只是补充权限或加入新域名？可以直接编辑已有令牌，无需在这里重新粘贴。保存后关闭此窗口，重试刚才的操作。只有创建了新令牌或重新生成了令牌值，才需要在下方替换。
                 </p>
@@ -3253,67 +3244,65 @@ export default function App() {
                     打开新令牌模板
                   </button>
                 </details>
-              </>
-            ) : (
-              <button
-                className="button bordered opener"
-                type="button"
-                onClick={() => void openTemplate()}
-              >
-                <ArrowSquareOut size={17} />
-                在系统浏览器中打开令牌模板
-              </button>
-            )}
-            <label>
-              访问令牌
-              <input
-                type="password"
-                autoComplete="off"
-                value={token}
-                disabled={mutation === "token"}
-                onChange={(e) => {
-                  clearClipboardOffer();
-                  setToken(e.target.value);
-                }}
-                onFocus={() => void checkClipboard()}
-                placeholder="在此粘贴令牌"
-                required
-              />
-            </label>
-            {clipboardOffer && (
-              <div className="clipboard-offer">
-                <Clipboard size={18} />
-                <span>检测到可能的访问令牌，是否填入？</span>
-                <button
-                  type="button"
-                  disabled={mutation === "token"}
-                  onClick={() => {
-                    setToken(clipboardOffer);
-                    clearClipboardOffer();
-                  }}
-                >
-                  填入
-                </button>
-                <button
-                  type="button"
-                  aria-label="忽略剪贴板"
-                  onClick={clearClipboardOffer}
-                >
-                  <X size={15} />
-                </button>
               </div>
             )}
-            {!updateTokenAccount && (
-              <label className="checkbox-row">
-                <input
-                  type="checkbox"
-                  checked={replaceToken}
-                  onChange={(e) => setReplaceToken(e.target.checked)}
-                  disabled={mutation === "token"}
-                />
-                <span>若账户已存在，确认替换本机保存的令牌</span>
-              </label>
-            )}
+            <div className={updateTokenAccount ? "token-field" : "token-step"}>
+              {!updateTokenAccount && <span className="token-step-number">2</span>}
+              <div className="token-step-content">
+                <strong>{updateTokenAccount ? "粘贴新令牌" : "粘贴并验证"}</strong>
+                {!updateTokenAccount && <p className="form-note">软件会向 Cloudflare 验证令牌，并交给操作系统保存。</p>}
+                <label>
+                  访问令牌
+                  <input
+                    type="password"
+                    autoComplete="off"
+                    value={token}
+                    disabled={mutation === "token"}
+                    onChange={(e) => {
+                      clearClipboardOffer();
+                      setToken(e.target.value);
+                    }}
+                    onFocus={() => void checkClipboard()}
+                    placeholder="在此粘贴令牌"
+                    required
+                  />
+                </label>
+                {clipboardOffer && (
+                  <div className="clipboard-offer">
+                    <Clipboard size={18} />
+                    <span>检测到可能的访问令牌，是否填入？</span>
+                    <button
+                      type="button"
+                      disabled={mutation === "token"}
+                      onClick={() => {
+                        setToken(clipboardOffer);
+                        clearClipboardOffer();
+                      }}
+                    >
+                      填入
+                    </button>
+                    <button
+                      type="button"
+                      aria-label="忽略剪贴板"
+                      onClick={clearClipboardOffer}
+                    >
+                      <X size={15} />
+                    </button>
+                  </div>
+                )}
+                {!updateTokenAccount && (
+                  <label className="checkbox-row">
+                    <input
+                      type="checkbox"
+                      checked={replaceToken}
+                      onChange={(e) => setReplaceToken(e.target.checked)}
+                      disabled={mutation === "token"}
+                    />
+                    <span>若账户已存在，确认替换本机保存的令牌</span>
+                  </label>
+                )}
+              </div>
+            </div>
           </form>
         </Dialog>
       )}
@@ -3424,8 +3413,13 @@ export default function App() {
                 <code>{manageAccount.id}</code>
               </details>
             </div>
-            <div className="manager-actions">
-              {migrationAction(manageAccount.id)}
+            <section className="manager-section">
+              <div className="manager-section-heading">
+                <strong>账户与访问令牌</strong>
+                <p>访问令牌用于管理 Cloudflare 中的域名和短链接配置。</p>
+              </div>
+              <div className="manager-actions">
+                {migrationAction(manageAccount.id)}
               <button
                 disabled={mutation === "prepare_credentials"}
                 className="button secondary"
@@ -3458,6 +3452,14 @@ export default function App() {
               >
                 修改本机备注
               </button>
+              </div>
+            </section>
+            <section className="manager-section">
+              <div className="manager-section-heading">
+                <strong>检测与恢复</strong>
+                <p>检测密钥用于短链接健康检查，与 Cloudflare API 令牌分开保存。</p>
+              </div>
+              <div className="manager-actions">
               {!manageAccount.monitorEnabled && (
                 <button
                   disabled={mutation === "prepare_credentials"}
@@ -3510,35 +3512,38 @@ export default function App() {
               >
                 重置检测密钥
               </button>
-            </div>
+              </div>
+            </section>
             <div className="danger-zone">
               <strong>危险操作</strong>
               <p>
                 删除云端短链接服务会删除此账户中由本应用管理的
                 Worker、路由和短链接数据；不会删除其他网站或 DNS 记录。
               </p>
-              <button
-                disabled={mutation === "prepare_credentials"}
-                className="button danger-button"
-                onClick={() => {
-                  void prepare("cleanup_account", {
-                    accountId: manageAccount.id,
-                  });
-                  setManageAccount(null);
-                }}
-              >
-                删除云端短链接服务
-              </button>
-              <button
-                disabled={mutation === "prepare_credentials"}
-                className="button danger-button"
-                onClick={() => {
-                  setRemoveAccount(manageAccount);
-                  setManageAccount(null);
-                }}
-              >
-                从本机移除
-              </button>
+              <div className="danger-actions">
+                <button
+                  disabled={mutation === "prepare_credentials"}
+                  className="button danger-button"
+                  onClick={() => {
+                    void prepare("cleanup_account", {
+                      accountId: manageAccount.id,
+                    });
+                    setManageAccount(null);
+                  }}
+                >
+                  删除云端短链接服务
+                </button>
+                <button
+                  disabled={mutation === "prepare_credentials"}
+                  className="button bordered danger-outline"
+                  onClick={() => {
+                    setRemoveAccount(manageAccount);
+                    setManageAccount(null);
+                  }}
+                >
+                  从本机移除
+                </button>
+              </div>
             </div>
           </div>
         </Dialog>

@@ -65,6 +65,8 @@ it('does not dispatch a refresh before a multi-account selection is made',async(
   fireEvent.click(screen.getByRole('button',{name:/^域名管理$/}));
   fireEvent.click(screen.getAllByRole('button',{name:'添加域名'})[0]);
   const dialog=screen.getByRole('dialog',{name:'添加域名'});
+  expect(within(dialog).getByText('可输入域名自动匹配账户；刷新域名列表时需先明确选择账户。')).toBeTruthy();
+  expect(within(dialog).queryByRole('alert')).toBeNull();
   fireEvent.click(within(dialog).getByRole('button',{name:'刷新域名列表'}));
   expect(control.calls.filter(call=>call.action==='refresh_domains')).toHaveLength(0);
   expect(within(dialog).getByRole('alert').textContent).toContain('请选择要刷新域名的 Cloudflare 账户。');

@@ -35,6 +35,34 @@ it('uses a root account dialog and returns focus after Escape',async()=>{
   expect(document.activeElement).toBe(manage);
 });
 
+it('separates account facts, management groups, and the two import steps',async()=>{
+  render(<App/>);
+  await screen.findByText('/manual');
+  fireEvent.click(screen.getByRole('button',{name:/^Cloudflare 账户$/}));
+  const card=screen.getByRole('article',{name:'Example organization 账户'});
+  const facts=card.querySelector('.account-facts') as HTMLElement;
+  expect(facts.querySelector('dt')?.textContent).toBe('本机备注');
+  expect(facts.querySelector('dd')?.textContent).toBe('本机备注');
+  expect(within(facts).getByText('账户 ID').nextElementSibling?.textContent).toContain('…');
+  expect(within(facts).getByText('接入域名').nextElementSibling?.textContent).toBe('1 个域名');
+  expect(within(card).getByText(/检测服务：未启用/)).toBeTruthy();
+  fireEvent.click(within(card).getByRole('button',{name:'管理 本机备注'}));
+  const manager=screen.getByRole('dialog',{name:'账户管理'});
+  const access=within(manager).getByText('账户与访问令牌').closest('.manager-section') as HTMLElement;
+  const detection=within(manager).getByText('检测与恢复').closest('.manager-section') as HTMLElement;
+  expect(within(access).getByRole('button',{name:'修改已有令牌权限'})).toBeTruthy();
+  expect(within(detection).getByRole('button',{name:'重置检测密钥'})).toBeTruthy();
+  expect(within(manager).getByText(/检测密钥用于短链接健康检查，与 Cloudflare API 令牌分开保存/)).toBeTruthy();
+  fireEvent.click(within(manager).getByRole('button',{name:'完成'}));
+  fireEvent.click(screen.getByRole('button',{name:'导入账户'}));
+  const imported=screen.getByRole('dialog',{name:'导入访问令牌'});
+  const steps=imported.querySelectorAll('.token-step');
+  expect(steps).toHaveLength(2);
+  expect(steps[0].textContent).toContain('在 Cloudflare 准备令牌');
+  expect(steps[1].textContent).toContain('粘贴并验证');
+  expect((within(imported).getByRole('checkbox') as HTMLInputElement).checked).toBe(false);
+});
+
 it('keeps the selected account visible while updating its token',async()=>{
   render(<App/>);
   await screen.findByText('/manual');

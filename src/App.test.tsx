@@ -89,6 +89,32 @@ describe('desktop primary flows in explicit preview', () => {
     expect((within(linkEditor).getByRole('combobox', {name:'所属域名'}) as HTMLSelectElement).value).toBe('demo-d1');
   });
 
+  it('keeps each domain row linked to its own path, link filter, and removal plan', async () => {
+    const originalDispatch = bridge.dispatch;
+    const prepared: Record<string, unknown>[] = [];
+    vi.spyOn(bridge, 'dispatch').mockImplementation(((action: Action, payload: Record<string, unknown> = {}) => {
+      if (action === 'prepare_change') prepared.push(payload);
+      return originalDispatch(action, payload);
+    }) as typeof bridge.dispatch);
+    const user = userEvent.setup();
+    render(<App />);
+    await screen.findByRole('heading', {name:'短链接'});
+    await user.click(screen.getByRole('button', {name:/^域名管理$/}));
+    const card = screen.getByRole('article', {name:'links.example.org 域名'});
+    expect(within(card).getByText('/s/')).toBeTruthy();
+    expect(card.querySelector('.domain-facts')?.textContent).toContain('已创建 1 条链接');
+    await user.click(within(card).getByRole('button', {name:'创建短链接'}));
+    const editor = screen.getByRole('dialog', {name:'创建短链接'});
+    expect((within(editor).getByRole('combobox', {name:'所属域名'}) as HTMLSelectElement).value).toBe('demo-d2');
+    await user.click(within(editor).getByRole('button', {name:'取消'}));
+    await user.click(screen.getByRole('button', {name:/^域名管理$/}));
+    await user.click(within(screen.getByRole('article', {name:'links.example.org 域名'})).getByRole('button', {name:'查看链接'}));
+    expect((screen.getByRole('combobox', {name:'筛选域名'}) as HTMLSelectElement).value).toBe('demo-d2');
+    await user.click(screen.getByRole('button', {name:/^域名管理$/}));
+    await user.click(within(screen.getByRole('article', {name:'links.example.org 域名'})).getByRole('button', {name:'移除 links.example.org'}));
+    await waitFor(() => expect(prepared.some(payload => payload.kind === 'remove_domain' && payload.domainId === 'demo-d2')).toBe(true));
+  });
+
   it('uses the clicked zero-link domain before the current filter and keeps that filter for a new link', async () => {
     const originalDispatch = bridge.dispatch;
     const mockedDispatch = async (action: Action, payload: Record<string, unknown> = {}): Promise<unknown> => {
