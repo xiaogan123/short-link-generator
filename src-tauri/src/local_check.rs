@@ -2,9 +2,26 @@ use chrono::Utc;
 use reqwest::{Client, Method, StatusCode};
 use serde_json::{json, Value};
 use std::{
-    net::{IpAddr, Ipv6Addr, SocketAddr},
+    net::{IpAddr, SocketAddr},
     time::Duration,
 };
+
+mod public_dns;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DnsMode {
+    System,
+    Public,
+}
+
+impl DnsMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::System => "system",
+            Self::Public => "public",
+        }
+    }
+}
 
 fn public_ip(ip: IpAddr) -> bool {
     match ip {
@@ -26,14 +43,29 @@ fn public_ip(ip: IpAddr) -> bool {
                 return public_ip(IpAddr::V4(mapped));
             }
             let s = v.segments();
-            !((s[0] & 0xe000) != 0x2000
-                || v == Ipv6Addr::LOCALHOST
-                || v == Ipv6Addr::UNSPECIFIED
-                || (s[0] & 0xfe00) == 0xfc00
-                || (s[0] & 0xffc0) == 0xfe80
-                || (s[0] & 0xff00) == 0xff00
+            // Keep the existing global-unicast-only policy. In particular,
+            // NAT64, IPv4-compatible, ULA, link-local and multicast addresses
+            // must not bypass the IPv4/private-address checks through IPv6.
+            if (s[0] & 0xe000) != 0x2000 {
+                return false;
+            }
+            // IANA special-purpose registry, including its more-specific
+            // globally reachable exceptions within 2001::/23:
+            // https://www.iana.org/assignments/iana-ipv6-special-registry/
+            if s[0] == 0x2001 && s[1] < 0x0200 {
+                return (s[1] == 1
+                    && s[2..7].iter().all(|segment| *segment == 0)
+                    && (1..=3).contains(&s[7]))
+                    || s[1] == 3
+                    || (s[1] == 4 && s[2] == 0x112)
+                    || (s[1] & 0xfff0) == 0x20
+                    || (s[1] & 0xfff0) == 0x30;
+            }
+            // Documentation prefixes and 6to4 are not accepted as ordinary
+            // public website destinations. Teredo is excluded above.
+            !(s[0] == 0x2002
                 || (s[0] == 0x2001 && s[1] == 0xdb8)
-                || (s[0] == 0x2001 && s[1] == 0x10))
+                || (s[0] == 0x3fff && (s[1] & 0xf000) == 0))
         }
     }
 }
@@ -44,6 +76,10 @@ enum CheckIssue {
     DnsTimeout,
     DnsFailed,
     DnsEmpty,
+    PublicDnsTimeout,
+    PublicDnsFailed,
+    PublicDnsInvalidResponse,
+    PublicDnsResponseTooLarge,
     VirtualAddress,
     NonPublicAddress,
     ClientInitialization,
@@ -56,6 +92,10 @@ impl CheckIssue {
             Self::DnsTimeout => ("dns_timeout", "dns", "查询网站地址超时，请稍后重试"),
             Self::DnsFailed => ("dns_failed", "dns", "当前电脑无法解析网站域名，请检查网络后重试"),
             Self::DnsEmpty => ("dns_no_answer", "dns", "没有查询到网站的 IP 地址，尚未连接网站"),
+            Self::PublicDnsTimeout => ("public_dns_timeout", "dns", "公共 DNS 查询超时，尚未连接网站，请稍后重试"),
+            Self::PublicDnsFailed => ("public_dns_failed", "dns", "未能从公共 DNS 查询网站地址，尚未连接网站，请稍后重试"),
+            Self::PublicDnsInvalidResponse => ("public_dns_invalid_response", "dns", "公共 DNS 返回的信息不完整或不匹配，已停止检测，尚未连接网站"),
+            Self::PublicDnsResponseTooLarge => ("public_dns_response_too_large", "dns", "公共 DNS 返回的信息超出检查范围，已停止检测，尚未连接网站"),
             Self::VirtualAddress => ("virtual_dns_address", "dns", "本机网络设置影响了检测：域名返回虚拟地址范围，可能与代理或 VPN 有关。尚未连接网站，不能据此判断网站是否可用"),
             Self::NonPublicAddress => ("blocked_non_public_address", "dns", "域名指向非公开地址，已停止检测。尚未连接网站，请检查域名和本机网络设置"),
             Self::ClientInitialization => ("client_initialization", "connection", "无法启动网站检查，请稍后重试"),
@@ -93,7 +133,25 @@ fn validate_addresses(addrs: &[SocketAddr]) -> Result<(), CheckIssue> {
     Ok(())
 }
 
-async fn client_for(url: &url::Url) -> Result<Client, CheckIssue> {
+async fn client_for(url: &url::Url, mode: DnsMode) -> Result<Client, CheckIssue> {
+    client_for_with_timeout(url, mode, Duration::from_secs(6)).await
+}
+
+pub(crate) async fn client_for_probe(
+    url: &url::Url,
+    mode: DnsMode,
+    timeout: Duration,
+) -> Result<Client, String> {
+    client_for_with_timeout(url, mode, timeout)
+        .await
+        .map_err(|issue| issue.details().2.to_owned())
+}
+
+async fn client_for_with_timeout(
+    url: &url::Url,
+    mode: DnsMode,
+    timeout: Duration,
+) -> Result<Client, CheckIssue> {
     if url.scheme() != "https"
         || url.host_str().is_none()
         || !url.username().is_empty()
@@ -109,6 +167,8 @@ async fn client_for(url: &url::Url) -> Result<Client, CheckIssue> {
     let port = url.port_or_known_default().ok_or(CheckIssue::InvalidUrl)?;
     let addrs: Vec<SocketAddr> = if let Ok(ip) = host.parse::<IpAddr>() {
         vec![SocketAddr::new(ip, port)]
+    } else if mode == DnsMode::Public {
+        public_dns::resolve(host, port).await?
     } else {
         tokio::time::timeout(
             Duration::from_secs(3),
@@ -124,20 +184,30 @@ async fn client_for(url: &url::Url) -> Result<Client, CheckIssue> {
         .redirect(reqwest::redirect::Policy::none())
         .no_proxy()
         .https_only(true)
-        .timeout(Duration::from_secs(6))
+        .timeout(timeout)
         .resolve_to_addrs(host, &addrs)
         .build()
         .map_err(|_| CheckIssue::ClientInitialization)
 }
 
 pub async fn check(label: &str, initial: &str) -> Value {
+    check_with_mode(label, initial, DnsMode::System).await
+}
+
+pub async fn check_with_mode(label: &str, initial: &str, mode: DnsMode) -> Value {
+    let mut value = check_inner(label, initial, mode).await;
+    value["dnsMode"] = json!(mode.as_str());
+    value
+}
+
+async fn check_inner(label: &str, initial: &str, mode: DnsMode) -> Value {
     let checked_at = Utc::now().to_rfc3339();
     let mut url = match url::Url::parse(initial) {
         Ok(v) => v,
         Err(_) => return issue_result(label, &CheckIssue::InvalidUrl, &checked_at, initial),
     };
     for hop in 0..=3 {
-        let client = match client_for(&url).await {
+        let client = match client_for(&url, mode).await {
             Ok(c) => c,
             Err(e) => return issue_result(label, &e, &checked_at, url.as_str()),
         };
@@ -295,7 +365,7 @@ fn result(
 }
 
 pub fn timeout_result(label: &str, url: &str) -> Value {
-    result(
+    let mut value = result(
         label,
         "unknown",
         "request_timeout",
@@ -303,7 +373,15 @@ pub fn timeout_result(label: &str, url: &str) -> Value {
         "本机检查超时，请稍后重试",
         &Utc::now().to_rfc3339(),
         url,
-    )
+    );
+    value["dnsMode"] = json!(DnsMode::System.as_str());
+    value
+}
+
+pub fn timeout_result_with_mode(label: &str, url: &str, mode: DnsMode) -> Value {
+    let mut value = timeout_result(label, url);
+    value["dnsMode"] = json!(mode.as_str());
+    value
 }
 
 #[cfg(test)]
@@ -351,6 +429,67 @@ mod tests {
         assert_eq!(validate_addresses(&[addr("1.1.1.1")]), Ok(()));
     }
 
+    #[test]
+    fn ipv6_special_prefixes_and_translation_cannot_bypass_address_guards() {
+        for ip in [
+            "2001::1",                           // Teredo
+            "2001:2::1",                         // Benchmarking
+            "2001:2:0:ffff:ffff:ffff:ffff:ffff", // End of benchmarking /48
+            "2001:10::1",                        // Deprecated ORCHID /28
+            "2001:1f:ffff:ffff:ffff:ffff:ffff:ffff",
+            "2001:1::4",     // Outside globally reachable anycast exceptions
+            "2001:4:113::1", // Outside AS112 exception
+            "2001:1ff:ffff:ffff:ffff:ffff:ffff:ffff", // End of IETF /23
+            "2001:db8::1",
+            "2002::1",
+            "2002:7f00:1::1", // 6to4 embedding loopback
+            "2002:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
+            "3fff::1",
+            "3fff:fff:ffff:ffff:ffff:ffff:ffff:ffff", // End of documentation /20
+            "64:ff9b::7f00:1",                        // Well-known NAT64 embedding loopback
+            "64:ff9b::101:101",                       // NAT64 remains conservatively blocked
+            "64:ff9b:1::a00:1",                       // Local-use NAT64
+            "::127.0.0.1",                            // Deprecated IPv4-compatible
+            "::ffff:10.0.0.1",
+            "::ffff:198.18.0.1",
+            "100::1",
+            "100:0:0:1::1",
+            "5f00::1",
+        ] {
+            let ip: IpAddr = ip.parse().unwrap();
+            assert!(!public_ip(ip), "{ip}");
+            assert!(
+                validate_addresses(&[
+                    SocketAddr::new("1.1.1.1".parse().unwrap(), 443),
+                    SocketAddr::new(ip, 443),
+                ])
+                .is_err(),
+                "mixed answer containing {ip}"
+            );
+        }
+        // Preserve ordinary public IPv6 and IANA's globally reachable
+        // exceptions rather than rejecting their containing block wholesale.
+        for ip in [
+            "2606:4700:4700::1111",
+            "2001:4860:4860::8888",
+            "2001:1::1",
+            "2001:1::2",
+            "2001:1::3",
+            "2001:3::1",
+            "2001:4:112::1",
+            "2001:20::1",
+            "2001:2f:ffff:ffff:ffff:ffff:ffff:ffff",
+            "2001:30::1",
+            "2001:3f:ffff:ffff:ffff:ffff:ffff:ffff",
+            "2001:200::1", // Just beyond IETF /23
+            "2620:4f:8000::1",
+            "3fff:1000::1", // Just beyond documentation /20
+            "::ffff:1.1.1.1",
+        ] {
+            assert!(public_ip(ip.parse().unwrap()), "{ip}");
+        }
+    }
+
     #[tokio::test]
     async fn blocked_destinations_return_specific_unknown_before_transport() {
         for (url, reason) in [
@@ -369,6 +508,60 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("不经过系统代理"));
+        }
+    }
+
+    #[tokio::test]
+    async fn public_mode_does_not_resolve_or_connect_to_literal_or_local_destinations() {
+        for (url, reason) in [
+            ("https://198.18.0.1/", "virtual_dns_address"),
+            ("https://[::ffff:198.18.0.1]/", "virtual_dns_address"),
+            ("https://127.0.0.1/", "blocked_non_public_address"),
+            ("https://[::1]/", "blocked_non_public_address"),
+            ("https://localhost/", "blocked_non_public_address"),
+            ("https://test.localhost/", "blocked_non_public_address"),
+            ("https://router.local/", "blocked_non_public_address"),
+            ("https://router.home.arpa/", "blocked_non_public_address"),
+            ("http://example.org/", "invalid_url"),
+            ("https://user:password@example.org/", "invalid_url"),
+        ] {
+            let result = check_with_mode("目标网站", url, DnsMode::Public).await;
+            assert_eq!(result["status"], "unknown", "{url}");
+            assert_eq!(result["reason"], reason, "{url}");
+            assert_eq!(result["dnsMode"], "public");
+            assert_eq!(result["source"], "local");
+        }
+        assert_eq!(
+            timeout_result_with_mode("目标网站", "https://example.org/", DnsMode::Public)
+                ["dnsMode"],
+            "public"
+        );
+        assert_eq!(
+            timeout_result("目标网站", "https://example.org/")["dnsMode"],
+            "system"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_client_reuses_the_same_address_and_https_guards() {
+        for mode in [DnsMode::System, DnsMode::Public] {
+            for (address, expected) in [
+                ("https://198.18.0.1/", "虚拟地址"),
+                ("https://127.0.0.1/", "非公开地址"),
+                ("https://[::1]/", "非公开地址"),
+                ("https://[2002:7f00:1::1]/", "非公开地址"),
+                ("https://[2001:2::1]/", "非公开地址"),
+                ("https://[3fff::1]/", "非公开地址"),
+                ("https://[64:ff9b::7f00:1]/", "非公开地址"),
+                ("http://example.org/", "HTTPS"),
+                ("https://user:password@example.org/", "HTTPS"),
+            ] {
+                let url = url::Url::parse(address).unwrap();
+                let error = client_for_probe(&url, mode, Duration::from_secs(30))
+                    .await
+                    .unwrap_err();
+                assert!(error.contains(expected), "{address}: {error}");
+            }
         }
     }
 }

@@ -1,6 +1,9 @@
 import {act,cleanup,fireEvent,render,screen,waitFor,within} from '@testing-library/react';
 import {afterEach,expect,it,vi} from 'vitest';
 import App from './App';
+import {openUrl} from '@tauri-apps/plugin-opener';
+
+vi.mock('@tauri-apps/plugin-opener',()=>({openUrl:vi.fn()}));
 
 const control=vi.hoisted(()=>({calls:[] as {action:string;payload:Record<string,unknown>}[],resolveApply:null as null|((value:unknown)=>void),dnsReady:false,domainReady:false,applyFails:false,multi:false,ambiguous:false}));
 const account={id:'a',label:'示例账户',zones:[{id:'z',name:'example.com',status:'active'}],zoneCount:1,checkedAt:null,hasResources:true,needsSelftestKey:false};
@@ -14,7 +17,7 @@ vi.mock('./bridge',()=>({preview:false,errorMessage:(error:unknown)=>String(erro
   throw new Error(`Unexpected ${action}`);
 }}));
 
-afterEach(()=>{cleanup();control.calls.length=0;control.resolveApply=null;control.dnsReady=false;control.domainReady=false;control.applyFails=false;control.multi=false;control.ambiguous=false;});
+afterEach(()=>{cleanup();control.calls.length=0;control.resolveApply=null;control.dnsReady=false;control.domainReady=false;control.applyFails=false;control.multi=false;control.ambiguous=false;vi.clearAllMocks();});
 
 it('keeps a DNS repair plan open while applying, so its late result cannot prepare another host',async()=>{
   render(<App/>); await screen.findByText('先连接一个域名');
@@ -80,7 +83,11 @@ it('keeps a DNS permission failure visible and retries only the read preparation
   const reopened=await screen.findByRole('dialog',{name:'添加域名'});
   const alert=within(reopened).getByRole('alert');
   expect(alert.textContent).toContain('当前授权无法修改此域名的解析');
-  expect(within(reopened).getByRole('button',{name:'更新当前账户令牌'})).toBeTruthy();
+  expect(within(reopened).getByRole('button',{name:'更换本机令牌'})).toBeTruthy();
+  const callsBeforeEdit=control.calls.length;
+  fireEvent.click(within(reopened).getByRole('button',{name:'修改已有令牌权限'}));
+  await waitFor(()=>expect(openUrl).toHaveBeenCalledWith('https://dash.cloudflare.com/profile/api-tokens'));
+  expect(control.calls).toHaveLength(callsBeforeEdit);
   fireEvent.click(within(reopened).getByRole('button',{name:'已补好授权，继续检查'}));
   expect(await screen.findByRole('dialog',{name:'修复 DNS'})).toBeTruthy();
   expect(control.calls.filter(call=>call.action==='apply_plan')).toHaveLength(1);
@@ -101,7 +108,7 @@ it('binds a unique automatic account match so recovery stays available after a D
   const reopened=await screen.findByRole('dialog',{name:'添加域名'});
   expect((within(reopened).getByRole('combobox',{name:'Cloudflare 账户'}) as HTMLSelectElement).value).toBe('a');
   expect(within(reopened).getByRole('button',{name:'已补好授权，继续检查'})).toBeTruthy();
-  expect(within(reopened).getByRole('button',{name:'更新当前账户令牌'})).toBeTruthy();
+  expect(within(reopened).getByRole('button',{name:'更换本机令牌'})).toBeTruthy();
 });
 
 it('requires an explicit account choice when domain preparation has multiple candidates',async()=>{
@@ -114,5 +121,23 @@ it('requires an explicit account choice when domain preparation has multiple can
   fireEvent.click(within(form).getByRole('button',{name:'检查并接入'}));
   expect((await within(form).findByRole('alert')).textContent).toContain('多个账户都可能管理此域名');
   expect(control.calls.filter(call=>call.action==='prepare_domain_dns')).toHaveLength(0);
+  expect(control.calls.filter(call=>call.action==='apply_plan')).toHaveLength(0);
+});
+
+it('keeps the explicit VPN choice through the DNS-ready automatic directory recheck',async()=>{
+  control.dnsReady=true;
+  render(<App/>);await screen.findByText('先连接一个域名');
+  fireEvent.click(screen.getByRole('button',{name:/^域名管理$/}));
+  fireEvent.click(screen.getAllByRole('button',{name:'添加域名'})[0]);
+  const form=screen.getByRole('dialog',{name:'添加域名'});
+  fireEvent.change(within(form).getByPlaceholderText('go.example.com'),{target:{value:'ready.example.com'}});
+  const vpn=within(form).getByRole('checkbox',{name:'兼容 VPN 网络'}) as HTMLInputElement;
+  expect(vpn.checked).toBe(false);
+  fireEvent.click(vpn);
+  fireEvent.click(within(form).getByRole('button',{name:'检查并接入'}));
+  await screen.findByRole('button',{name:'确认并执行'});
+  const checks=control.calls.filter(call=>call.action==='prepare_domain');
+  expect(checks).toHaveLength(2);
+  expect(checks.every(call=>call.payload.dnsMode==='public')).toBe(true);
   expect(control.calls.filter(call=>call.action==='apply_plan')).toHaveLength(0);
 });

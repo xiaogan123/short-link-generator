@@ -1,8 +1,12 @@
-import {cleanup,fireEvent,render,screen,waitFor,within} from '@testing-library/react';
+import {act,cleanup,fireEvent,render,screen,waitFor,within} from '@testing-library/react';
 import {afterEach,expect,it,vi} from 'vitest';
 import App from './App';
+import {openUrl} from '@tauri-apps/plugin-opener';
 
 const calls=vi.hoisted(()=>[] as {action:string;payload:Record<string,unknown>}[]);
+const clipboard=vi.hoisted(()=>({readText:vi.fn(async()=>''),writeText:vi.fn()}));
+vi.mock('@tauri-apps/plugin-opener',()=>({openUrl:vi.fn()}));
+vi.mock('@tauri-apps/plugin-clipboard-manager',()=>clipboard);
 vi.mock('./bridge',()=>({
   preview:false,
   errorMessage:(error:unknown)=>String(error),
@@ -16,7 +20,7 @@ vi.mock('./bridge',()=>({
   },
 }));
 
-afterEach(()=>{cleanup();calls.length=0;});
+afterEach(()=>{cleanup();calls.length=0;vi.clearAllMocks();clipboard.readText.mockReset();clipboard.readText.mockResolvedValue('');});
 
 it('uses a root account dialog and returns focus after Escape',async()=>{
   render(<App/>);
@@ -36,15 +40,93 @@ it('keeps the selected account visible while updating its token',async()=>{
   await screen.findByText('/manual');
   fireEvent.click(screen.getByRole('button',{name:/^Cloudflare 账户$/}));
   fireEvent.click(screen.getByRole('button',{name:'管理 本机备注'}));
-  fireEvent.click(within(screen.getByRole('dialog',{name:'账户管理'})).getByRole('button',{name:'更新访问令牌'}));
-  const token=screen.getByRole('dialog',{name:'更新访问令牌'});
+  fireEvent.click(within(screen.getByRole('dialog',{name:'账户管理'})).getByRole('button',{name:'更换本机令牌'}));
+  const token=screen.getByRole('dialog',{name:'更换本机令牌'});
   expect(token.textContent).toContain('Example organization');
   expect(token.textContent).toContain('必须包含这个 Cloudflare 账户');
-  expect(within(token).getByRole('checkbox')).toBeTruthy();
-  expect((within(token).getByRole('checkbox') as HTMLInputElement).disabled).toBe(true);
+  expect(token.textContent).toContain('其他账户不变');
+  expect(within(token).queryByRole('checkbox')).toBeNull();
   fireEvent.change(within(token).getByPlaceholderText('在此粘贴令牌'),{target:{value:'replacement-token'}});
   fireEvent.submit(token.querySelector('#token-form')!);
   await waitFor(()=>expect(calls.some(call=>call.action==='import_token'&&call.payload.expectedAccountId==='a'&&call.payload.replace===true)).toBe(true));
+});
+
+it.each(['账户管理','更换本机令牌'])('opens existing-token settings from %s without creating or replacing a token',async(location)=>{
+  render(<App/>);
+  await screen.findByText('/manual');
+  fireEvent.click(screen.getByRole('button',{name:/^Cloudflare 账户$/}));
+  fireEvent.click(screen.getByRole('button',{name:'管理 本机备注'}));
+  if(location==='更换本机令牌')fireEvent.click(within(screen.getByRole('dialog',{name:'账户管理'})).getByRole('button',{name:'更换本机令牌'}));
+  const dialog=screen.getByRole('dialog',{name:location});
+  fireEvent.click(within(dialog).getByRole('button',{name:'修改已有令牌权限'}));
+  await waitFor(()=>expect(openUrl).toHaveBeenCalledWith('https://dash.cloudflare.com/profile/api-tokens'));
+  expect(calls.filter(call=>call.action==='token_template'||call.action==='import_token')).toHaveLength(0);
+  if(location==='更换本机令牌'){
+    expect(dialog.textContent).toContain('无需在这里重新粘贴');
+    expect(within(dialog).getByRole('button',{name:'打开新令牌模板'}).closest('details')?.open).toBe(false);
+    fireEvent.click(within(dialog).getByRole('button',{name:'取消'}));
+    expect(screen.queryByRole('dialog',{name:location})).toBeNull();
+  }
+});
+
+it.each(['取消','关闭','Escape','遮罩'])('dismisses an unsubmitted token update with %s without retaining the token or replacement choice',async(method)=>{
+  render(<App/>);
+  await screen.findByText('/manual');
+  fireEvent.click(screen.getByRole('button',{name:/^Cloudflare 账户$/}));
+  fireEvent.click(screen.getByRole('button',{name:'管理 本机备注'}));
+  fireEvent.click(within(screen.getByRole('dialog',{name:'账户管理'})).getByRole('button',{name:'更换本机令牌'}));
+  const editor=screen.getByRole('dialog',{name:'更换本机令牌'});
+  fireEvent.change(within(editor).getByPlaceholderText('在此粘贴令牌'),{target:{value:'discard-this-test-token'}});
+  if(method==='Escape')fireEvent.keyDown(document,{key:'Escape'});
+  else if(method==='遮罩')fireEvent.mouseDown(editor.parentElement!);
+  else fireEvent.click(within(editor).getByRole('button',{name:method}));
+  await waitFor(()=>expect(screen.queryByRole('dialog',{name:'更换本机令牌'})).toBeNull());
+  expect(calls.filter(call=>call.action==='import_token')).toHaveLength(0);
+  fireEvent.click(screen.getByRole('button',{name:'导入账户'}));
+  const imported=screen.getByRole('dialog',{name:'导入访问令牌'});
+  expect((within(imported).getByPlaceholderText('在此粘贴令牌') as HTMLInputElement).value).toBe('');
+  const replacement=within(imported).getByRole('checkbox') as HTMLInputElement;
+  expect(replacement.checked).toBe(false);
+  expect(replacement.disabled).toBe(false);
+});
+
+async function openTokenEditor(){
+  render(<App/>);
+  await screen.findByText('/manual');
+  fireEvent.click(screen.getByRole('button',{name:/^Cloudflare 账户$/}));
+  fireEvent.click(screen.getByRole('button',{name:'管理 本机备注'}));
+  fireEvent.click(within(screen.getByRole('dialog',{name:'账户管理'})).getByRole('button',{name:'更换本机令牌'}));
+  return screen.getByRole('dialog',{name:'更换本机令牌'});
+}
+
+it.each([false,true])('discards a late clipboard result after cancellation (reopen first: %s)',async(reopenFirst)=>{
+  const pending:Array<(value:string)=>void>=[];
+  clipboard.readText.mockImplementation(()=>new Promise(resolve=>pending.push(resolve)));
+  const editor=await openTokenEditor();
+  await waitFor(()=>expect(pending.length).toBe(1));
+  fireEvent.click(within(editor).getByRole('button',{name:'取消'}));
+  if(reopenFirst)fireEvent.click(screen.getByRole('button',{name:'导入账户'}));
+  await act(async()=>pending[0]('old'.repeat(14)));
+  if(!reopenFirst)fireEvent.click(screen.getByRole('button',{name:'导入账户'}));
+  const next=screen.getByRole('dialog',{name:'导入访问令牌'});
+  expect(within(next).queryByText('检测到可能的访问令牌，是否填入？')).toBeNull();
+  expect((within(next).getByPlaceholderText('在此粘贴令牌') as HTMLInputElement).value).toBe('');
+  expect(calls.some(call=>call.action==='import_token')).toBe(false);
+});
+
+it('keeps the newest clipboard offer when focus reads finish out of order',async()=>{
+  const pending:Array<(value:string)=>void>=[];
+  clipboard.readText.mockImplementation(()=>new Promise(resolve=>pending.push(resolve)));
+  const editor=await openTokenEditor();
+  await waitFor(()=>expect(pending.length).toBe(1));
+  fireEvent.focus(window);
+  await waitFor(()=>expect(pending.length).toBe(2));
+  await act(async()=>pending[1]('new'.repeat(14)));
+  expect(within(editor).getByText('检测到可能的访问令牌，是否填入？')).toBeTruthy();
+  await act(async()=>pending[0]('old'.repeat(14)));
+  fireEvent.click(within(editor).getByRole('button',{name:'填入'}));
+  expect((within(editor).getByPlaceholderText('在此粘贴令牌') as HTMLInputElement).value).toBe('new'.repeat(14));
+  expect(calls.some(call=>call.action==='import_token')).toBe(false);
 });
 
 it('marks manual links and clears a prepared domain plan after input changes',async()=>{

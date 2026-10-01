@@ -84,8 +84,12 @@ GitHub 的 `release` 环境需新增 `MACOS_SIGNING_P12_BASE64`、`MACOS_SIGNING
 
 归档解析先验证整个路径与链接图，再写入新的私有目录；支持普通 USTAR、GNU 长名称、受限 PAX 元数据和应用内部链接，拒绝路径穿越、大小写/Unicode 重复路径、链接父目录、越界或循环链接、硬链接、设备、稀疏文件及不支持的扩展元数据。压缩输入最多 256 MiB、展开数据最多 512 MiB、头记录最多 20,000 条；超过限制须调整并重新审查，不能跳过检查。隐私检查使用同一解包器，并在提取前扫描完整展开字节，覆盖不进入文件清单的头部、元数据和填充区；原始字节不写入公开证据。外层 Minisign 验签本身不证明内部原生签名。
 
-首次采用该身份前，必须用同一证书签两个确实不同的二进制，确认代码哈希不同、固定 DR 一致，并让 A 满足 B 的 DR、B 满足 A 的 DR。自动工具测试的合成证书和 mock OS 命令仅验证逻辑，不代表原生签名或真实用户钥匙串验收。旧临时签名迁移到自签名仍是一次身份改变，可能按受保护条目再次询问授权；尊重系统提示与用户选择，不静默改 ACL、删除重建条目或承诺所有弹框消失。以后保持证书与 identifier 可稳定身份，但锁定钥匙串、自定义 ACL 等仍可能要求用户授权。证书丢失、轮换或将来换成 Developer ID 都需要单独处理迁移。
+首次采用该身份前，必须用同一证书签两个确实不同的二进制，确认代码哈希不同、固定 DR 一致，并让 A 满足 B 的 DR、B 满足 A 的 DR。这仅验证签名要求的连续性，不证明钥匙串跨版本授权连续性。macOS 在普通 ACL 之外还验证 partition；自签代码可能使用随二进制变化的 CDHash。即使证书和 identifier 不变，升级后也可能再次要求授权。
 
-身份稳定与钥匙串跟踪的依据见 [Apple TN2206](https://developer.apple.com/library/archive/technotes/tn2206/_index.html)；证书指纹和 identifier 约束见 [Apple Code Signing Requirement Language](https://developer.apple.com/library/archive/documentation/Security/Conceptual/CodeSigningGuide/RequirementLang/RequirementLang.html)。
+自动工具测试、mock OS 命令以及新建自定义钥匙串的成功结果，均不能代替真实登录钥匙串的升级验收；不同库的格式和 partition 行为可能不同。发布前须以实际旧版与候选版、真实安装路径和原有条目验证升级后读取，分别记录首次授权、同版冷启动和跨版本结果。不得以同 DR、同版重启成功或新库夹具成功宣称跨版本免授权。当前跨版本授权故障未关闭前不得发布本候选。
+
+旧临时签名迁移到自签名、证书丢失或轮换、将来换成 Developer ID，都需要单独处理迁移。尊重系统提示与用户选择，不静默改 ACL、删除重建条目或承诺所有弹框消失。系统锁定和自定义访问限制仍可能要求授权。
+
+签名要求的依据见 [Apple TN2206](https://developer.apple.com/library/archive/technotes/tn2206/_index.html) 和 [Apple Code Signing Requirement Language](https://developer.apple.com/library/archive/documentation/Security/Conceptual/CodeSigningGuide/RequirementLang/RequirementLang.html)。额外的 partition 分类与验证见 Apple Security 源码中的 [clientid.cpp](https://github.com/apple-oss-distributions/Security/blob/db15acbe6a7f257a859ad9a3bb86097bfe0679d9/securityd/src/clientid.cpp#L187) 和 [acls.cpp](https://github.com/apple-oss-distributions/Security/blob/db15acbe6a7f257a859ad9a3bb86097bfe0679d9/securityd/src/acls.cpp#L119)。
 
 GitHub 的手动触发输入、原生 runner 标签与 artifact 保留期以 [workflow_dispatch 文档](https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/trigger-a-workflow)、[runner 参考](https://docs.github.com/en/actions/reference/runners/github-hosted-runners)和[artifact 文档](https://docs.github.com/en/actions/tutorials/store-and-share-data)为准。Windows 静默安装使用 Tauri 所述的 NSIS `/S` 参数；见 [Tauri Windows 安装包说明](https://v2.tauri.app/distribute/windows-installer/)。

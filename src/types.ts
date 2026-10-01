@@ -16,5 +16,5 @@ export type Action = 'get_state' | 'token_template' | 'import_token' | 'rename_a
 export type TargetTemplate = {prefix:string;suffix:string};
 export type PoolCandidate = TargetTemplate & {id:string;enabled:boolean};
 export type Pool = {id:string;name:string;official:TargetTemplate;candidates:PoolCandidate[];updated:string;accountIds:string[];syncStatus?:{accountId:string;status:string;message:string}[]};
-export type TargetReport = {checkedAt:string;checks:{label:string;status:'passed'|'failed'|'unknown';message:string;checkedAt:string;source:'local';url:string;reason?:string;stage?:string}[]};
+export type TargetReport = {checkedAt:string;dnsMode?:'system'|'public';checks:{label:string;status:'passed'|'failed'|'unknown';message:string;checkedAt:string;source:'local';url:string;reason?:string;stage?:string;dnsMode?:'system'|'public'}[]};
 export type PoolHealth = {poolId:string;accounts:{accountId:string;source:'mainland_provider'|'unconfigured'|'unknown';checkedAt:string|null;status:'healthy'|'unhealthy'|'unknown';candidates:{id:string;status:'healthy'|'unhealthy'|'unknown';checkedAt:string|null;message:string}[]}[]};

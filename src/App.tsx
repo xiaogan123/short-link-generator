@@ -131,8 +131,8 @@ function formatDate(value: string | null) {
         minute: "2-digit",
       }).format(d);
 }
-function targetSourceLabel() {
-  return preview ? "本地预览 · 未探测" : "本机网络";
+function targetSourceLabel(dnsMode?: TargetReport["dnsMode"]) {
+  return preview ? "本地预览 · 未探测" : dnsMode === "public" ? "本机网络 · 公共 DNS" : "本机网络";
 }
 function domainCheckLevel(check: DomainPreparation["checks"][number]) {
   return check.level || (check.ok ? "pass" : "error");
@@ -183,10 +183,13 @@ export default function App() {
   const [filter, setFilter] = useState("all");
   const [linkDraft, setLinkDraft] = useState<LinkDraft | null>(null);
   const [originalSlug, setOriginalSlug] = useState<string | null>(null);
+  const [copySource, setCopySource] = useState<{domainId: string; slug: string} | null>(null);
+  const slugInput = useRef<HTMLInputElement>(null);
   const [domainDraft, setDomainDraft] = useState({
     input: "",
     prefix: "r",
     accountId: "",
+    dnsMode: "system" as "system" | "public",
   });
   const [domainOpen, setDomainOpen] = useState(false);
   const [domainBusy, setDomainBusy] = useState(false);
@@ -202,7 +205,9 @@ export default function App() {
   const [planDetails, setPlanDetails] = useState<string[]>([]);
   const [planKind, setPlanKind] = useState("");
   const [migrationAccountId, setMigrationAccountId] = useState<string | null>(null);
-  const [tokenOpen, setTokenOpen] = useState(false);
+  const [tokenOpen, setTokenOpenState] = useState(false);
+  const tokenDialogOpen = useRef(false);
+  const clipboardReadSequence = useRef(0);
   const [updateTokenAccount, setUpdateTokenAccount] = useState<Account | null>(
     null,
   );
@@ -210,14 +215,30 @@ export default function App() {
   const [replaceToken, setReplaceToken] = useState(false);
   const [clipboardOffer, setClipboardOffer] = useState("");
   const [clipboardToClear, setClipboardToClear] = useState("");
+  function clearClipboardOffer() {
+    clipboardReadSequence.current += 1;
+    setClipboardOffer("");
+  }
+  function setTokenOpen(open: boolean) {
+    tokenDialogOpen.current = open;
+    clearClipboardOffer();
+    setTokenOpenState(open);
+  }
   const [renameAccount, setRenameAccount] = useState<Account | null>(null);
   const [renameValue, setRenameValue] = useState("");
   const [removeAccount, setRemoveAccount] = useState<Account | null>(null);
   const [testResult, setTestResult] = useState<{
     url: string;
     result: Selftest;
+    domainId: string;
+    slug: string;
+    fingerprint: string;
+    dnsMode: "system" | "public";
   } | null>(null);
   const [targetResult, setTargetResult] = useState<TargetReport | null>(null);
+  const [retryingTargets, setRetryingTargets] = useState(false);
+  const targetRetrySequence = useRef(0);
+  const targetRetryBusy = useRef(false);
   const [detections, setDetections] = useState<Record<string, Detection>>({});
   const [poolHealth, setPoolHealth] = useState<
     Record<string, { fingerprint: string; report: PoolHealth }>
@@ -413,8 +434,7 @@ export default function App() {
         const domain = state.domains.find((d) => d.id === fields.domainId);
         const pool = state.pools?.find((p) => p.id === fields.poolId);
         const code = encodeURIComponent(String(fields.code));
-        setPlanDetails(
-          fields.poolId
+        const linkDetails = fields.poolId
             ? [
                 `短链接：${domain ? shortUrl(domain.host, domain.prefix, String(fields.slug)) : String(fields.slug)}`,
                 `跟随平台地址：${pool?.name || String(fields.poolId)}`,
@@ -433,8 +453,14 @@ export default function App() {
                 `短链接：${domain ? shortUrl(domain.host, domain.prefix, String(fields.slug)) : String(fields.slug)}`,
                 `手动大陆地址：${String(fields.cnUrl)}`,
                 `手动其他地区地址：${String(fields.defaultUrl)}`,
-              ],
-        );
+              ];
+        const sourceDomain = state.domains.find((d) => d.id === copySource?.domainId);
+        setPlanDetails([
+          ...(fields.createOnly && copySource && sourceDomain
+            ? [`旧链接继续保留：${shortUrl(sourceDomain.host, sourceDomain.prefix, copySource.slug)}`]
+            : []),
+          ...linkDetails,
+        ]);
       } else if (kind === "save_pool") {
         const pool = fields.pool as Pool;
         const associations = state.links.filter(
@@ -573,6 +599,8 @@ export default function App() {
   }
   function openLink(link?: Link, usePlatform = false) {
     linkPrepareSequence.current += 1;
+    setError("");
+    setCopySource(null);
     setOriginalSlug(link?.slug || null);
     setLinkDraft(
       link
@@ -598,13 +626,26 @@ export default function App() {
   }
   function updateLinkDraft(fields: Partial<LinkDraft>) {
     linkPrepareSequence.current += 1;
+    setError("");
     setMigrationAccountId(null);
     setLinkDraft((current) => (current ? { ...current, ...fields } : current));
   }
+  function useNewLinkName() {
+    if (!linkDraft || !originalSlug || busy) return;
+    linkPrepareSequence.current += 1;
+    setCopySource({ domainId: linkDraft.domainId, slug: originalSlug });
+    setOriginalSlug(null);
+    setLinkDraft({ ...linkDraft, slug: "" });
+    setError("");
+  }
+  useEffect(() => {
+    if (copySource) slugInput.current?.focus();
+  }, [copySource]);
   function closeLink() {
     if (mutationRef.current === "prepare_credentials") return;
     linkPrepareSequence.current += 1;
     setLinkDraft(null);
+    setCopySource(null);
   }
   async function saveLink(event: FormEvent) {
     event.preventDefault();
@@ -628,7 +669,13 @@ export default function App() {
       return;
     }
     if (originalSlug && originalSlug !== linkDraft.slug) {
-      setError("现有短链接不能更改名称。请新建一条链接。");
+      setError("请点击“换一个名称”，填写新名称后创建链接。");
+      return;
+    }
+    if (!originalSlug && state.links.some((link) =>
+      link.domainId === linkDraft.domainId && link.slug === linkDraft.slug
+    )) {
+      setError("这个名称已被使用，请换一个名称。现有链接不会被覆盖。");
       return;
     }
     const submittedDraft = { ...linkDraft };
@@ -641,12 +688,14 @@ export default function App() {
             slug: linkDraft.slug,
             poolId: linkDraft.poolId,
             code: linkDraft.code,
+            createOnly: !originalSlug,
           }
         : {
             domainId: linkDraft.domainId,
             slug: linkDraft.slug,
             cnUrl: linkDraft.cnUrl,
             defaultUrl: linkDraft.defaultUrl,
+            createOnly: !originalSlug,
           },
       () =>
         requestSequence === linkPrepareSequence.current &&
@@ -768,6 +817,7 @@ export default function App() {
       input: draft.input.trim(),
       prefix: draft.prefix,
       accountId: draft.accountId,
+      dnsMode: draft.dnsMode,
     };
     setDomainFeedback({
       tone: "progress",
@@ -779,6 +829,7 @@ export default function App() {
       let result = await dispatch<DomainPreparation>("prepare_domain", {
         input: snapshot.input,
         prefix: snapshot.prefix,
+        dnsMode: snapshot.dnsMode,
         ...(snapshot.accountId ? { accountId: snapshot.accountId } : {}),
       });
       if (
@@ -845,6 +896,7 @@ export default function App() {
           result = await dispatch<DomainPreparation>("prepare_domain", {
             input: snapshot.input,
             prefix: snapshot.prefix,
+            dnsMode: snapshot.dnsMode,
             ...(snapshot.accountId ? { accountId: snapshot.accountId } : {}),
           });
           if (
@@ -1010,6 +1062,14 @@ export default function App() {
         <button
           type="button"
           className="button secondary"
+          onClick={() => void openTokenManagement()}
+          disabled={domainBusy}
+        >
+          修改已有令牌权限
+        </button>
+        <button
+          type="button"
+          className="button secondary"
           onClick={retryDomainAfterAuthorization}
           disabled={domainBusy}
         >
@@ -1021,7 +1081,7 @@ export default function App() {
           onClick={updateSelectedDomainToken}
           disabled={domainBusy}
         >
-          更新当前账户令牌
+          更换本机令牌
         </button>
       </div>
     );
@@ -1037,24 +1097,37 @@ export default function App() {
     if (planKind === "add_domain" || planKind === "fix_domain_dns")
       setDomainOpen(true);
   }
-  async function openTemplate() {
-    const url = await run(() => dispatch<string>("token_template"));
-    if (!url) return;
-    if (preview) window.open(url, "_blank", "noopener,noreferrer");
-    else {
-      const { openUrl } = await import("@tauri-apps/plugin-opener");
-      await run(() => openUrl(url));
+  async function openAccountPage(url: string) {
+    try {
+      if (preview) window.open(url, "_blank", "noopener,noreferrer");
+      else {
+        const { openUrl } = await import("@tauri-apps/plugin-opener");
+        await openUrl(url);
+      }
+    } catch (e) {
+      const message = `无法打开浏览器：${errorMessage(e)}`;
+      setError((current) => current ? `${current}\n${message}` : message);
     }
   }
+  async function openTokenManagement() {
+    await openAccountPage("https://dash.cloudflare.com/profile/api-tokens");
+  }
+  async function openTemplate() {
+    const url = await run(() => dispatch<string>("token_template"));
+    if (url) await openAccountPage(url);
+  }
   async function checkClipboard() {
+    if (!tokenDialogOpen.current || mutationRef.current === "token") return;
+    const sequence = ++clipboardReadSequence.current;
+    const isCurrent = () => sequence === clipboardReadSequence.current &&
+      tokenDialogOpen.current && mutationRef.current !== "token";
     try {
-      const text = (
-        preview
-          ? await navigator.clipboard.readText()
-          : await (
-              await import("@tauri-apps/plugin-clipboard-manager")
-            ).readText()
-      ).trim();
+      const readText = preview
+        ? () => navigator.clipboard.readText()
+        : (await import("@tauri-apps/plugin-clipboard-manager")).readText;
+      if (!isCurrent()) return;
+      const text = (await readText()).trim();
+      if (!isCurrent()) return;
       if (/^[A-Za-z0-9_-]{35,80}$/.test(text) && text !== token)
         setClipboardOffer(text);
       else setClipboardOffer("");
@@ -1068,7 +1141,10 @@ export default function App() {
       void checkClipboard();
     };
     window.addEventListener("focus", onFocus);
-    return () => window.removeEventListener("focus", onFocus);
+    return () => {
+      clipboardReadSequence.current += 1;
+      window.removeEventListener("focus", onFocus);
+    };
   }, [tokenOpen, token]);
   async function tokenDigest(value: string) {
     return Array.from(
@@ -1095,9 +1171,19 @@ export default function App() {
       setClipboardToClear("");
     });
   }
+  function closeToken() {
+    if (mutationRef.current === "token") return;
+    resumeDomainAfterToken.current = false;
+    setTokenOpen(false);
+    setToken("");
+    setClipboardOffer("");
+    setReplaceToken(false);
+    setUpdateTokenAccount(null);
+  }
   async function importToken(event: FormEvent) {
     event.preventDefault();
     await withMutation("token", async () => {
+      clearClipboardOffer();
       if (!token.trim()) {
         setError("请先粘贴令牌。");
         return;
@@ -1106,7 +1192,7 @@ export default function App() {
         () =>
           dispatch<State>("import_token", {
             token: token.trim(),
-            replace: replaceToken,
+            replace: updateTokenAccount ? true : replaceToken,
             ...(updateTokenAccount
               ? { expectedAccountId: updateTokenAccount.id }
               : {}),
@@ -1360,7 +1446,9 @@ export default function App() {
   }
   function fingerprint(link: Link, snapshot: State = stateRef.current) {
     const pool = snapshot.pools?.find((p) => p.id === link.poolId);
+    const domain = snapshot.domains.find((item) => item.id === link.domainId);
     return JSON.stringify([
+      domain?.host, domain?.prefix, domain?.accountId,
       link.updated,
       link.poolId,
       link.code,
@@ -1371,8 +1459,9 @@ export default function App() {
       pool?.candidates,
     ]);
   }
-  async function selftest(link: Link, domain: Domain) {
+  async function selftest(link: Link, domain: Domain, dnsMode: "system" | "public" = "system") {
     if (!requireCurrentCredentials([domain.accountId])) return;
+    closeDetection();
     const url = shortUrl(domain.host, domain.prefix, link.slug);
     const sequence = ++detectionSequence.current;
     latestDetectionForLink.current[detectionKey(link)] = sequence;
@@ -1384,10 +1473,12 @@ export default function App() {
         dispatch<Selftest>("selftest_link", {
           domainId: link.domainId,
           slug: link.slug,
+          ...(dnsMode === "public" ? {dnsMode} : {}),
         }),
         dispatch<TargetReport>("check_link_targets", {
           domainId: link.domainId,
           slug: link.slug,
+          ...(dnsMode === "public" ? {dnsMode} : {}),
         }),
       ]);
       const checkedAt = new Date().toISOString();
@@ -1404,6 +1495,7 @@ export default function App() {
           ? targets.value
           : {
               checkedAt,
+              dnsMode,
               checks: [
                 {
                   label: "目标地址",
@@ -1411,6 +1503,7 @@ export default function App() {
                   message: `本机检测未完成：${errorMessage(targets.reason)}`,
                   checkedAt,
                   source: "local",
+                  dnsMode,
                   url: "",
                 },
               ],
@@ -1430,7 +1523,7 @@ export default function App() {
       );
       if (sequence === detectionSequence.current) {
         if (current && fingerprint(current) === observedFingerprint) {
-          setTestResult({ url, result });
+          setTestResult({ url, result, domainId: link.domainId, slug: link.slug, fingerprint: observedFingerprint, dnsMode });
           setTargetResult(targetReport);
         } else setNotice("链接或平台地址已变化，请重新检测。");
       }
@@ -1439,6 +1532,71 @@ export default function App() {
     } finally {
       if (sequence === detectionSequence.current) setTestingLink("");
     }
+  }
+
+  function closeDetection() {
+    targetRetrySequence.current++;
+    targetRetryBusy.current = false;
+    setRetryingTargets(false);
+    setTestResult(null);
+    setTargetResult(null);
+  }
+  function retryRouteWithPublicDns() {
+    if (!testResult || targetRetryBusy.current || testingLink) return;
+    const link = stateRef.current.links.find((item) => item.domainId === testResult.domainId && item.slug === testResult.slug);
+    const domain = stateRef.current.domains.find((item) => item.id === testResult.domainId);
+    if (!link || !domain || fingerprint(link) !== testResult.fingerprint) {
+      closeDetection();
+      setNotice("链接或平台地址已变化，请重新检测。");
+      return;
+    }
+    void selftest(link, domain, "public");
+  }
+  async function retryTargetsWithPublicDns() {
+    if (!testResult || targetRetryBusy.current) return;
+    const context = testResult;
+    const currentLink = () => stateRef.current.links.find(
+      (item) => item.domainId === context.domainId && item.slug === context.slug,
+    );
+    const link = currentLink();
+    if (!link || fingerprint(link) !== context.fingerprint) {
+      closeDetection();
+      setNotice("链接或平台地址已变化，请重新检测。");
+      return;
+    }
+    const sequence = ++targetRetrySequence.current;
+    targetRetryBusy.current = true;
+    setRetryingTargets(true);
+    let report: TargetReport;
+    try {
+      report = await dispatch<TargetReport>("check_link_targets", {
+        domainId: context.domainId, slug: context.slug, dnsMode: "public",
+      });
+    } catch (error) {
+      const checkedAt = new Date().toISOString();
+      report = {checkedAt, dnsMode: "public", checks: [{
+        label: "目标地址", status: "unknown", source: "local", url: "",
+        dnsMode: "public", checkedAt,
+        message: `兼容 VPN 检测未完成：${errorMessage(error)}`,
+      }]};
+    }
+    if (sequence !== targetRetrySequence.current) return;
+    targetRetryBusy.current = false;
+    setRetryingTargets(false);
+    const latest = currentLink();
+    if (!latest || fingerprint(latest) !== context.fingerprint) {
+      closeDetection();
+      setNotice("链接或平台地址已变化，请重新检测。");
+      return;
+    }
+    setTargetResult(report);
+    setDetections((previous) => {
+      const key = detectionKey(latest);
+      const record = previous[key];
+      if (!record || record.fingerprint !== context.fingerprint) return previous;
+      // Retain the route check timestamp: a target-only retry cannot renew it.
+      return {...previous, [key]: {...record, targets: report}};
+    });
   }
 
   function detectionLabel(link: Link) {
@@ -1633,6 +1791,7 @@ export default function App() {
                   onClick={() => {
                     invalidateDomainPreparation();
                     setDomainDraft({
+                      dnsMode: "system",
                       input: "",
                       prefix: ["go", "out", "to", "visit", "link", "r", "jump"][
                         crypto.getRandomValues(new Uint32Array(1))[0] % 7
@@ -1936,13 +2095,13 @@ export default function App() {
                                         title={
                                           detections[detectionKey(link)]
                                             ?.checkedAt
-                                            ? `${targetSourceLabel()}结果于 ${formatDate(detections[detectionKey(link)].checkedAt)}`
+                                            ? `${targetSourceLabel(detections[detectionKey(link)].targets.dnsMode)}结果于 ${formatDate(detections[detectionKey(link)].checkedAt)}`
                                             : undefined
                                         }
                                       >
                                         {detectionLabel(link).label}
                                         {detections[detectionKey(link)] &&
-                                          ` · ${targetSourceLabel()} · ${formatDate(detections[detectionKey(link)].checkedAt)}`}
+                                          ` · ${targetSourceLabel(detections[detectionKey(link)].targets.dnsMode)} · ${formatDate(detections[detectionKey(link)].checkedAt)}`}
                                       </small>
                                     </div>
                                   </td>
@@ -2170,6 +2329,7 @@ export default function App() {
                         onClick={() => {
                           invalidateDomainPreparation();
                           setDomainDraft({
+                            dnsMode: "system",
                             input: "",
                             prefix: "r",
                             accountId:
@@ -2282,6 +2442,9 @@ export default function App() {
                         className="button secondary"
                         onClick={() => {
                           setUpdateTokenAccount(null);
+                          setToken("");
+                          setReplaceToken(false);
+                          setClipboardOffer("");
                           setTokenOpen(true);
                         }}
                       >
@@ -2388,7 +2551,7 @@ export default function App() {
 
       {linkDraft && !plan && (
         <Dialog
-          title={originalSlug ? "编辑短链接" : "创建短链接"}
+          title={originalSlug ? "编辑短链接" : copySource ? "使用新名称创建链接" : "创建短链接"}
           eyebrow="LINK DETAILS"
           error={error}
           errorAction={migrationAction()}
@@ -2438,6 +2601,7 @@ export default function App() {
             <label>
               短链接名称
               <input
+                ref={slugInput}
                 value={linkDraft.slug}
                 onChange={(e) => updateLinkDraft({ slug: e.target.value })}
                 placeholder="例如 welcome"
@@ -2450,6 +2614,25 @@ export default function App() {
                 /welcome；可用字母、数字、下划线或连字符。
               </small>
             </label>
+            {originalSlug && (
+              <div className="form-note">
+                <p>名称是网址的一部分。需要新名称时，可以带上当前设置创建新链接，旧链接继续保留。</p>
+                <button
+                  type="button"
+                  className="button secondary"
+                  disabled={busy}
+                  onClick={useNewLinkName}
+                >
+                  换一个名称
+                </button>
+              </div>
+            )}
+            {copySource && (
+              <div className="form-note" role="status">
+                <strong>旧链接 /{copySource.slug} 会继续保留</strong>
+                <p>跳转设置和邀请码已带入。这次填写的内容只用于新链接；新地址确认可用后，可以按需删除旧链接。</p>
+              </div>
+            )}
             <div className="form-divider" />
             <div className="mode-switch" role="group" aria-label="地址来源">
               <button
@@ -2719,6 +2902,17 @@ export default function App() {
               带 www 和不带 www
               的域名需要分别添加。未启用域名不会出现在可选列表中。
             </p>
+            <div className="form-note">
+              <label className="checkbox-label">
+                <input type="checkbox" checked={domainDraft.dnsMode === "public"} disabled={domainBusy}
+                  onChange={(event) => {
+                    setDomainDraft({...domainDraft, dnsMode: event.target.checked ? "public" : "system"});
+                    invalidateDomainPreparation();
+                  }} />
+                兼容 VPN 网络
+              </label>
+              <small>开启后，用 Cloudflare 公共 DNS 查询此域名再检查目录，只发送域名，不发送账户令牌。不会更改你的 DNS 或 VPN 设置。</small>
+            </div>
             {preflight && (
               <div className="preflight">
                 {(() => {
@@ -2940,29 +3134,17 @@ export default function App() {
       )}
       {tokenOpen && (
         <Dialog
-          title={updateTokenAccount ? "更新访问令牌" : "导入访问令牌"}
+          title={updateTokenAccount ? "更换本机令牌" : "导入访问令牌"}
           dismissDisabled={mutation === "token"}
           eyebrow="ACCOUNT ACCESS"
           error={error}
-          onClose={() => {
-            resumeDomainAfterToken.current = false;
-            setTokenOpen(false);
-            setToken("");
-            setClipboardOffer("");
-            setUpdateTokenAccount(null);
-          }}
+          onClose={closeToken}
           footer={
             <>
               <button
                 className="button ghost"
                 disabled={mutation === "token"}
-                onClick={() => {
-                  resumeDomainAfterToken.current = false;
-                  setTokenOpen(false);
-                  setToken("");
-                  setClipboardOffer("");
-                  setUpdateTokenAccount(null);
-                }}
+                onClick={closeToken}
               >
                 取消
               </button>
@@ -2975,7 +3157,7 @@ export default function App() {
                 {busy
                   ? "正在验证…"
                   : updateTokenAccount
-                    ? "验证并更新"
+                    ? "验证并替换"
                     : "验证并导入"}
               </button>
             </>
@@ -2994,7 +3176,7 @@ export default function App() {
                     updateTokenAccount.label}
                 </strong>
                 （账户 ID：…{updateTokenAccount.id.slice(-8)}
-                ）的本机令牌。令牌必须包含这个 Cloudflare 账户，否则不会保存。
+                ）的本机令牌，其他账户不变。令牌必须包含这个 Cloudflare 账户，否则不会保存。
               </p>
             ) : (
               <p className="form-note">
@@ -3003,14 +3185,44 @@ export default function App() {
                 验证令牌，并交给操作系统保存。
               </p>
             )}
-            <button
-              className="button bordered opener"
-              type="button"
-              onClick={() => void openTemplate()}
-            >
-              <ArrowSquareOut size={17} />
-              在系统浏览器中打开令牌模板
-            </button>
+            {updateTokenAccount ? (
+              <>
+                <p className="form-note">
+                  只是补充权限或加入新域名？可以直接编辑已有令牌，无需在这里重新粘贴。保存后关闭此窗口，重试刚才的操作。只有创建了新令牌或重新生成了令牌值，才需要在下方替换。
+                </p>
+                <button
+                  className="button bordered opener"
+                  type="button"
+                  disabled={mutation === "token"}
+                  onClick={() => void openTokenManagement()}
+                >
+                  <ArrowSquareOut size={17} />
+                  修改已有令牌权限
+                </button>
+                <small>请在浏览器中登录原令牌所属的 Cloudflare 用户，找到正在使用的令牌，点右侧菜单中的“编辑”。</small>
+                <details>
+                  <summary>需要创建新令牌</summary>
+                  <button
+                    className="button bordered opener"
+                    type="button"
+                    disabled={mutation === "token"}
+                    onClick={() => void openTemplate()}
+                  >
+                    <ArrowSquareOut size={17} />
+                    打开新令牌模板
+                  </button>
+                </details>
+              </>
+            ) : (
+              <button
+                className="button bordered opener"
+                type="button"
+                onClick={() => void openTemplate()}
+              >
+                <ArrowSquareOut size={17} />
+                在系统浏览器中打开令牌模板
+              </button>
+            )}
             <label>
               访问令牌
               <input
@@ -3018,7 +3230,10 @@ export default function App() {
                 autoComplete="off"
                 value={token}
                 disabled={mutation === "token"}
-                onChange={(e) => setToken(e.target.value)}
+                onChange={(e) => {
+                  clearClipboardOffer();
+                  setToken(e.target.value);
+                }}
                 onFocus={() => void checkClipboard()}
                 placeholder="在此粘贴令牌"
                 required
@@ -3033,7 +3248,7 @@ export default function App() {
                   disabled={mutation === "token"}
                   onClick={() => {
                     setToken(clipboardOffer);
-                    setClipboardOffer("");
+                    clearClipboardOffer();
                   }}
                 >
                   填入
@@ -3041,25 +3256,23 @@ export default function App() {
                 <button
                   type="button"
                   aria-label="忽略剪贴板"
-                  onClick={() => setClipboardOffer("")}
+                  onClick={clearClipboardOffer}
                 >
                   <X size={15} />
                 </button>
               </div>
             )}
-            <label className="checkbox-row">
-              <input
-                type="checkbox"
-                checked={replaceToken}
-                onChange={(e) => setReplaceToken(e.target.checked)}
-                disabled={Boolean(updateTokenAccount) || mutation === "token"}
-              />
-              <span>
-                {updateTokenAccount
-                  ? "只替换这个账户的本机令牌"
-                  : "若账户已存在，确认替换本机保存的令牌"}
-              </span>
-            </label>
+            {!updateTokenAccount && (
+              <label className="checkbox-row">
+                <input
+                  type="checkbox"
+                  checked={replaceToken}
+                  onChange={(e) => setReplaceToken(e.target.checked)}
+                  disabled={mutation === "token"}
+                />
+                <span>若账户已存在，确认替换本机保存的令牌</span>
+              </label>
+            )}
           </form>
         </Dialog>
       )}
@@ -3175,6 +3388,13 @@ export default function App() {
               <button
                 disabled={mutation === "prepare_credentials"}
                 className="button secondary"
+                onClick={() => void openTokenManagement()}
+              >
+                修改已有令牌权限
+              </button>
+              <button
+                disabled={mutation === "prepare_credentials"}
+                className="button secondary"
                 onClick={() => {
                   setUpdateTokenAccount(manageAccount);
                   setToken("");
@@ -3184,7 +3404,7 @@ export default function App() {
                   setTokenOpen(true);
                 }}
               >
-                更新访问令牌
+                更换本机令牌
               </button>
               <button
                 disabled={mutation === "prepare_credentials"}
@@ -3356,17 +3576,11 @@ export default function App() {
         <Dialog
           title="链接检测"
           eyebrow="ROUTE & TARGET CHECK"
-          onClose={() => {
-            setTestResult(null);
-            setTargetResult(null);
-          }}
+          onClose={closeDetection}
           footer={
             <button
               className="button primary"
-              onClick={() => {
-                setTestResult(null);
-                setTargetResult(null);
-              }}
+              onClick={closeDetection}
             >
               完成
             </button>
@@ -3394,6 +3608,7 @@ export default function App() {
               }
             </StatusPill>
             <p>{testResult.result.message}</p>
+            {testResult.dnsMode === "public" && <small>本次跳转检查使用公共 DNS 查询短链接域名。</small>}
             {testResult.result.checks.map((c, i) => (
               <div className="check-row" key={i}>
                 {c.ok ? <CheckCircle size={17} /> : <WarningCircle size={17} />}
@@ -3418,11 +3633,25 @@ export default function App() {
                 <span>
                   {c.label}：{c.message}
                   <small>
-                    来源：{targetSourceLabel()} · {formatDate(c.checkedAt)}
+                    来源：{targetSourceLabel(c.dnsMode || targetResult.dnsMode)} · {formatDate(c.checkedAt)}
                   </small>
                 </span>
               </div>
             ))}
+            {!preview && (targetResult?.dnsMode === "public" || targetResult?.checks.some((check) => check.status === "unknown") || testResult.result.status !== "passed") && (
+              <div className="form-note">
+                <p>开启 VPN 后无法检测？可使用 Cloudflare 公共 DNS 查询真实地址后重试。只向查询服务发送域名，不发送完整链接或邀请码；重试过程中如遇跳转，也会查询跳转后的域名。</p>
+                <button className="button secondary" disabled={retryingTargets} onClick={() => void retryTargetsWithPublicDns()}>
+                  {retryingTargets ? "正在重新检测…" : "兼容 VPN 重试"}
+                </button>
+                {testResult.result.status !== "passed" && (
+                  <button className="button secondary" disabled={retryingTargets || Boolean(testingLink)} onClick={retryRouteWithPublicDns}>
+                    兼容 VPN 重新检测跳转和网站
+                  </button>
+                )}
+                <p>不会更改你的 VPN 设置。结果仍代表本机当前网络，不能据此判断大陆是否能访问。</p>
+              </div>
+            )}
             <small>
               {preview
                 ? "本地预览未发起目标检测。"

@@ -356,7 +356,7 @@ pub fn classify_probe(
                 DomainCheck {
                     label: label.into(),
                     ok: false,
-                    message: format!("无法连接此路径（DNS、TLS、超时或网络失败）：{message}"),
+                    message: format!("暂时无法检查此路径：{message}"),
                     level: DomainCheckLevel::Error,
                 },
                 ProbeRisk::Unreachable,

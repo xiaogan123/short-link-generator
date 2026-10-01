@@ -464,6 +464,7 @@ pub enum PlanKind {
         host: String,
         prefix: String,
         path_risk: crate::domain_check::PathRiskSnapshot,
+        dns_mode: crate::local_check::DnsMode,
         requires_takeover_confirmation: bool,
     },
     DomainDns {
@@ -475,6 +476,7 @@ pub enum PlanKind {
     SaveLink {
         domain_id: String,
         slug: String,
+        create_only: bool,
         cn_url: String,
         default_url: String,
         pool_id: Option<String>,

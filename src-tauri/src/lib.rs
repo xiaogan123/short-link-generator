@@ -4,6 +4,8 @@ mod credential_migration;
 #[cfg(all(test, target_os = "macos"))]
 mod credential_migration_tests;
 mod domain_check;
+#[cfg(test)]
+mod link_create_only_tests;
 mod local_check;
 #[cfg(target_os = "macos")]
 mod mac_credentials;
@@ -111,6 +113,7 @@ struct HealthSnapshot {
 
 struct DomainTakeover<'a> {
     expected_path_risk: &'a PathRiskSnapshot,
+    dns_mode: local_check::DnsMode,
     requires_confirmation: bool,
     acknowledged: bool,
 }
@@ -1612,6 +1615,7 @@ impl Backend {
         host: &str,
         prefix: &str,
         planned_probe_segment: Option<&str>,
+        dns_mode: local_check::DnsMode,
     ) -> (Vec<DomainCheck>, Option<PathRiskSnapshot>) {
         let mut checks = Vec::new();
         if let Err(error) = self.require_credentials(account_id) {
@@ -1733,16 +1737,20 @@ impl Backend {
         let root_url = format!("https://{host}/{prefix}/");
         let child_url = format!("https://{host}/{prefix}/{probe_segment}");
         let (root_result, child_result) = tokio::join!(
-            self.cloud_probe(&root_url, None),
-            self.cloud_probe(&child_url, None)
+            self.cloud.probe_with_mode(&root_url, None, dns_mode),
+            self.cloud.probe_with_mode(&child_url, None, dns_mode)
         );
-        let (root_check, root) =
-            domain_check::classify_probe("短链接目录", &root_url, None, root_result);
+        let (root_check, root) = domain_check::classify_probe(
+            "短链接目录",
+            &root_url,
+            None,
+            root_result.map_err(problem),
+        );
         let (child_check, child) = domain_check::classify_probe(
             "随机测试链接",
             &child_url,
             Some(&probe_segment),
-            child_result,
+            child_result.map_err(problem),
         );
         checks.push(root_check);
         checks.push(child_check);
@@ -1756,15 +1764,8 @@ impl Backend {
         )
     }
 
-    async fn cloud_probe(
-        &self,
-        url: &str,
-        header: Option<String>,
-    ) -> Result<(u16, Option<String>), String> {
-        self.cloud.probe(url, header).await.map_err(problem)
-    }
-
     async fn prepare_domain(&mut self, payload: &Value) -> Result<Value, String> {
+        let dns_mode = requested_dns_mode(payload)?;
         let host = normalize_host(field(payload, "input")?)?;
         let prefix = payload["prefix"]
             .as_str()
@@ -1804,7 +1805,7 @@ impl Backend {
             ));
         } else if let Some(c) = selected {
             let (next_checks, path_risk) = self
-                .preflight(&c.account_id, &c.zone_id, &host, &prefix, None)
+                .preflight(&c.account_id, &c.zone_id, &host, &prefix, None, dns_mode)
                 .await;
             checks = next_checks;
             if !checks
@@ -1827,6 +1828,9 @@ impl Backend {
                     route_pattern(&host, &prefix)
                 ));
                 let mut warnings = vec!["边缘配置传播可能需要一段时间".into()];
+                if dns_mode == local_check::DnsMode::Public {
+                    steps.push("使用公共 DNS 检查目录；确认后仍按此方式重新核对，不更改本机 DNS 或 VPN 设置".into());
+                }
                 if requires_takeover_confirmation {
                     warnings.push(
                         "路径预检只说明当前 HTTP 响应；接入只创建指定目录的 Worker 路由，不修改 DNS、重定向规则或访问策略，也不保证绕过先于 Worker 执行的 Cloudflare 规则。配置提交后，请创建短链接并使用现有签名自检验证最终跳转。".into(),
@@ -1842,6 +1846,7 @@ impl Backend {
                         host: host.clone(),
                         prefix: prefix.clone(),
                         path_risk,
+                        dns_mode,
                         requires_takeover_confirmation,
                     },
                 ));
@@ -1900,6 +1905,11 @@ impl Backend {
                 )
             }
             "save_link" => {
+                let create_only = match payload.get("createOnly") {
+                    None => false,
+                    Some(Value::Bool(value)) => *value,
+                    Some(_) => return Err("createOnly 必须为布尔值".into()),
+                };
                 let domain_id = field(payload, "domainId")?.to_owned();
                 let domain = self.domain(&domain_id)?;
                 let slug = field(payload, "slug")?.to_owned();
@@ -1957,8 +1967,15 @@ impl Backend {
                     .links
                     .iter()
                     .any(|l| l.domain_id == domain_id && l.slug == slug);
+                if create_only && existing {
+                    return Err("此域名下已存在同名链接，请换一个名称；已有链接未修改".into());
+                }
                 (
-                    "保存链接",
+                    if create_only {
+                        "另存为新链接"
+                    } else {
+                        "保存链接"
+                    },
                     vec![if let (Some(pool_id), Some(code)) = (&pool_id, &code) {
                         let pool_name = self
                             .db
@@ -1974,7 +1991,9 @@ impl Backend {
                     } else {
                         format!("为 {} 的短码 {} 保存大陆与默认跳转地址", domain.host, slug)
                     }],
-                    if existing {
+                    if create_only {
+                        vec!["已有链接保持不变，新名称会生成另一条短链接".into()]
+                    } else if existing {
                         vec!["这会覆盖现有链接目标".into()]
                     } else {
                         vec![]
@@ -1982,6 +2001,7 @@ impl Backend {
                     PlanKind::SaveLink {
                         domain_id,
                         slug,
+                        create_only,
                         cn_url,
                         default_url,
                         pool_id,
@@ -3280,6 +3300,7 @@ impl Backend {
                 host,
                 prefix,
                 path_risk,
+                dns_mode,
                 requires_takeover_confirmation,
             } => {
                 self.apply_domain(
@@ -3289,6 +3310,7 @@ impl Backend {
                     &prefix,
                     DomainTakeover {
                         expected_path_risk: &path_risk,
+                        dns_mode,
                         requires_confirmation: requires_takeover_confirmation,
                         acknowledged: acknowledge_domain_takeover,
                     },
@@ -3307,11 +3329,24 @@ impl Backend {
             PlanKind::SaveLink {
                 domain_id,
                 slug,
+                create_only,
                 cn_url,
                 default_url,
                 pool_id,
                 code,
             } => {
+                // Copying to a new name must never become an edit if state
+                // changes after preparation. Keep this check before credentials
+                // or any platform/link cloud writes.
+                if create_only
+                    && self
+                        .db
+                        .links
+                        .iter()
+                        .any(|link| link.domain_id == domain_id && link.slug == slug)
+                {
+                    return Err("此域名下已存在同名链接，请换一个名称；已有链接未修改".into());
+                }
                 self.apply_save_link(
                     &domain_id,
                     &slug,
@@ -3375,6 +3410,7 @@ impl Backend {
                 host,
                 prefix,
                 Some(&takeover.expected_path_risk.probe_segment),
+                takeover.dns_mode,
             )
             .await;
         if checks
@@ -5920,6 +5956,7 @@ async fn run_region_test(
     country: &str,
     label: &str,
     expected: Option<&str>,
+    dns_mode: local_check::DnsMode,
 ) -> Result<Check, String> {
     let mut pending = false;
     for attempt in 0..5 {
@@ -5935,10 +5972,19 @@ async fn run_region_test(
             "{seconds}.{country}.{}",
             hex::encode(mac.finalize().into_bytes())
         );
-        let result = tokio::time::timeout(
-            Duration::from_secs(6),
-            snapshot.cloud.probe(&snapshot.url, Some(header)),
-        )
+        let result = tokio::time::timeout(Duration::from_secs(6), async {
+            match dns_mode {
+                local_check::DnsMode::System => {
+                    snapshot.cloud.probe(&snapshot.url, Some(header)).await
+                }
+                local_check::DnsMode::Public => {
+                    snapshot
+                        .cloud
+                        .probe_with_mode(&snapshot.url, Some(header), dns_mode)
+                        .await
+                }
+            }
+        })
         .await;
         match result {
             Ok(Ok((302, Some(location)))) if expected == Some(location.as_str()) => {
@@ -5974,6 +6020,13 @@ async fn run_region_test(
 }
 
 async fn run_selftest(snapshot: SelftestSnapshot) -> Result<Value, String> {
+    run_selftest_with_mode(snapshot, local_check::DnsMode::System).await
+}
+
+async fn run_selftest_with_mode(
+    snapshot: SelftestSnapshot,
+    dns_mode: local_check::DnsMode,
+) -> Result<Value, String> {
     let expected_cn = if let Some((pool, code, account, namespace, token)) = &snapshot.pool {
         let health = snapshot
             .cloud
@@ -5989,8 +6042,14 @@ async fn run_selftest(snapshot: SelftestSnapshot) -> Result<Value, String> {
     let Some(expected_cn) = expected_cn else {
         let (other, cn) = tokio::time::timeout(Duration::from_secs(60), async {
             tokio::try_join!(
-                run_region_test(&snapshot, "US", "其他地区", Some(&snapshot.default_url)),
-                run_region_test(&snapshot, "CN", "中国大陆", None)
+                run_region_test(
+                    &snapshot,
+                    "US",
+                    "其他地区",
+                    Some(&snapshot.default_url),
+                    dns_mode
+                ),
+                run_region_test(&snapshot, "CN", "中国大陆", None, dns_mode)
             )
         })
         .await
@@ -6002,8 +6061,14 @@ async fn run_selftest(snapshot: SelftestSnapshot) -> Result<Value, String> {
     };
     let result = tokio::time::timeout(Duration::from_secs(60), async {
         tokio::try_join!(
-            run_region_test(&snapshot, "US", "其他地区", Some(&snapshot.default_url)),
-            run_region_test(&snapshot, "CN", "中国大陆", Some(&expected_cn))
+            run_region_test(
+                &snapshot,
+                "US",
+                "其他地区",
+                Some(&snapshot.default_url),
+                dns_mode
+            ),
+            run_region_test(&snapshot, "CN", "中国大陆", Some(&expected_cn), dns_mode)
         )
     })
     .await;
@@ -6063,6 +6128,15 @@ fn chosen_cn_target(
         .transpose()
 }
 
+fn requested_dns_mode(payload: &Value) -> Result<local_check::DnsMode, String> {
+    match payload.get("dnsMode") {
+        None => Ok(local_check::DnsMode::System),
+        Some(Value::String(value)) if value == "system" => Ok(local_check::DnsMode::System),
+        Some(Value::String(value)) if value == "public" => Ok(local_check::DnsMode::Public),
+        _ => Err("不支持的域名查询方式，请重新检测".into()),
+    }
+}
+
 #[tauri::command]
 async fn dispatch(request: Value, state: tauri::State<'_, AppState>) -> Result<Value, String> {
     let action = field(&request, "action")?.to_string();
@@ -6075,6 +6149,7 @@ async fn dispatch(request: Value, state: tauri::State<'_, AppState>) -> Result<V
         return run_pool_health(snapshot).await;
     }
     if action == "check_link_targets" {
+        let mode = requested_dns_mode(&payload)?;
         let targets = {
             let backend = state.0.lock().await;
             backend.target_snapshot(field(&payload, "domainId")?, field(&payload, "slug")?)?
@@ -6082,10 +6157,16 @@ async fn dispatch(request: Value, state: tauri::State<'_, AppState>) -> Result<V
         let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
         let mut stream = futures_util::stream::iter(targets.iter().cloned().enumerate().map(
             |(index, (label, url))| async move {
-                let result =
-                    tokio::time::timeout(Duration::from_secs(15), local_check::check(&label, &url))
-                        .await
-                        .unwrap_or_else(|_| local_check::timeout_result(&label, &url));
+                let result = tokio::time::timeout(Duration::from_secs(15), async {
+                    match mode {
+                        local_check::DnsMode::System => local_check::check(&label, &url).await,
+                        local_check::DnsMode::Public => {
+                            local_check::check_with_mode(&label, &url, mode).await
+                        }
+                    }
+                })
+                .await
+                .unwrap_or_else(|_| local_check::timeout_result_with_mode(&label, &url, mode));
                 (index, result)
             },
         ))
@@ -6099,18 +6180,24 @@ async fn dispatch(request: Value, state: tauri::State<'_, AppState>) -> Result<V
             .into_iter()
             .enumerate()
             .map(|(i, entry)| {
-                entry.unwrap_or_else(|| local_check::timeout_result(&targets[i].0, &targets[i].1))
+                entry.unwrap_or_else(|| {
+                    local_check::timeout_result_with_mode(&targets[i].0, &targets[i].1, mode)
+                })
             })
             .collect();
-        return Ok(json!({"checkedAt":now(),"checks":checks}));
+        return Ok(json!({"checkedAt":now(),"checks":checks,"dnsMode":mode.as_str()}));
     }
     if action == "selftest_link" {
+        let mode = requested_dns_mode(&payload)?;
         let snapshot = {
             let backend = lock_backend(&state, &action).await?;
             backend.selftest_snapshot(field(&payload, "domainId")?, field(&payload, "slug")?)?
         };
         return match snapshot {
-            Some(snapshot) => run_selftest(snapshot).await,
+            Some(snapshot) => match mode {
+                local_check::DnsMode::System => run_selftest(snapshot).await,
+                local_check::DnsMode::Public => run_selftest_with_mode(snapshot, mode).await,
+            },
             None => Ok(json!({"status":"key_missing",
                 "message":"本机没有自检密钥，请先单独确认重置密钥","checks":[] })),
         };
@@ -6272,7 +6359,7 @@ mod tests {
             },
         )
     }
-    async fn mount_resource(server: &MockServer, source: &str) {
+    pub(super) async fn mount_resource(server: &MockServer, source: &str) {
         mount_resource_with_probe(server, source, false).await;
     }
     async fn mount_zone_owner(server: &MockServer) {
@@ -6367,7 +6454,7 @@ mod tests {
             route_id: "route1".into(),
         }
     }
-    async fn mount_owned_domain(server: &MockServer) {
+    pub(super) async fn mount_owned_domain(server: &MockServer) {
         Mock::given(method("GET"))
             .and(path("/client/v4/zones/zone1/workers/routes"))
             .respond_with(ok(json!([{"id":"route1","pattern":"example.com/go/*",
@@ -7564,6 +7651,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn domain_public_dns_mode_is_bound_to_plan_and_invalid_modes_do_not_read_credentials() {
+        let (server, mut backend, _dir) = fixture().await;
+        for mode in [json!(null), json!(true), json!("other"), json!({})] {
+            let error = backend
+                .dispatch(
+                    "prepare_domain",
+                    &json!({"input":"example.com","prefix":"go","dnsMode":mode}),
+                )
+                .await
+                .unwrap_err();
+            assert!(error.contains("查询方式"));
+        }
+        assert!(server.received_requests().await.unwrap().is_empty());
+        mount_domain_hard_checks(
+            &server,
+            json!([{"name":"example.com","type":"A","proxied":true}]),
+            json!([]),
+        )
+        .await;
+        mount_domain_probes(
+            &server,
+            ResponseTemplate::new(522),
+            ResponseTemplate::new(522),
+        )
+        .await;
+        mount_existing_resource_domain_write(&server).await;
+        let result = backend
+            .dispatch(
+                "prepare_domain",
+                &json!({"input":"example.com","prefix":"go","dnsMode":"public"}),
+            )
+            .await
+            .unwrap();
+        let id = result["plan"]["id"].as_str().unwrap();
+        let plan = backend.plans.iter().find(|p| p.view.id == id).unwrap();
+        assert!(matches!(
+            plan.kind,
+            PlanKind::Domain {
+                dns_mode: local_check::DnsMode::Public,
+                ..
+            }
+        ));
+        assert!(result["plan"]["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|step| step.as_str().unwrap().contains("公共 DNS")));
+        // The execution payload cannot override the prepared mode or skip the takeover acknowledgment.
+        assert!(backend
+            .dispatch("apply_plan", &json!({"planId":id,"dnsMode":"system"}))
+            .await
+            .unwrap_err()
+            .contains("接管"));
+        let result = backend
+            .dispatch(
+                "prepare_domain",
+                &json!({"input":"example.com","prefix":"go","dnsMode":"public"}),
+            )
+            .await
+            .unwrap();
+        backend.dispatch("apply_plan", &json!({"planId":result["plan"]["id"],"acknowledgeDomainTakeover":true,"dnsMode":"system"})).await.unwrap();
+        assert_eq!(backend.db.domains.len(), 1);
+        let probes = server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.method.as_str() == "HEAD")
+            .count();
+        assert!(probes >= 6); // preparation plus execution both recheck directory and child.
+    }
+
+    #[tokio::test]
     async fn domain_404_plan_keeps_original_flow_and_expires_single_use() {
         let (server, mut backend, _dir) = fixture().await;
         mount_domain_hard_checks(
@@ -8106,6 +8266,7 @@ mod tests {
                 "example.com",
                 "go",
                 DomainTakeover {
+                    dns_mode: local_check::DnsMode::System,
                     expected_path_risk: &PathRiskSnapshot {
                         root: domain_check::ProbeRisk::Missing,
                         child: domain_check::ProbeRisk::Missing,
@@ -9077,6 +9238,46 @@ mod tests {
         assert!(!backend.db.accounts[0].monitor_enabled);
         assert!(backend.db.pending_monitor_changes.is_empty());
         assert!(backend.db.pending_operations.is_empty());
+    }
+
+    #[tokio::test]
+    async fn public_dns_selftest_checks_both_regions_without_sending_api_token_or_following_targets(
+    ) {
+        let (server, backend, _guard) = fixture().await;
+        for (country, target) in [
+            ("US", "https://example.org/global"),
+            ("CN", "https://example.org/local"),
+        ] {
+            Mock::given(method("HEAD"))
+                .and(path("/client/v4/probe/example.com/go/sample"))
+                .and(header_regex("x-selftest", &format!(r"\.{country}\.")))
+                .respond_with(ResponseTemplate::new(302).insert_header("location", target))
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+        let result = run_selftest_with_mode(
+            SelftestSnapshot {
+                cloud: backend.cloud.clone(),
+                host: "example.com".into(),
+                path: "/go/sample".into(),
+                url: "https://example.com/go/sample".into(),
+                cn_url: "https://example.org/local".into(),
+                default_url: "https://example.org/global".into(),
+                key: Zeroizing::new(vec![0xa1; 32]),
+                pool: None,
+            },
+            local_check::DnsMode::Public,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result["status"], "passed");
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests
+            .iter()
+            .all(|r| r.headers.get("authorization").is_none()
+                && r.headers.get("x-selftest").is_some()));
     }
 
     #[tokio::test]

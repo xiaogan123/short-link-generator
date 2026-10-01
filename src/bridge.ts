@@ -94,6 +94,10 @@ function previewDispatch(action: Action, payload: Record<string, unknown>): unkn
   }
   if (action === 'prepare_change') {
     const kind = String(payload.kind);
+    if (kind === 'save_link') {
+      if (payload.createOnly !== undefined && typeof payload.createOnly !== 'boolean') throw new Error('创建方式格式无效。');
+      if (payload.createOnly === true && local.links.some(l => l.domainId === payload.domainId && l.slug === payload.slug)) throw new Error('这个名称已被使用，请换一个名称。现有链接不会被覆盖。');
+    }
     if (kind === 'migrate_credentials') {
       const account = local.accounts.find(a => a.id === payload.accountId);
       if (!account?.needsCredentialMigration) throw new Error('此账户无需更新本机授权。');
@@ -126,6 +130,7 @@ function previewDispatch(action: Action, payload: Record<string, unknown>): unkn
     }
     if (item.action === 'add_domain') local.domains.push({ id: uid(), host: String(p.host), prefix: String(p.prefix), accountId: String(p.accountId), zoneId: String(p.zoneId), routeId: `demo-route-${uid()}` });
     if (item.action === 'save_link') {
+      if (p.createOnly === true && local.links.some(l => l.domainId === p.domainId && l.slug === p.slug)) throw new Error('这个名称已被使用，请换一个名称。现有链接不会被覆盖。');
       const pool = (local.pools || []).find(pool => pool.id === p.poolId);
       if (p.poolId && !pool) throw new Error('平台地址不存在。');
       const code = String(p.code || '');
@@ -144,7 +149,11 @@ function previewDispatch(action: Action, payload: Record<string, unknown>): unkn
     return clone();
   }
   if (action === 'selftest_link') return { status: 'pending', message: '本地预览只展示检测流程，无法判断真实网络或大陆可达性。', checks: [] } satisfies Selftest;
-  if (action === 'check_link_targets') return {checkedAt:now(),checks:[{label:'中国大陆打开的网址',status:'unknown',message:'本地预览未发起网络检测。',checkedAt:now(),source:'local',url:''},{label:'其他地区打开的网址',status:'unknown',message:'本地预览未发起网络检测。',checkedAt:now(),source:'local',url:''}]} satisfies TargetReport;
+  if (action === 'check_link_targets') {
+    const dnsMode = payload.dnsMode === undefined ? 'system' : payload.dnsMode;
+    if (dnsMode !== 'system' && dnsMode !== 'public') throw new Error('不支持的域名查询方式，请重新检测');
+    return {checkedAt:now(),dnsMode,checks:[{label:'中国大陆打开的网址',status:'unknown',message:'本地预览未发起网络检测。',checkedAt:now(),source:'local',url:'',dnsMode},{label:'其他地区打开的网址',status:'unknown',message:'本地预览未发起网络检测。',checkedAt:now(),source:'local',url:'',dnsMode}]} satisfies TargetReport;
+  }
   if (action === 'check_pool_health') {const pool=(local.pools||[]).find(p=>p.id===payload.poolId);return {poolId:String(payload.poolId),accounts:(pool?.accountIds||[]).map(accountId=>({accountId,source:'unconfigured' as const,checkedAt:null,status:'unknown' as const,candidates:pool!.candidates.map(c=>({id:c.id,status:'unknown' as const,checkedAt:null,message:'本地预览未连接检测服务。'}))}))} satisfies PoolHealth;}
   if (action === 'prepare_monitor') return makePlan('启用检测服务',['配置您提供的 HTTPS 检测端点','保存密钥并启用定时检测'],['本地预览不会连接检测服务。'],'enable_monitor',{accountId:payload.accountId,endpoint:payload.endpoint});
   if (action === 'disable_monitor') return makePlan('停用检测服务',['移除定时检测与配置'],[],'disable_monitor',{accountId:payload.accountId});

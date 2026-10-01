@@ -1,9 +1,57 @@
+use crate::local_check::DnsMode;
 use reqwest::{multipart, Client, Method, StatusCode};
 use serde_json::{json, Value};
 use std::time::Duration;
 
 const BASE: &str = "https://api.cloudflare.com/client/v4/";
 const MAX_PAGES: u32 = 100;
+const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn probe_timeout() -> CloudError {
+    CloudError::new(
+        "路径检查超时，尚未确认此目录的响应，请检查网络后重试",
+        false,
+    )
+}
+
+fn probe_transport_error(error: reqwest::Error) -> CloudError {
+    if error.is_timeout() {
+        probe_timeout()
+    } else if error.is_connect() {
+        CloudError::new(
+            "连接或 TLS 验证失败；请检查代理/VPN，以及此主机名的边缘证书是否已生效",
+            false,
+        )
+    } else {
+        CloudError::new("路径网络请求失败，尚未确认此目录的响应", false)
+    }
+}
+
+async fn probe_response(
+    client: &Client,
+    url: reqwest::Url,
+    header: Option<&str>,
+) -> CloudResult<(u16, Option<String>)> {
+    let mut req = client.head(url.clone());
+    if let Some(h) = header {
+        req = req.header("X-Selftest", h);
+    }
+    let mut response = req.send().await.map_err(probe_transport_error)?;
+    if response.status() == StatusCode::METHOD_NOT_ALLOWED {
+        // Do not consume either response body. A compliant server also honors Range.
+        let mut req = client.get(url).header(reqwest::header::RANGE, "bytes=0-0");
+        if let Some(h) = header {
+            req = req.header("X-Selftest", h);
+        }
+        response = req.send().await.map_err(probe_transport_error)?;
+    }
+    let location = response
+        .headers()
+        .get(reqwest::header::LOCATION)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    Ok((response.status().as_u16(), location))
+}
 
 fn uncertain_write_status(status: StatusCode) -> bool {
     status.is_server_error() || status == StatusCode::REQUEST_TIMEOUT || status.is_redirection()
@@ -544,47 +592,52 @@ impl Cloud {
         input: &str,
         header: Option<String>,
     ) -> CloudResult<(u16, Option<String>)> {
+        self.probe_with_mode(input, header, DnsMode::System).await
+    }
+
+    pub async fn probe_with_mode(
+        &self,
+        input: &str,
+        header: Option<String>,
+        mode: DnsMode,
+    ) -> CloudResult<(u16, Option<String>)> {
         let url = reqwest::Url::parse(input).map_err(|_| CloudError::new("探测地址无效", false))?;
-        if url.scheme() != "https" {
-            return Err(CloudError::new("只允许 HTTPS 探测", false));
+        if url.scheme() != "https"
+            || url.host_str().is_none()
+            || !url.username().is_empty()
+            || url.password().is_some()
+        {
+            return Err(CloudError::new(
+                "只允许不含登录信息的 HTTPS 探测地址",
+                false,
+            ));
         }
-        #[cfg(test)]
-        let url = self
-            .base
-            .join(&format!(
-                "probe/{}{}",
-                url.host_str().unwrap_or_default(),
-                url.path()
-            ))
-            .map_err(|_| CloudError::new("测试探测地址无效", false))?;
-        let mut req = self.client.head(url.clone());
-        if let Some(h) = header.as_deref() {
-            req = req.header("X-Selftest", h);
-        }
-        let mut response = req
-            .send()
-            .await
-            .map_err(|_| CloudError::new("DNS、TLS、超时或网络连接失败", false))?;
-        if response.status() == StatusCode::METHOD_NOT_ALLOWED {
-            // Do not consume the response body. Range also bounds a compliant server's GET body.
-            let mut req = self
-                .client
-                .get(url)
-                .header(reqwest::header::RANGE, "bytes=0-0");
-            if let Some(h) = header.as_deref() {
-                req = req.header("X-Selftest", h);
-            }
-            response = req
-                .send()
+        // One budget includes resolution and the optional HEAD -> GET fallback.
+        // The authenticated API client and its proxy policy remain unchanged.
+        tokio::time::timeout(PROBE_TIMEOUT, async {
+            #[cfg(not(test))]
+            let client = crate::local_check::client_for_probe(&url, mode, PROBE_TIMEOUT)
                 .await
-                .map_err(|_| CloudError::new("DNS、TLS、超时或网络连接失败", false))?;
-        }
-        let location = response
-            .headers()
-            .get(reqwest::header::LOCATION)
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_owned);
-        Ok((response.status().as_u16(), location))
+                .map_err(|message| CloudError::new(message, false))?;
+            #[cfg(test)]
+            let (client, url) = {
+                // Existing integration fixtures use a local wiremock API server.
+                // Production never bypasses the guarded resolver above.
+                let _ = mode;
+                let url = self
+                    .base
+                    .join(&format!(
+                        "probe/{}{}",
+                        url.host_str().unwrap_or_default(),
+                        url.path()
+                    ))
+                    .map_err(|_| CloudError::new("测试探测地址无效", false))?;
+                (self.client.clone(), url)
+            };
+            probe_response(&client, url, header.as_deref()).await
+        })
+        .await
+        .map_err(|_| probe_timeout())?
     }
 
     pub async fn rotate_secret(
@@ -607,6 +660,10 @@ impl Cloud {
 pub fn encode(input: &str) -> String {
     url::form_urlencoded::byte_serialize(input.as_bytes()).collect()
 }
+
+#[cfg(test)]
+#[path = "cloud_probe_tests.rs"]
+mod cloud_probe_tests;
 
 #[cfg(test)]
 mod tests {
