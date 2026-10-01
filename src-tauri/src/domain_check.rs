@@ -332,6 +332,7 @@ impl ProbeRisk {
 
 pub fn hard_check(label: impl Into<String>, ok: bool, message: impl Into<String>) -> DomainCheck {
     DomainCheck {
+        reason: None,
         label: label.into(),
         ok,
         message: message.into(),
@@ -341,6 +342,23 @@ pub fn hard_check(label: impl Into<String>, ok: bool, message: impl Into<String>
             DomainCheckLevel::Error
         },
     }
+}
+
+pub fn classify_probe_detailed(
+    label: &str,
+    request_url: &str,
+    random_segment: Option<&str>,
+    result: Result<(u16, Option<String>), crate::cloud::ProbeError>,
+) -> (DomainCheck, ProbeRisk) {
+    let reason = result.as_ref().err().and_then(|error| error.reason);
+    let (mut check, risk) = classify_probe(
+        label,
+        request_url,
+        random_segment,
+        result.map_err(|error| error.message),
+    );
+    check.reason = reason.map(str::to_owned);
+    (check, risk)
 }
 
 pub fn classify_probe(
@@ -354,6 +372,7 @@ pub fn classify_probe(
         Err(message) => {
             return (
                 DomainCheck {
+                    reason: None,
                     label: label.into(),
                     ok: false,
                     message: format!("暂时无法检查此路径：{message}"),
@@ -366,6 +385,7 @@ pub fn classify_probe(
     if status == 404 {
         return (
             DomainCheck {
+                reason: None,
                 label: label.into(),
                 ok: true,
                 message: "没有发现内容（HTTP 404），可使用这个短链接目录".into(),
@@ -419,6 +439,7 @@ pub fn classify_probe(
     };
     (
         DomainCheck {
+            reason: None,
             label: label.into(),
             ok: false,
             message: format!("此路径返回 HTTP {status}（{explanation}），请处理后重新检查"),
@@ -430,6 +451,7 @@ pub fn classify_probe(
 
 fn warning(label: &str, message: String) -> DomainCheck {
     DomainCheck {
+        reason: None,
         label: label.into(),
         ok: true,
         message,

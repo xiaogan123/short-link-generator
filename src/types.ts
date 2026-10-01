@@ -6,10 +6,10 @@ export type PendingAction = {kind:'resume_pool_sync'|'delete_pool'|'resume_monit
 export type State = { accounts: Account[]; domains: Domain[]; links: Link[]; pendingOperations: string[]; pendingActions:PendingAction[]; pools?: Pool[]; appVersion?: string };
 export type Plan = { id: string; title: string; steps: string[]; warnings: string[]; expiresAt: string; domainTakeoverConfirmation?: string; credentialMigrationConfirmation?: string };
 export type Check = { label: string; ok: boolean; message: string };
-export type DomainCheck = Check & { level?: 'pass' | 'warning' | 'error' };
-export type DomainPreparation = { host: string; prefix: string; candidates: { accountId: string; label: string; zoneId: string; status: string }[]; checks: DomainCheck[]; canApply: boolean; plan?: Plan };
+export type DomainCheck = Check & { level?: 'pass' | 'warning' | 'error'; reason?: string };
+export type DomainPreparation = { host: string; prefix: string; dnsMode?: 'system' | 'public'; candidates: { accountId: string; label: string; zoneId: string; status: string }[]; checks: DomainCheck[]; canApply: boolean; plan?: Plan };
 export type DomainDnsPreparation = { host: string; candidates: { accountId: string; label: string; zoneId: string; status: string }[]; checks: DomainCheck[]; dnsStatus: 'ready'|'missing'|'dnsOnly'|'unsupported'|'conflict'|'readFailed'; actions: { kind: 'createPlaceholder'|'enableProxy'; recordType: string; name: string }[]; canApply: boolean; plan?: Plan };
-export type Selftest = { status: 'passed' | 'pending' | 'failed' | 'key_missing'; message: string; checks: Check[] };
+export type Selftest = { status: 'passed' | 'pending' | 'failed' | 'key_missing'; message: string; checks: (Check & {reason?: string})[] };
 export type UpdateStatus = { status: 'unavailable' | 'up_to_date' | 'available'; currentVersion?: string; version?: string; notes?: string };
 export type Action = 'get_state' | 'token_template' | 'import_token' | 'rename_account' | 'remove_account' | 'refresh_accounts' | 'refresh_domains' | 'prepare_domain' | 'prepare_domain_dns' | 'prepare_change' | 'apply_plan' | 'selftest_link' | 'export_config' | 'import_config' | 'check_update' | 'install_update' | 'prepare_monitor' | 'disable_monitor' | 'resume_monitor' | 'check_link_targets' | 'check_pool_health';
 

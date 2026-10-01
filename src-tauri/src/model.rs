@@ -428,14 +428,6 @@ pub struct PlanView {
     pub credential_migration_confirmation: Option<String>,
 }
 
-#[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Check {
-    pub label: String,
-    pub ok: bool,
-    pub message: String,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DomainCheckLevel {
@@ -451,6 +443,8 @@ pub struct DomainCheck {
     pub ok: bool,
     pub message: String,
     pub level: DomainCheckLevel,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 #[derive(Clone)]
@@ -544,6 +538,7 @@ pub struct Candidate {
 pub struct DomainPreparation {
     pub host: String,
     pub prefix: String,
+    pub dns_mode: String,
     pub candidates: Vec<Candidate>,
     pub checks: Vec<DomainCheck>,
     pub can_apply: bool,

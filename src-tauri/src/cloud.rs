@@ -74,6 +74,31 @@ impl CloudError {
 
 pub type CloudResult<T> = Result<T, CloudError>;
 
+#[derive(Debug)]
+pub struct ProbeError {
+    pub message: String,
+    pub reason: Option<&'static str>,
+}
+
+impl From<CloudError> for ProbeError {
+    fn from(error: CloudError) -> Self {
+        Self {
+            message: error.message,
+            reason: None,
+        }
+    }
+}
+
+impl From<crate::local_check::CheckIssue> for ProbeError {
+    fn from(issue: crate::local_check::CheckIssue) -> Self {
+        let (reason, _, message) = issue.details();
+        Self {
+            message: message.into(),
+            reason: Some(reason),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Cloud {
     client: Client,
@@ -591,7 +616,7 @@ impl Cloud {
         &self,
         input: &str,
         header: Option<String>,
-    ) -> CloudResult<(u16, Option<String>)> {
+    ) -> Result<(u16, Option<String>), ProbeError> {
         self.probe_with_mode(input, header, DnsMode::System).await
     }
 
@@ -600,17 +625,14 @@ impl Cloud {
         input: &str,
         header: Option<String>,
         mode: DnsMode,
-    ) -> CloudResult<(u16, Option<String>)> {
+    ) -> Result<(u16, Option<String>), ProbeError> {
         let url = reqwest::Url::parse(input).map_err(|_| CloudError::new("探测地址无效", false))?;
         if url.scheme() != "https"
             || url.host_str().is_none()
             || !url.username().is_empty()
             || url.password().is_some()
         {
-            return Err(CloudError::new(
-                "只允许不含登录信息的 HTTPS 探测地址",
-                false,
-            ));
+            return Err(CloudError::new("只允许不含登录信息的 HTTPS 探测地址", false).into());
         }
         // One budget includes resolution and the optional HEAD -> GET fallback.
         // The authenticated API client and its proxy policy remain unchanged.
@@ -618,7 +640,7 @@ impl Cloud {
             #[cfg(not(test))]
             let client = crate::local_check::client_for_probe(&url, mode, PROBE_TIMEOUT)
                 .await
-                .map_err(|message| CloudError::new(message, false))?;
+                .map_err(ProbeError::from)?;
             #[cfg(test)]
             let (client, url) = {
                 // Existing integration fixtures use a local wiremock API server.
@@ -634,10 +656,12 @@ impl Cloud {
                     .map_err(|_| CloudError::new("测试探测地址无效", false))?;
                 (self.client.clone(), url)
             };
-            probe_response(&client, url, header.as_deref()).await
+            probe_response(&client, url, header.as_deref())
+                .await
+                .map_err(ProbeError::from)
         })
         .await
-        .map_err(|_| probe_timeout())?
+        .map_err(|_| ProbeError::from(probe_timeout()))?
     }
 
     pub async fn rotate_secret(

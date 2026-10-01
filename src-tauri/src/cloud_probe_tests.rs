@@ -56,7 +56,7 @@ async fn probe_rejects_non_https_and_url_credentials_before_transport() {
             "not a URL",
         ] {
             let error = cloud.probe_with_mode(input, None, mode).await.unwrap_err();
-            assert!(!error.uncertain);
+            assert_eq!(error.reason, None);
             assert!(!error.message.contains("synthetic"));
         }
     }
@@ -174,7 +174,7 @@ async fn guarded_probe_client_rejects_virtual_and_private_literals_in_both_modes
             let error = crate::local_check::client_for_probe(&url, mode, PROBE_TIMEOUT)
                 .await
                 .unwrap_err();
-            assert!(error.contains(expected), "{error}");
+            assert!(error.details().2.contains(expected), "{error:?}");
         }
     }
 }

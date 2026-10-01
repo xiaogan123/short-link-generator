@@ -71,7 +71,7 @@ fn public_ip(ip: IpAddr) -> bool {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-enum CheckIssue {
+pub(crate) enum CheckIssue {
     InvalidUrl,
     DnsTimeout,
     DnsFailed,
@@ -86,7 +86,7 @@ enum CheckIssue {
 }
 
 impl CheckIssue {
-    fn details(&self) -> (&'static str, &'static str, &'static str) {
+    pub(crate) fn details(&self) -> (&'static str, &'static str, &'static str) {
         match self {
             Self::InvalidUrl => ("invalid_url", "address", "地址格式不支持，只能检查公开的 HTTPS 网站"),
             Self::DnsTimeout => ("dns_timeout", "dns", "查询网站地址超时，请稍后重试"),
@@ -141,10 +141,8 @@ pub(crate) async fn client_for_probe(
     url: &url::Url,
     mode: DnsMode,
     timeout: Duration,
-) -> Result<Client, String> {
-    client_for_with_timeout(url, mode, timeout)
-        .await
-        .map_err(|issue| issue.details().2.to_owned())
+) -> Result<Client, CheckIssue> {
+    client_for_with_timeout(url, mode, timeout).await
 }
 
 async fn client_for_with_timeout(
@@ -560,8 +558,50 @@ mod tests {
                 let error = client_for_probe(&url, mode, Duration::from_secs(30))
                     .await
                     .unwrap_err();
-                assert!(error.contains(expected), "{address}: {error}");
+                assert!(error.details().2.contains(expected), "{address}: {error:?}");
             }
         }
+    }
+
+    #[test]
+    fn probe_reason_survives_to_domain_checks_without_classifying_text() {
+        for (addresses, reason) in [
+            (vec!["198.18.0.1:443"], "virtual_dns_address"),
+            (
+                vec!["198.18.0.1:443", "10.0.0.1:443"],
+                "blocked_non_public_address",
+            ),
+            (
+                vec!["1.1.1.1:443", "127.0.0.1:443"],
+                "blocked_non_public_address",
+            ),
+            (vec![], "dns_no_answer"),
+        ] {
+            let addresses = addresses
+                .iter()
+                .map(|value| value.parse().unwrap())
+                .collect::<Vec<_>>();
+            let issue = validate_addresses(&addresses).unwrap_err();
+            let (check, risk) = crate::domain_check::classify_probe_detailed(
+                "路径",
+                "https://example.com/r/",
+                None,
+                Err(issue.into()),
+            );
+            let serialized = serde_json::to_value(check).unwrap();
+            assert_eq!(serialized["reason"], reason);
+            assert_eq!(serialized["level"], "error");
+            assert_eq!(risk, crate::domain_check::ProbeRisk::Unreachable);
+        }
+        let (check, _) = crate::domain_check::classify_probe_detailed(
+            "路径",
+            "https://example.com/r/",
+            None,
+            Err(crate::cloud::ProbeError {
+                message: "virtual_dns_address VPN 虚拟地址".into(),
+                reason: None,
+            }),
+        );
+        assert!(serde_json::to_value(check).unwrap().get("reason").is_none());
     }
 }

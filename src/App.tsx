@@ -163,6 +163,13 @@ function domainErrorMessage(message: string) {
     ? `当前授权无法修改此域名的解析。${message}`
     : message;
 }
+function hasOnlyVirtualDnsBlocker(preparation: DomainPreparation) {
+  const errors = preparation.checks.filter(
+    (check) => domainCheckLevel(check) === "error",
+  );
+  return !preparation.canApply && errors.length > 0 &&
+    errors.every((check) => check.reason === "virtual_dns_address");
+}
 function poolTargetUrl(prefix: string, suffix: string, code = "") {
   return `${prefix}${encodeURIComponent(code)}${suffix}`;
 }
@@ -197,6 +204,7 @@ export default function App() {
   });
   const [domainOpen, setDomainOpen] = useState(false);
   const [domainBusy, setDomainBusy] = useState(false);
+  const [domainAutomaticDns, setDomainAutomaticDns] = useState(false);
   const [domainFeedback, setDomainFeedback] = useState<{
     tone: "error" | "success" | "progress";
     message: string;
@@ -238,6 +246,7 @@ export default function App() {
     slug: string;
     fingerprint: string;
     dnsMode: "system" | "public";
+    automaticDns?: boolean;
   } | null>(null);
   const [targetResult, setTargetResult] = useState<TargetReport | null>(null);
   const [retryingTargets, setRetryingTargets] = useState(false);
@@ -253,6 +262,7 @@ export default function App() {
   const [monitorEndpoint, setMonitorEndpoint] = useState("");
   const [monitorSecret, setMonitorSecret] = useState("");
   const [testingLink, setTestingLink] = useState("");
+  const [testingAutomaticDns, setTestingAutomaticDns] = useState(false);
   const [updateStatus, setUpdateStatus] = useState<UpdateStatus | null>(null);
   const [manageAccount, setManageAccount] = useState<Account | null>(null);
   const [sidebarOpen, setSidebarOpen] = useState(false);
@@ -267,7 +277,10 @@ export default function App() {
   const linkPrepareSequence = useRef(0);
   const monitorPrepareSequence = useRef(0);
   const domainDraftRef = useRef(domainDraft);
+  // Session-only, scoped to an account/host/directory that passed public-DNS checks.
+  const publicDnsDomains = useRef(new Set<string>());
   const detectionSequence = useRef(0);
+  const detectionInflight = useRef(new Set<string>());
   const domainCheckSequence = useRef(0);
   const domainOperation = useRef({ sequence: 0, inflight: false });
   const resumeDomainAfterToken = useRef(false);
@@ -306,6 +319,12 @@ export default function App() {
   }
   useEffect(() => {
     void load();
+    return () => {
+      detectionSequence.current++;
+      targetRetrySequence.current++;
+      domainCheckSequence.current++;
+      domainOperation.current.sequence++;
+    };
   }, []);
   useEffect(() => {
     const timer = window.setInterval(() => setClock(Date.now()), 60000);
@@ -745,6 +764,7 @@ export default function App() {
     setMigrationAccountId(null);
     setPreflight(null);
     setDnsPreflight(null);
+    setDomainAutomaticDns(false);
     setDomainFeedback(null);
     setError("");
   }
@@ -772,6 +792,7 @@ export default function App() {
       `域名：${result.host}`,
       `链接目录：/${result.prefix}/`,
       `账户：${result.candidates.find((candidate) => candidate.accountId === domainDraftRef.current.accountId)?.label || "待确认"}`,
+      ...(result.dnsMode === "public" ? ["网络检查：公共 DNS（兼容 VPN）"] : []),
     ]);
     setPlan(result.plan);
     setDomainOpen(false);
@@ -864,13 +885,40 @@ export default function App() {
     });
     setPreflight(null);
     setDnsPreflight(null);
-    try {
-      let result = await dispatch<DomainPreparation>("prepare_domain", {
+    setDomainAutomaticDns(false);
+    const isCurrent = () => sequence === domainCheckSequence.current &&
+      isCurrentDomainOperation(operation);
+    let automaticRetryUsed = false;
+    async function prepareWithAutomaticDns(): Promise<DomainPreparation | null> {
+      const prepare = () => dispatch<DomainPreparation>("prepare_domain", {
         input: snapshot.input,
         prefix: snapshot.prefix,
         dnsMode: snapshot.dnsMode,
         ...(snapshot.accountId ? { accountId: snapshot.accountId } : {}),
       });
+      let result = await prepare();
+      if (!isCurrent()) return null;
+      if (snapshot.dnsMode === "system" && !automaticRetryUsed && hasOnlyVirtualDnsBlocker(result)) {
+        automaticRetryUsed = true;
+        snapshot.dnsMode = "public";
+        setDomainAutomaticDns(true);
+        setDomainFeedback({
+          tone: "progress",
+          message: "检测到 VPN 虚拟地址，正在自动使用公共 DNS 重新检查。",
+        });
+        result = await prepare();
+        if (!isCurrent()) return null;
+      }
+      const accountId = snapshot.accountId || (result.candidates.length === 1 ? result.candidates[0].accountId : "");
+      if (accountId && result.dnsMode === "public" && result.canApply && result.plan &&
+          !result.checks.some((check) => domainCheckLevel(check) === "error")) {
+        publicDnsDomains.current.add(JSON.stringify([accountId, result.host, result.prefix]));
+      }
+      return result;
+    }
+    try {
+      let result = await prepareWithAutomaticDns();
+      if (!result) return;
       if (
         sequence !== domainCheckSequence.current ||
         !isCurrentDomainOperation(operation)
@@ -932,12 +980,8 @@ export default function App() {
             tone: "progress",
             message: "网站解析已就绪，正在继续检查域名接入。",
           });
-          result = await dispatch<DomainPreparation>("prepare_domain", {
-            input: snapshot.input,
-            prefix: snapshot.prefix,
-            dnsMode: snapshot.dnsMode,
-            ...(snapshot.accountId ? { accountId: snapshot.accountId } : {}),
-          });
+          result = await prepareWithAutomaticDns();
+          if (!result) return;
           if (
             sequence !== domainCheckSequence.current ||
             !isCurrentDomainOperation(operation)
@@ -1502,28 +1546,59 @@ export default function App() {
       pool?.candidates,
     ]);
   }
-  async function selftest(link: Link, domain: Domain, dnsMode: "system" | "public" = "system") {
+  async function selftest(link: Link, domain: Domain, requestedMode?: "system" | "public") {
+    const key = detectionKey(link);
+    if (detectionInflight.current.has(key)) return;
     if (!requireCurrentCredentials([domain.accountId])) return;
+    const dnsKey = JSON.stringify([domain.accountId, domain.host, domain.prefix]);
+    let dnsMode = requestedMode || (publicDnsDomains.current.has(dnsKey) ? "public" : "system");
+    let automaticDns = false;
     closeDetection();
+    detectionInflight.current.add(key);
     const url = shortUrl(domain.host, domain.prefix, link.slug);
     const sequence = ++detectionSequence.current;
     latestDetectionForLink.current[detectionKey(link)] = sequence;
     setTestingLink(url);
     setError("");
     const observedFingerprint = fingerprint(link);
+    const isCurrent = () => {
+      const current = stateRef.current.links.find((item) => detectionKey(item) === key);
+      return sequence === detectionSequence.current && current && fingerprint(current) === observedFingerprint;
+    };
+    const routeRequest = () => dispatch<Selftest>("selftest_link", {
+      domainId: link.domainId, slug: link.slug, ...(dnsMode === "public" ? {dnsMode} : {}),
+    });
+    const targetRequest = () => dispatch<TargetReport>("check_link_targets", {
+      domainId: link.domainId, slug: link.slug, ...(dnsMode === "public" ? {dnsMode} : {}),
+    });
     try {
-      const [route, targets] = await Promise.allSettled([
-        dispatch<Selftest>("selftest_link", {
-          domainId: link.domainId,
-          slug: link.slug,
-          ...(dnsMode === "public" ? {dnsMode} : {}),
-        }),
-        dispatch<TargetReport>("check_link_targets", {
-          domainId: link.domainId,
-          slug: link.slug,
-          ...(dnsMode === "public" ? {dnsMode} : {}),
-        }),
-      ]);
+      let [route, targets] = await Promise.allSettled([routeRequest(), targetRequest()]);
+      // A rejected credential/API operation is not a DNS diagnosis. Never retry it
+      // automatically; a typed route or target result must establish virtual DNS.
+      if (isCurrent() && dnsMode === "system" && route.status === "fulfilled" && targets.status === "fulfilled") {
+        const routeVirtual = route.value.checks.some((check) => !check.ok && check.reason === "virtual_dns_address");
+        const targetsVirtual = targets.value.checks.some((check) => check.status === "unknown" && check.reason === "virtual_dns_address");
+        const routeSafe = (route.value.status === "passed" || route.value.checks.length > 0) &&
+          route.value.checks.every((check) => check.ok || check.reason === "virtual_dns_address");
+        const targetsSafe = targets.value.checks.every((check) => check.status === "passed" ||
+          (check.status === "unknown" && check.reason === "virtual_dns_address"));
+        const retry = targetsSafe && (route.value.status === "key_missing"
+          ? targetsVirtual
+          : routeSafe && (routeVirtual || targetsVirtual));
+        if (retry) {
+          automaticDns = true;
+          setTestingAutomaticDns(true);
+          if (route.value.status === "key_missing") {
+            // Targets are anonymous; do not repeat a known missing-key read.
+            targets = (await Promise.allSettled([dispatch<TargetReport>("check_link_targets", {
+              domainId: link.domainId, slug: link.slug, dnsMode: "public",
+            })]))[0];
+          } else {
+            dnsMode = "public";
+            [route, targets] = await Promise.allSettled([routeRequest(), targetRequest()]);
+          }
+        }
+      }
       const checkedAt = new Date().toISOString();
       const result: Selftest =
         route.status === "fulfilled"
@@ -1538,7 +1613,7 @@ export default function App() {
           ? targets.value
           : {
               checkedAt,
-              dnsMode,
+              dnsMode: automaticDns ? "public" : dnsMode,
               checks: [
                 {
                   label: "目标地址",
@@ -1546,12 +1621,12 @@ export default function App() {
                   message: `本机检测未完成：${errorMessage(targets.reason)}`,
                   checkedAt,
                   source: "local",
-                  dnsMode,
+                  dnsMode: automaticDns ? "public" : dnsMode,
                   url: "",
                 },
               ],
             };
-      if (latestDetectionForLink.current[detectionKey(link)] === sequence)
+      if (isCurrent() && latestDetectionForLink.current[detectionKey(link)] === sequence)
         setDetections((prev) => ({
           ...prev,
           [detectionKey(link)]: {
@@ -1566,18 +1641,23 @@ export default function App() {
       );
       if (sequence === detectionSequence.current) {
         if (current && fingerprint(current) === observedFingerprint) {
-          setTestResult({ url, result, domainId: link.domainId, slug: link.slug, fingerprint: observedFingerprint, dnsMode });
+          if (dnsMode === "public" && result.status === "passed") publicDnsDomains.current.add(dnsKey);
+          setTestResult({ url, result, domainId: link.domainId, slug: link.slug, fingerprint: observedFingerprint, dnsMode, automaticDns });
           setTargetResult(targetReport);
         } else setNotice("链接或平台地址已变化，请重新检测。");
       }
     } catch (e) {
-      setError(`检测未完成：${errorMessage(e)}`);
+      if (sequence === detectionSequence.current) setError(`检测未完成：${errorMessage(e)}`);
     } finally {
+      detectionInflight.current.delete(key);
       if (sequence === detectionSequence.current) setTestingLink("");
     }
   }
 
   function closeDetection() {
+    detectionSequence.current++;
+    setTestingLink("");
+    setTestingAutomaticDns(false);
     targetRetrySequence.current++;
     targetRetryBusy.current = false;
     setRetryingTargets(false);
@@ -1892,7 +1972,9 @@ export default function App() {
               <ShieldCheck size={19} />
               <span>
                 正在检测 {testingLink} 的跳转结果。检测期间仍可继续使用应用。
+                {testingAutomaticDns && " 检测到 VPN 虚拟地址，正在自动使用公共 DNS 重查一次。"}
               </span>
+              <button onClick={closeDetection}>取消等待</button>
             </div>
           )}
           {clipboardToClear && (
@@ -2958,7 +3040,8 @@ export default function App() {
                   }} />
                 兼容 VPN 网络
               </label>
-              <small>开启后，用 Cloudflare 公共 DNS 查询此域名再检查目录，只发送域名，不发送账户令牌。不会更改你的 DNS 或 VPN 设置。</small>
+              <small>默认先用系统 DNS；仅发现 VPN 虚拟地址时自动重查一次。勾选可直接使用公共 DNS。公共查询只向 Cloudflare 发送域名，不发送账户令牌，不更改你的 DNS 或 VPN 设置。</small>
+              {domainAutomaticDns && <p role="status">本次已自动切换为公共 DNS；接入计划将按同一方式复核，仍需确认后才会接入。</p>}
             </div>
             {preflight && (
               <div className="preflight">
@@ -3641,6 +3724,7 @@ export default function App() {
         >
           <div className="test-result">
             <div className="test-url">{testResult.url}</div>
+            {testResult.automaticDns && <p role="status">检测到 VPN 虚拟地址，本次已自动使用公共 DNS 重查一次；下方显示实际检查结果。</p>}
             <h3>短链接跳转</h3>
             <StatusPill
               tone={
@@ -3693,7 +3777,7 @@ export default function App() {
             ))}
             {!preview && (targetResult?.dnsMode === "public" || targetResult?.checks.some((check) => check.status === "unknown") || testResult.result.status !== "passed") && (
               <div className="form-note">
-                <p>开启 VPN 后无法检测？可使用 Cloudflare 公共 DNS 查询真实地址后重试。只向查询服务发送域名，不发送完整链接或邀请码；重试过程中如遇跳转，也会查询跳转后的域名。</p>
+                <p>明确检测到 VPN 虚拟地址时会自动兼容重查一次；其他网络问题不会自动切换，也可在这里手动重试。Cloudflare 公共 DNS 只向查询服务发送域名，不发送完整链接或邀请码；重试过程中如遇跳转，也会查询跳转后的域名。</p>
                 <button className="button secondary" disabled={retryingTargets} onClick={() => void retryTargetsWithPublicDns()}>
                   {retryingTargets ? "正在重新检测…" : "兼容 VPN 重试"}
                 </button>

@@ -1,5 +1,7 @@
 mod cloud;
-#[cfg(any(target_os = "macos", test))]
+#[cfg(test)]
+mod credential_cleanup_tests;
+#[cfg(any(target_os = "macos", target_os = "windows", test))]
 mod credential_migration;
 #[cfg(all(test, target_os = "macos"))]
 mod credential_migration_tests;
@@ -14,6 +16,10 @@ mod pools;
 mod secret_store;
 #[cfg(test)]
 mod selftest_resource_recovery_tests;
+#[cfg(target_os = "windows")]
+mod windows_configuration;
+#[cfg(all(test, target_os = "windows"))]
+mod windows_credential_native_tests;
 
 use chrono::Utc;
 use cloud::{Cloud, CloudError};
@@ -21,7 +27,7 @@ use domain_check::PathRiskSnapshot;
 use futures_util::StreamExt;
 use hmac::{Hmac, Mac};
 use model::{
-    Account, Candidate, Check, Database, DnsActionView, Domain, DomainCheck, DomainCheckLevel,
+    Account, Candidate, Database, DnsActionView, Domain, DomainCheck, DomainCheckLevel,
     DomainDnsPreparation, DomainPreparation, Link, PendingMonitorChange, PendingPoolChange,
     PendingSelftestRotation, Plan, PlanKind, PlanView, Pool, PoolSyncStatus, Resources,
     SelftestRotationStatus, State, Zone,
@@ -87,6 +93,8 @@ struct Backend {
     app: Option<tauri::AppHandle>,
     #[cfg(target_os = "macos")]
     _credential_lease: Option<mac_credentials::ConfigurationLease>,
+    #[cfg(target_os = "windows")]
+    _configuration_lease: Option<windows_configuration::ConfigurationLease>,
     #[cfg(test)]
     persist_count: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
@@ -286,7 +294,7 @@ async fn remove_current_credentials(id: &str) -> Result<(), String> {
         {
             secret_store::remove_current_account(&id).map_err(|error| error.to_string())
         }
-        #[cfg(all(target_os = "macos", test))]
+        #[cfg(test)]
         {
             use credential_migration::MigrationBackend;
             credential_migration::remove_current_verified(
@@ -297,7 +305,11 @@ async fn remove_current_credentials(id: &str) -> Result<(), String> {
             )
             .map_err(|error| error.to_string())
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(all(target_os = "windows", not(test)))]
+        {
+            secret_store::remove_current_account(&id).map_err(|error| error.to_string())
+        }
+        #[cfg(all(not(any(target_os = "macos", target_os = "windows")), not(test)))]
         {
             keyring_delete(&id, "token")?;
             keyring_delete(&id, "selftest")?;
@@ -322,9 +334,9 @@ fn mock_key_mutations() -> &'static std::sync::Mutex<Vec<String>> {
     CALLS.get_or_init(|| std::sync::Mutex::new(Vec::new()))
 }
 
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(test)]
 struct MockMigration;
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(test)]
 impl credential_migration::MigrationBackend for MockMigration {
     fn current(
         &self,
@@ -335,6 +347,14 @@ impl credential_migration::MigrationBackend for MockMigration {
             .lock()
             .unwrap()
             .push(format!("current:{kind}:{id}"));
+        let failures = mock_key_set_failures().lock().unwrap();
+        if failures.contains(&format!("read-denied:{kind}:{id}")) {
+            return Err(secret_store::SecretError::AccessDenied);
+        }
+        if failures.contains(&format!("read-unavailable:{kind}:{id}")) {
+            return Err(secret_store::SecretError::Unavailable);
+        }
+        drop(failures);
         mock_keys()
             .lock()
             .unwrap()
@@ -702,6 +722,10 @@ impl Backend {
         #[cfg(target_os = "macos")]
         let lease =
             mac_credentials::ConfigurationLease::acquire(path.parent().ok_or("配置目录无效")?)?;
+        #[cfg(target_os = "windows")]
+        let windows_lease = windows_configuration::ConfigurationLease::acquire(
+            path.parent().ok_or("配置目录无效")?,
+        )?;
         let db: Database = if path.exists() {
             let bytes = fs::read(&path).map_err(|_| "无法读取本机配置".to_string())?;
             serde_json::from_slice(&bytes).map_err(|_| "本机配置格式无效".to_string())?
@@ -721,6 +745,8 @@ impl Backend {
         Ok(Self {
             #[cfg(target_os = "macos")]
             _credential_lease: Some(lease),
+            #[cfg(target_os = "windows")]
+            _configuration_lease: Some(windows_lease),
             db,
             path,
             plans: Vec::new(),
@@ -1491,6 +1517,7 @@ impl Backend {
                                     Ok(()) => {
                                         dns_status = "missing".into();
                                         checks.push(DomainCheck {
+                                            reason: None,
                                             label: "DNS".into(),
                                             ok: true,
                                             message: "这个域名还没有用于打开网址的解析，可以补齐；现有邮件及验证设置会保留".into(),
@@ -1543,6 +1570,7 @@ impl Backend {
                                     Ok(()) => {
                                         dns_status = "dnsOnly".into();
                                         checks.push(DomainCheck {
+                                            reason: None,
                                             label: "DNS".into(),
                                             ok: true,
                                             message: format!(
@@ -1740,17 +1768,13 @@ impl Backend {
             self.cloud.probe_with_mode(&root_url, None, dns_mode),
             self.cloud.probe_with_mode(&child_url, None, dns_mode)
         );
-        let (root_check, root) = domain_check::classify_probe(
-            "短链接目录",
-            &root_url,
-            None,
-            root_result.map_err(problem),
-        );
-        let (child_check, child) = domain_check::classify_probe(
+        let (root_check, root) =
+            domain_check::classify_probe_detailed("短链接目录", &root_url, None, root_result);
+        let (child_check, child) = domain_check::classify_probe_detailed(
             "随机测试链接",
             &child_url,
             Some(&probe_segment),
-            child_result.map_err(problem),
+            child_result,
         );
         checks.push(root_check);
         checks.push(child_check);
@@ -1855,6 +1879,7 @@ impl Backend {
         Ok(serde_json::to_value(DomainPreparation {
             host,
             prefix,
+            dns_mode: dns_mode.as_str().into(),
             candidates,
             checks,
             can_apply: plan.is_some(),
@@ -5957,7 +5982,7 @@ async fn run_region_test(
     label: &str,
     expected: Option<&str>,
     dns_mode: local_check::DnsMode,
-) -> Result<Check, String> {
+) -> Result<DomainCheck, String> {
     let mut pending = false;
     for attempt in 0..5 {
         let seconds = Utc::now().timestamp();
@@ -5988,18 +6013,29 @@ async fn run_region_test(
         .await;
         match result {
             Ok(Ok((302, Some(location)))) if expected == Some(location.as_str()) => {
-                return Ok(Check {
-                    label: label.into(),
-                    ok: true,
-                    message: "302 与 Location 均正确".into(),
-                })
+                return Ok(domain_check::hard_check(
+                    label,
+                    true,
+                    "302 与 Location 均正确",
+                ))
             }
             Ok(Ok((503, None))) if expected.is_none() => {
-                return Ok(Check {
-                    label: label.into(),
-                    ok: false,
-                    message: "云端监测记录显示所有大陆备用地址暂时不可用，转发返回 HTTP 503".into(),
-                });
+                return Ok(domain_check::hard_check(
+                    label,
+                    false,
+                    "云端监测记录显示所有大陆备用地址暂时不可用，转发返回 HTTP 503",
+                ));
+            }
+            Ok(Err(error)) if error.reason.is_some() => {
+                // Resolver/address guard failures are definitive for this mode.
+                // Preserve their typed cause; never retry them as propagation.
+                return Ok(domain_check::classify_probe_detailed(
+                    label,
+                    &snapshot.url,
+                    None,
+                    Err(error),
+                )
+                .0);
             }
             Ok(Ok((404, _))) | Ok(Err(_)) | Err(_) => pending = true,
             _ => pending = false,
@@ -6008,15 +6044,15 @@ async fn run_region_test(
             tokio::time::sleep(Duration::from_secs(5)).await;
         }
     }
-    Ok(Check {
-        label: label.into(),
-        ok: false,
-        message: if pending {
-            "边缘配置可能仍在传播或网络暂时不可用".into()
+    Ok(domain_check::hard_check(
+        label,
+        false,
+        if pending {
+            "边缘配置可能仍在传播或网络暂时不可用"
         } else {
-            "响应状态或 Location 与预期不符".into()
+            "响应状态或 Location 与预期不符"
         },
-    })
+    ))
 }
 
 async fn run_selftest(snapshot: SelftestSnapshot) -> Result<Value, String> {
@@ -6076,16 +6112,8 @@ async fn run_selftest_with_mode(
         Ok(Ok((other, cn))) => vec![other, cn],
         Ok(Err(e)) => return Err(e),
         Err(_) => vec![
-            Check {
-                label: "其他地区".into(),
-                ok: false,
-                message: "自检超时，请稍后重试".into(),
-            },
-            Check {
-                label: "中国大陆".into(),
-                ok: false,
-                message: "自检超时，请稍后重试".into(),
-            },
+            domain_check::hard_check("其他地区", false, "自检超时，请稍后重试"),
+            domain_check::hard_check("中国大陆", false, "自检超时，请稍后重试"),
         ],
     };
     let status = if checks.iter().all(|c| c.ok) {
@@ -6347,6 +6375,8 @@ mod tests {
             app: None,
             #[cfg(target_os = "macos")]
             _credential_lease: None,
+            #[cfg(target_os = "windows")]
+            _configuration_lease: None,
             persist_count: std::sync::atomic::AtomicUsize::new(0),
             fail_persist_at: std::sync::atomic::AtomicUsize::new(0),
         };
@@ -7684,6 +7714,7 @@ mod tests {
             )
             .await
             .unwrap();
+        assert_eq!(result["dnsMode"], "public");
         let id = result["plan"]["id"].as_str().unwrap();
         let plan = backend.plans.iter().find(|p| p.view.id == id).unwrap();
         assert!(matches!(

@@ -4,11 +4,13 @@ use zeroize::Zeroizing;
 
 pub(crate) const KINDS: [&str; 4] = ["token", "selftest", "probe", "selftest-pending"];
 
+#[cfg(any(target_os = "macos", test))]
 pub(crate) enum Created {
     New,
     AlreadyExists,
 }
 
+#[cfg(any(target_os = "macos", test))]
 pub(crate) trait MigrationBackend {
     fn current(&self, id: &str, kind: &str) -> Result<Zeroizing<String>, SecretError>;
     fn legacy(&self, id: &str, kind: &str) -> Result<Zeroizing<String>, SecretError>;
@@ -17,6 +19,7 @@ pub(crate) trait MigrationBackend {
 
 /// Called only after the account's one-use migration plan has been acknowledged.
 /// A completed account may contain genuinely absent optional credentials.
+#[cfg(any(target_os = "macos", test))]
 pub(crate) fn migrate(backend: &impl MigrationBackend, id: &str) -> Result<(), SecretError> {
     for kind in KINDS {
         match backend.current(id, kind) {

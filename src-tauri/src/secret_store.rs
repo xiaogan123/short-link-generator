@@ -44,7 +44,7 @@ pub(crate) enum SecretError {
     Conflict,
     #[cfg(any(target_os = "macos", test))]
     ReadbackMismatch,
-    #[cfg(any(target_os = "macos", test))]
+    #[cfg(any(target_os = "macos", target_os = "windows", test))]
     DeletionNotConfirmed,
 }
 
@@ -64,7 +64,7 @@ impl fmt::Display for SecretError {
             Self::Conflict => "本机凭据在更新期间发生冲突，未覆盖任何已有值；请重新核对并确认",
             #[cfg(any(target_os = "macos", test))]
             Self::ReadbackMismatch => "新本机凭据读回不一致，未完成授权更新；旧凭据已保留",
-            #[cfg(any(target_os = "macos", test))]
+            #[cfg(any(target_os = "macos", target_os = "windows", test))]
             Self::DeletionNotConfirmed => "无法确认本机凭据已删除，账户记录已保留，请稍后重试",
         })
     }
@@ -667,6 +667,29 @@ pub(crate) fn remove_current_account(id: &str) -> Result<(), SecretError> {
     )
 }
 
+#[cfg(any(all(not(test), target_os = "windows"), test))]
+fn remove_current_account_verified(
+    mut clear_cache: impl FnMut(),
+    remove: impl FnMut(&str) -> Result<(), SecretError>,
+    current: impl FnMut(&str) -> Result<Zeroizing<String>, SecretError>,
+) -> Result<(), SecretError> {
+    clear_cache();
+    let result = crate::credential_migration::remove_current_verified(remove, current);
+    clear_cache();
+    result
+}
+
+/// Read back through the native backend, never through the cached Missing state
+/// installed by `store().delete`. A partial failure must leave the account row.
+#[cfg(all(not(test), target_os = "windows"))]
+pub(crate) fn remove_current_account(id: &str) -> Result<(), SecretError> {
+    remove_current_account_verified(
+        || store().clear_all(),
+        |kind| KeyringBackend.delete(id, kind),
+        |kind| KeyringBackend.get(id, kind),
+    )
+}
+
 #[cfg(all(not(test), target_os = "macos"))]
 pub(crate) fn migrate_account(id: &str) -> Result<(), SecretError> {
     store().clear_all();
@@ -1085,6 +1108,27 @@ mod tests {
         success(store.delete("acct", "token"));
         assert!(store.get("acct", "token").unwrap_err() == SecretError::Missing);
         assert!(backend.get_count.load(Ordering::SeqCst) == 2);
+    }
+
+    #[test]
+    fn verified_account_removal_flushes_cached_values_after_native_deletes() {
+        let (store, backend, _) = fixture(Duration::from_secs(600));
+        for kind in crate::credential_migration::KINDS {
+            backend.put("acct", kind, "synthetic");
+            assert!(success(store.get("acct", kind)) == "synthetic");
+        }
+        assert!(remove_current_account_verified(
+            || store.clear_all(),
+            |kind| backend.delete("acct", kind),
+            |kind| backend.get("acct", kind),
+        )
+        .is_ok());
+        assert_eq!(backend.delete_count.load(Ordering::SeqCst), 4);
+        let before = backend.get_count.load(Ordering::SeqCst);
+        for kind in crate::credential_migration::KINDS {
+            assert!(store.get("acct", kind).unwrap_err() == SecretError::Missing);
+        }
+        assert_eq!(backend.get_count.load(Ordering::SeqCst), before + 4);
     }
 
     #[test]
