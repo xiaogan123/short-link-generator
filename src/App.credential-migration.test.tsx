@@ -143,7 +143,7 @@ it('local removal discloses retained legacy entries without attempting migration
 });
 it('cached domain matching does not block a current account because another account is legacy',async()=>{
   await start();const editor=await domainEditor('');fireEvent.change(within(editor).getByPlaceholderText('go.example.com'),{target:{value:'new.example.org'}});
-  fireEvent.click(within(editor).getByRole('button',{name:'检查并接入'}));await waitFor(()=>expect(calls('prepare_domain')).toHaveLength(1));expect(calls('prepare_change')).toHaveLength(0);
+  fireEvent.click(within(editor).getByRole('button',{name:'检查并继续'}));await waitFor(()=>expect(calls('prepare_domain')).toHaveLength(1));expect(calls('prepare_change')).toHaveLength(0);
 });
 
 it('changing domain account removes the old account migration entry',async()=>{

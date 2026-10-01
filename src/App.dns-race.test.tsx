@@ -25,7 +25,7 @@ it('keeps a DNS repair plan open while applying, so its late result cannot prepa
   fireEvent.click(screen.getAllByRole('button',{name:'添加域名'})[0]);
   const form=screen.getByRole('dialog',{name:'添加域名'});
   fireEvent.change(within(form).getByPlaceholderText('go.example.com'),{target:{value:'old.example.com'}});
-  fireEvent.click(within(form).getByRole('button',{name:'检查并接入'}));
+  fireEvent.click(within(form).getByRole('button',{name:'检查并继续'}));
   const plan=await screen.findByRole('dialog',{name:'修复 DNS'});
   expect(control.calls.filter(call=>call.action==='prepare_domain_dns')).toHaveLength(1);
   fireEvent.click(within(plan).getByRole('button',{name:'确认修改并继续检查'}));
@@ -51,7 +51,7 @@ it('continues from ready DNS into the domain confirmation without another click'
   fireEvent.click(screen.getAllByRole('button',{name:'添加域名'})[0]);
   const form=screen.getByRole('dialog',{name:'添加域名'});
   fireEvent.change(within(form).getByPlaceholderText('go.example.com'),{target:{value:'ready.example.com'}});
-  fireEvent.click(within(form).getByRole('button',{name:'检查并接入'}));
+  fireEvent.click(within(form).getByRole('button',{name:'检查并继续'}));
   expect(await screen.findByRole('button',{name:'确认并执行'})).toBeTruthy();
   expect(control.calls.filter(call=>call.action==='prepare_domain')).toHaveLength(2);
   expect(control.calls.filter(call=>call.action==='prepare_domain_dns')).toHaveLength(1);
@@ -64,7 +64,7 @@ it('prepares a missing DNS repair plan in the first user operation',async()=>{
   fireEvent.click(screen.getAllByRole('button',{name:'添加域名'})[0]);
   const form=screen.getByRole('dialog',{name:'添加域名'});
   fireEvent.change(within(form).getByPlaceholderText('go.example.com'),{target:{value:'repair.example.com'}});
-  fireEvent.click(within(form).getByRole('button',{name:'检查并接入'}));
+  fireEvent.click(within(form).getByRole('button',{name:'检查并继续'}));
   expect(await screen.findByRole('dialog',{name:'修复 DNS'})).toBeTruthy();
   expect(control.calls.filter(call=>call.action==='prepare_domain_dns')).toHaveLength(1);
   expect(control.calls.filter(call=>call.action==='get_state').length).toBeGreaterThan(2);
@@ -77,7 +77,7 @@ it('keeps a DNS permission failure visible and retries only the read preparation
   fireEvent.click(screen.getAllByRole('button',{name:'添加域名'})[0]);
   const form=screen.getByRole('dialog',{name:'添加域名'});
   fireEvent.change(within(form).getByPlaceholderText('go.example.com'),{target:{value:'blocked.example.com'}});
-  fireEvent.click(within(form).getByRole('button',{name:'检查并接入'}));
+  fireEvent.click(within(form).getByRole('button',{name:'检查并继续'}));
   const plan=await screen.findByRole('dialog',{name:'修复 DNS'});
   fireEvent.click(within(plan).getByRole('button',{name:'确认修改并继续检查'}));
   const reopened=await screen.findByRole('dialog',{name:'添加域名'});
@@ -101,7 +101,7 @@ it('binds a unique automatic account match so recovery stays available after a D
   const form=screen.getByRole('dialog',{name:'添加域名'});
   fireEvent.change(within(form).getByPlaceholderText('go.example.com'),{target:{value:'auto.example.com'}});
   expect((within(form).getByRole('combobox',{name:'Cloudflare 账户'}) as HTMLSelectElement).value).toBe('');
-  fireEvent.click(within(form).getByRole('button',{name:'检查并接入'}));
+  fireEvent.click(within(form).getByRole('button',{name:'检查并继续'}));
   const plan=await screen.findByRole('dialog',{name:'修复 DNS'});
   expect(control.calls.find(call=>call.action==='prepare_domain_dns')?.payload.accountId).toBe('a');
   fireEvent.click(within(plan).getByRole('button',{name:'确认修改并继续检查'}));
@@ -118,7 +118,7 @@ it('requires an explicit account choice when domain preparation has multiple can
   fireEvent.click(screen.getAllByRole('button',{name:'添加域名'})[0]);
   const form=screen.getByRole('dialog',{name:'添加域名'});
   fireEvent.change(within(form).getByPlaceholderText('go.example.com'),{target:{value:'ambiguous.example.com'}});
-  fireEvent.click(within(form).getByRole('button',{name:'检查并接入'}));
+  fireEvent.click(within(form).getByRole('button',{name:'检查并继续'}));
   expect((await within(form).findByRole('alert')).textContent).toContain('多个账户都可能管理此域名');
   expect(control.calls.filter(call=>call.action==='prepare_domain_dns')).toHaveLength(0);
   expect(control.calls.filter(call=>call.action==='apply_plan')).toHaveLength(0);
@@ -131,10 +131,10 @@ it('keeps the explicit VPN choice through the DNS-ready automatic directory rech
   fireEvent.click(screen.getAllByRole('button',{name:'添加域名'})[0]);
   const form=screen.getByRole('dialog',{name:'添加域名'});
   fireEvent.change(within(form).getByPlaceholderText('go.example.com'),{target:{value:'ready.example.com'}});
-  const vpn=within(form).getByRole('checkbox',{name:'兼容 VPN 网络'}) as HTMLInputElement;
+  const vpn=within(form).getByRole('checkbox',{name:'直接使用公共 DNS（手动兼容 VPN）'}) as HTMLInputElement;
   expect(vpn.checked).toBe(false);
   fireEvent.click(vpn);
-  fireEvent.click(within(form).getByRole('button',{name:'检查并接入'}));
+  fireEvent.click(within(form).getByRole('button',{name:'检查并继续'}));
   await screen.findByRole('button',{name:'确认并执行'});
   const checks=control.calls.filter(call=>call.action==='prepare_domain');
   expect(checks).toHaveLength(2);

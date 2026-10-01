@@ -61,25 +61,27 @@ async function open() {
   fireEvent.change(within(form).getByRole('combobox', {name: 'Cloudflare 账户'}), {target: {value: 'a'}});
   return form;
 }
-function submit(form: HTMLElement) {fireEvent.click(within(form).getByRole('button', {name: '检查并接入'}));}
-async function done(form: HTMLElement) {
-  await waitFor(() => expect(within(form).queryByRole('button', {name: '检查中…'})).toBeNull());
+function submit(form: HTMLElement) {fireEvent.click(within(form).getByRole('button', {name: '检查并继续'}));}
+async function done(_form: HTMLElement) {
+  await waitFor(() => expect(screen.queryByRole('button', {name: '检查中…'})).toBeNull());
 }
 
 it('automatically retries only typed virtual DNS, shows the actual warning, and binds only the public plan behind takeover confirmation', async () => {
   const form = await open(); submit(form); await done(form);
   expect(calls().map(call => call.payload.dnsMode)).toEqual(['system', 'public']);
-  expect(within(form).getByText(/本次已自动切换为公共 DNS/)).toBeTruthy();
-  expect(within(form).getByText('确认后可接入')).toBeTruthy();
-  expect(within(form).getByText(/真实模拟结果 HTTP 522/)).toBeTruthy();
   expect(applies()).toHaveLength(0);
-  fireEvent.click(within(form).getByRole('button', {name: '查看接入计划'}));
   const plan = screen.getByRole('dialog', {name: '添加域名'});
   expect(within(plan).getByText('网络检查：公共 DNS（兼容 VPN）')).toBeTruthy();
-  const confirm = within(plan).getByRole('button', {name: '确认使用此目录'}) as HTMLButtonElement;
+  expect(within(plan).getByRole('button', {name: '确认使用此目录'})).toBeTruthy();
   expect(within(plan).getByText('确认接管此目录及其下级网页。')).toBeTruthy();
+  fireEvent.click(within(plan).getByRole('button', {name:'返回'}));
+  const restored = screen.getByRole('dialog', {name:'添加域名'});
+  expect(within(restored).getByText(/本次已自动切换为公共 DNS/)).toBeTruthy();
+  expect(within(restored).getByText('确认后可接入')).toBeTruthy();
+  expect(within(restored).getByText(/真实模拟结果 HTTP 522/)).toBeTruthy();
+  fireEvent.click(within(restored).getByRole('button', {name:'查看接入计划'}));
   expect(applies()).toHaveLength(0);
-  fireEvent.click(confirm);
+  fireEvent.click(screen.getByRole('button', {name:'确认使用此目录'}));
   await waitFor(() => expect(applies()).toHaveLength(1));
   expect(applies()[0].payload).toMatchObject({planId: 'plan-public', acknowledgeDomainTakeover: true});
 });
@@ -88,7 +90,8 @@ it.each(['virtual_dns_address', 'public_dns_failed', 'blocked_non_public_address
   control.publicReason = reason;
   const form = await open(); submit(form); await done(form);
   expect(calls().map(call => call.payload.dnsMode)).toEqual(['system', 'public']);
-  expect(within(form).getByText('需要先处理')).toBeTruthy();
+  expect(within(form).getByText(reason === 'blocked_non_public_address' ? '需要先处理' : '网络检查未完成')).toBeTruthy();
+  if (reason !== 'blocked_non_public_address') expect(within(form).getByText(/域名尚未接入/)).toBeTruthy();
   expect(within(form).queryByRole('button', {name: '查看接入计划'})).toBeNull();
   expect(applies()).toHaveLength(0);
 });
@@ -112,10 +115,12 @@ it.each([
 });
 
 it('honors explicit public mode without an extra fallback', async () => {
-  const form = await open(); fireEvent.click(within(form).getByRole('checkbox', {name: '兼容 VPN 网络'}));
+  const form = await open(); fireEvent.click(within(form).getByText('网络检查选项'));
+  fireEvent.click(within(form).getByRole('checkbox', {name: '直接使用公共 DNS（手动兼容 VPN）'}));
   submit(form); await done(form);
   expect(calls().map(call => call.payload.dnsMode)).toEqual(['public']);
-  expect(within(form).queryByText(/本次已自动切换/)).toBeNull();
+  expect(screen.getByText('网络检查：公共 DNS（兼容 VPN）')).toBeTruthy();
+  expect(applies()).toHaveLength(0);
 });
 
 it.each(['system', 'public'])('ignores a late %s result after cancel and reopen, without duplicate requests', async mode => {
@@ -158,16 +163,18 @@ it.each(['ready', 'missing'])('covers the followup check after DNS is %s with th
 
 it('does not silently remember public mode for a different host', async () => {
   const form = await open(); submit(form); await done(form);
-  fireEvent.change(within(form).getByPlaceholderText('go.example.com'), {target: {value: 'next.example.com'}});
-  control.reasons = []; submit(form); await done(form);
+  fireEvent.click(screen.getByRole('button', {name:'返回'}));
+  const restored = screen.getByRole('dialog', {name:'添加域名'});
+  fireEvent.change(within(restored).getByPlaceholderText('go.example.com'), {target: {value: 'next.example.com'}});
+  control.reasons = []; submit(restored); await done(restored);
   expect(calls().map(call => call.payload.dnsMode)).toEqual(['system', 'public', 'system']);
-  expect(within(form).queryByText(/本次已自动切换/)).toBeNull();
+  expect(screen.getByRole('button',{name:'确认使用此目录'})).toBeTruthy();
+  expect(screen.queryByText('网络检查：公共 DNS（兼容 VPN）')).toBeNull();
 });
 
 it('reuses a domain public-DNS preparation for link detection, without changing another domain', async () => {
   control.showLinksOnApply = true;
   const form = await open(); submit(form); await done(form);
-  fireEvent.click(within(form).getByRole('button', {name: '查看接入计划'}));
   fireEvent.click(screen.getByRole('button', {name: '确认使用此目录'}));
   await waitFor(() => expect(control.installed).toBe(true));
   fireEvent.click(screen.getByRole('button', {name: /^短链接\d*$/}));

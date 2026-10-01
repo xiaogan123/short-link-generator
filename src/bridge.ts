@@ -25,6 +25,17 @@ const demoState: State = {
   pools: [],
 };
 let local: State = structuredClone(demoState);
+// Optional, isolated examples for checking the desktop layout without cloud access.
+if (preview && new URLSearchParams(window.location.search).get('visualReview') === '1') {
+  local.domains.push({id:'demo-d3',accountId:'demo-b',zoneId:'demo-zone-3',host:'new.example.net',prefix:'go',routeId:'demo-route-3'});
+  local.pools = [{id:'demo-platform',name:'示例平台',official:{prefix:'https://www.example.com/join/',suffix:''},candidates:[
+    {id:'demo-c1',prefix:'https://cn.example.com/join/',suffix:'',enabled:true},
+    {id:'demo-c2',prefix:'https://backup.example.org/join/',suffix:'',enabled:true},
+    {id:'demo-c3',prefix:'https://old.example.org/join/',suffix:'',enabled:false},
+  ],updated:now(),accountIds:['demo-a']}];
+  local.links[0] = {...local.links[0],poolId:'demo-platform',code:'DEMO2026'};
+  local.links[2] = {...local.links[2],poolId:'demo-platform',code:'EXAMPLE88'};
+}
 const plans = new Map<string, { plan: Plan; action: string; payload: Record<string, unknown> }>();
 const clone = ():State => {const state=structuredClone(local);state.links=state.links.map(link=>{if(!link.poolId)return link;const pool=state.pools?.find(p=>p.id===link.poolId);if(!pool)return link;const code=encodeURIComponent(link.code||'');const candidate=pool.candidates.find(c=>c.enabled);return {...link,cnUrl:candidate?candidate.prefix+code+candidate.suffix:'',defaultUrl:pool.official.prefix+code+pool.official.suffix};});return state;};
 function makePlan(title: string, steps: string[], warnings: string[], action: string, payload: Record<string, unknown>, domainTakeoverConfirmation?: string): Plan {

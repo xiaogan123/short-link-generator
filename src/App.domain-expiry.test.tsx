@@ -63,24 +63,24 @@ async function open() {
   fireEvent.change(within(form()).getByPlaceholderText('go.example.com'), { target: { value: 'new.example.com' } });
   fireEvent.change(within(form()).getByRole('textbox', { name: /^链接目录/ }), { target: { value: 'visit' } });
   fireEvent.change(within(form()).getByRole('combobox', { name: 'Cloudflare 账户' }), { target: { value: 'a' } });
-  await click(within(form()).getByRole('checkbox', { name: '兼容 VPN 网络' }));
+  await click(within(form()).getByText('网络检查选项'));
+  await click(within(form()).getByRole('checkbox', { name: '直接使用公共 DNS（手动兼容 VPN）' }));
 }
 function checkDraft() {
   expect((within(form()).getByPlaceholderText('go.example.com') as HTMLInputElement).value).toBe('new.example.com');
   expect((within(form()).getByRole('textbox', { name: /^链接目录/ }) as HTMLInputElement).value).toBe('visit');
   expect((within(form()).getByRole('combobox', { name: 'Cloudflare 账户' }) as HTMLSelectElement).value).toBe('a');
-  expect((within(form()).getByRole('checkbox', { name: '兼容 VPN 网络' }) as HTMLInputElement).checked).toBe(true);
+  expect((within(form()).getByRole('checkbox', { name: '直接使用公共 DNS（手动兼容 VPN）' }) as HTMLInputElement).checked).toBe(true);
 }
 function applies() { return control.calls.filter(call => call.action === 'apply_plan'); }
 
 it.each(['expired', 'invalid'] as const)('lets a %s response be explicitly rechecked without changing the draft or applying', async kind => {
   control.ttl = -1; control.invalidExpiry = kind === 'invalid';
-  await open(); await click(within(form()).getByRole('button', { name: '检查并接入' }));
+  await open(); await click(within(form()).getByRole('button', { name: '检查并继续' }));
   expect(within(form()).queryByRole('button', { name: '查看接入计划' })).toBeNull();
   expect(within(form()).getByText(/计划已过期/)).toBeTruthy(); checkDraft();
   control.ttl = 300000; control.invalidExpiry = false;
   await click(within(form()).getByRole('button', { name: '重新检查当前状态' }));
-  await click(within(form()).getByRole('button', { name: '查看接入计划' }));
   expect(within(form()).getByText('确认接管此目录及其下级网页。')).toBeTruthy();
   expect((within(form()).getByRole('button', { name: '确认使用此目录' }) as HTMLButtonElement).disabled).toBe(false);
   const requests = control.calls.filter(call => call.action === 'prepare_domain');
@@ -94,8 +94,7 @@ it.each(['expired', 'invalid'] as const)('lets a %s response be explicitly reche
 });
 
 it('expires an open plan, then returns directly to a usable recheck without reusing its ID', async () => {
-  await open(); await click(within(form()).getByRole('button', { name: '检查并接入' }));
-  await click(within(form()).getByRole('button', { name: '查看接入计划' }));
+  await open(); await click(within(form()).getByRole('button', { name: '检查并继续' }));
   const confirm = within(form()).getByRole('button', { name: '确认使用此目录' }) as HTMLButtonElement;
   await act(async () => { vi.advanceTimersByTime(300001); });
   expect(confirm.disabled).toBe(true);
@@ -107,7 +106,8 @@ it('expires an open plan, then returns directly to a usable recheck without reus
 });
 
 it('rechecks the deadline when opening between renders', async () => {
-  await open(); await click(within(form()).getByRole('button', { name: '检查并接入' }));
+  await open(); await click(within(form()).getByRole('button', { name: '检查并继续' }));
+  await click(within(form()).getByRole('button', { name: '返回' }));
   const button = within(form()).getByRole('button', { name: '查看接入计划' });
   vi.setSystemTime(Date.now() + 300001); // No timer/render before the click.
   await click(button); checkDraft();
@@ -117,8 +117,7 @@ it('rechecks the deadline when opening between renders', async () => {
 });
 
 it('does not submit an ID which expires between the confirmation render and click', async () => {
-  await open(); await click(within(form()).getByRole('button', { name: '检查并接入' }));
-  await click(within(form()).getByRole('button', { name: '查看接入计划' }));
+  await open(); await click(within(form()).getByRole('button', { name: '检查并继续' }));
   const confirm = within(form()).getByRole('button', { name: '确认使用此目录' });
   vi.setSystemTime(Date.now() + 300001);
   await click(confirm);
@@ -128,26 +127,25 @@ it('does not submit an ID which expires between the confirmation render and clic
 
 it('ignores a late recheck after cancellation and a new draft or DNS-mode choice', async () => {
   control.ttl = -1; await open();
-  await click(within(form()).getByRole('button', { name: '检查并接入' }));
+  await click(within(form()).getByRole('button', { name: '检查并继续' }));
   control.ttl = 300000; control.defer = true;
   await click(within(form()).getByRole('button', { name: '重新检查当前状态' }));
   const finish = control.finish!;
   await click(within(form()).getByRole('button', { name: '取消' }));
   await click(screen.getAllByRole('button', { name: '添加域名' })[0]);
   fireEvent.change(within(form()).getByPlaceholderText('go.example.com'), { target: { value: 'other.example.com' } });
-  const vpn = within(form()).getByRole('checkbox', { name: '兼容 VPN 网络' }) as HTMLInputElement;
+  const vpn = within(form()).getByRole('checkbox', { name: '直接使用公共 DNS（手动兼容 VPN）' }) as HTMLInputElement;
   if (vpn.checked) await click(vpn);
   await act(async () => { finish(); });
   expect(within(form()).queryByRole('button', { name: '查看接入计划' })).toBeNull();
   control.defer = false;
-  await click(within(form()).getByRole('button', { name: '检查并接入' }));
+  await click(within(form()).getByRole('button', { name: '检查并继续' }));
   expect(control.calls.filter(call => call.action === 'prepare_domain').at(-1)?.payload).toMatchObject({ input: 'other.example.com', dnsMode: 'system' });
   expect(applies()).toHaveLength(0);
 });
 
 it('does not unlock cancellation or refresh after expiry while a native apply is pending', async () => {
-  await open(); await click(within(form()).getByRole('button', { name: '检查并接入' }));
-  await click(within(form()).getByRole('button', { name: '查看接入计划' }));
+  await open(); await click(within(form()).getByRole('button', { name: '检查并继续' }));
   await click(within(form()).getByRole('button', { name: '确认使用此目录' }));
   await act(async () => { vi.advanceTimersByTime(300001); });
   const dialog = form();
@@ -161,7 +159,7 @@ it('does not unlock cancellation or refresh after expiry while a native apply is
 
 it('sends an already expired automatic DNS plan back to explicit preparation, not apply', async () => {
   control.dnsRepair = true; control.ttl = -1; await open();
-  await click(within(form()).getByRole('button', { name: '检查并接入' }));
+  await click(within(form()).getByRole('button', { name: '检查并继续' }));
   expect(screen.queryByRole('dialog', { name: '修复 DNS' })).toBeNull(); checkDraft();
   expect(within(form()).getByRole('button', { name: '重新检查当前状态' })).toBeTruthy();
   control.ttl = 300000;

@@ -23,9 +23,11 @@ async function openPreparedDomain() {
   const dialog=screen.getByRole('dialog',{name:'添加域名'});
   fireEvent.change(within(dialog).getByPlaceholderText('go.example.com'),{target:{value:'old.example.com'}});
   fireEvent.change(within(dialog).getByRole('combobox',{name:'Cloudflare 账户'}),{target:{value:'a'}});
-  fireEvent.click(within(dialog).getByRole('button',{name:'检查并接入'}));
-  await within(dialog).findByRole('button',{name:'查看接入计划'});
-  return dialog;
+  fireEvent.click(within(dialog).getByRole('button',{name:'检查并继续'}));
+  const plan=await screen.findByRole('button',{name:'确认并执行'});
+  expect(plan).toBeTruthy();
+  fireEvent.click(screen.getByRole('button',{name:'返回'}));
+  return screen.getByRole('dialog',{name:'添加域名'});
 }
 
 it('refreshes zones, keeps the draft, and invalidates the prepared domain plan',async()=>{
@@ -137,7 +139,7 @@ it('shows a direct domain-check failure without claiming the check completed',as
   fireEvent.click(screen.getAllByRole('button',{name:'添加域名'})[0]);
   const dialog=screen.getByRole('dialog',{name:'添加域名'});
   fireEvent.change(within(dialog).getByPlaceholderText('go.example.com'),{target:{value:'blocked.example.com'}});
-  fireEvent.click(within(dialog).getByRole('button',{name:'检查并接入'}));
+  fireEvent.click(within(dialog).getByRole('button',{name:'检查并继续'}));
   const alert=await within(dialog).findByRole('alert');
   expect(alert.textContent).toContain('Error: 无权读取此域名');
   expect(alert.textContent).not.toContain('检查完成');

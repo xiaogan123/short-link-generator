@@ -141,8 +141,11 @@ it('marks manual links and clears a prepared domain plan after input changes',as
   fireEvent.click(screen.getByRole('button',{name:'添加域名'}));
   const domain=screen.getByRole('dialog',{name:'添加域名'});
   fireEvent.change(within(domain).getByPlaceholderText('go.example.com'),{target:{value:'sub.example.com'}});
-  fireEvent.click(within(domain).getByRole('button',{name:'检查并接入'}));
-  expect(await within(domain).findByRole('button',{name:'查看接入计划'})).toBeTruthy();
-  fireEvent.change(within(domain).getByPlaceholderText('go.example.com'),{target:{value:'other.example.com'}});
-  expect(within(domain).queryByRole('button',{name:'查看接入计划'})).toBeNull();
+  fireEvent.click(within(domain).getByRole('button',{name:'检查并继续'}));
+  expect(await screen.findByRole('button',{name:'确认并执行'})).toBeTruthy();
+  fireEvent.click(screen.getByRole('button',{name:'返回'}));
+  const restored=screen.getByRole('dialog',{name:'添加域名'});
+  expect(within(restored).getByRole('button',{name:'查看接入计划'})).toBeTruthy();
+  fireEvent.change(within(restored).getByPlaceholderText('go.example.com'),{target:{value:'other.example.com'}});
+  expect(within(restored).queryByRole('button',{name:'查看接入计划'})).toBeNull();
 });

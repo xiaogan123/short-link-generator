@@ -32,7 +32,8 @@ describe('visible local detection provenance',()=>{
     expect(within(dialog).getByText(/VPN、TUN 和网络策略仍会影响结果；未开启大陆监测时不能代表中国大陆网络/)).toBeTruthy();
     fireEvent.click(within(dialog).getByRole('button',{name:'完成'}));
     const row=screen.getByText(label,{exact:false});
-    expect(row.classList.contains(tone)).toBe(true);
-    expect(row.textContent).toContain('本机');
+    expect(row.classList.contains(`slg-check-${tone}`)).toBe(true);
+    expect(row.closest('.slg-check-info')?.textContent).toContain('本机网络');
+    expect(row.closest('.slg-check-info')?.textContent).toContain('上次检测');
   });
 });

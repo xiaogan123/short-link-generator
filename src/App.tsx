@@ -14,7 +14,6 @@ import {
   Clipboard,
   CloudArrowDown,
   CloudArrowUp,
-  Copy,
   Globe,
   Key,
   LinkSimple,
@@ -54,6 +53,7 @@ import type {
 import "./styles.css";
 import Dialog from "./Dialog";
 import Pools from "./Pools";
+import LinkGroups from "./LinkGroups";
 
 type Page = "links" | "pools" | "domains" | "accounts";
 type LinkDraft = {
@@ -143,11 +143,24 @@ function domainCheckLevel(check: DomainPreparation["checks"][number]) {
 }
 function domainOutcome(preparation: DomainPreparation) {
   const levels = preparation.checks.map(domainCheckLevel);
+  if (hasOnlyNetworkBlocker(preparation))
+    return { level: "warning", label: "网络检查未完成" };
   return levels.includes("error")
     ? { level: "error", label: "需要先处理" }
     : levels.includes("warning")
       ? { level: "warning", label: "确认后可接入" }
       : { level: "pass", label: "可用" };
+}
+function hasOnlyNetworkBlocker(preparation: DomainPreparation) {
+  const errors = preparation.checks.filter(
+    (check) => domainCheckLevel(check) === "error",
+  );
+  return !preparation.canApply && errors.length > 0 && errors.every((check) =>
+    ["virtual_dns_address", "dns_timeout", "dns_failed", "public_dns_timeout", "public_dns_failed"].includes(check.reason || ""),
+  );
+}
+function isDomainCredentialError(message: string) {
+  return /HTTP 401|HTTP 403|令牌|凭据|授权|权限/.test(message);
 }
 function hasOnlyDnsBlocker(preparation: DomainPreparation) {
   const errors = preparation.checks.filter(
@@ -170,10 +183,6 @@ function hasOnlyVirtualDnsBlocker(preparation: DomainPreparation) {
   return !preparation.canApply && errors.length > 0 &&
     errors.every((check) => check.reason === "virtual_dns_address");
 }
-function poolTargetUrl(prefix: string, suffix: string, code = "") {
-  return `${prefix}${encodeURIComponent(code)}${suffix}`;
-}
-
 function isSelftestRecovery(kind: PendingAction["kind"]) {
   return kind === "resume_selftest_rotation" || kind === "recover_selftest_rotation" || kind === "recover_selftest_resources";
 }
@@ -190,6 +199,7 @@ export default function App() {
   const busy = working || mutation !== null;
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
+  const [domainSuccessId, setDomainSuccessId] = useState("");
   const [search, setSearch] = useState("");
   const [filter, setFilter] = useState("all");
   const [linkDraft, setLinkDraft] = useState<LinkDraft | null>(null);
@@ -206,9 +216,10 @@ export default function App() {
   const [domainBusy, setDomainBusy] = useState(false);
   const [domainAutomaticDns, setDomainAutomaticDns] = useState(false);
   const [domainFeedback, setDomainFeedback] = useState<{
-    tone: "error" | "success" | "progress";
+    tone: "error" | "success" | "progress" | "warning";
     message: string;
   } | null>(null);
+  const [duplicateDomainId, setDuplicateDomainId] = useState("");
   const [preflight, setPreflight] = useState<DomainPreparation | null>(null);
   const [dnsPreflight, setDnsPreflight] = useState<DomainDnsPreparation | null>(
     null,
@@ -343,7 +354,7 @@ export default function App() {
     return () => window.clearTimeout(timer);
   }, [isDomainPlan, plan?.expiresAt, preflight?.plan?.expiresAt, dnsPreflight?.plan?.expiresAt]);
   useEffect(() => {
-    if (!notice) return;
+    if (!notice || notice.startsWith("域名已接入。")) return;
     const id = window.setTimeout(() => setNotice(""), 5000);
     return () => clearTimeout(id);
   }, [notice]);
@@ -556,6 +567,9 @@ export default function App() {
         planKind === "save_link" && linkDraft ? { ...linkDraft } : null;
       const dnsSnapshot =
         appliedKind === "fix_domain_dns" ? { ...domainDraftRef.current } : null;
+      const addedHost = appliedKind === "add_domain"
+        ? normalizeHost(domainDraftRef.current.input)
+        : "";
       const takeover = Boolean(plan.domainTakeoverConfirmation);
       const next = await run(
         () =>
@@ -581,6 +595,9 @@ export default function App() {
       if (next) {
         stateRef.current = next;
         setState(next);
+        if (appliedKind === "add_domain") {
+          setDomainSuccessId(next.domains.find((domain) => domain.host === addedHost)?.id || "");
+        }
         setPoolHealth({});
         if (appliedKind === "save_pool") setPoolSavedRevision((n) => n + 1);
         setPlan(null);
@@ -606,7 +623,6 @@ export default function App() {
           domainDraftRef.current.accountId === dnsSnapshot.accountId
         )
           void refreshDomainPreparation(dnsSnapshot, {
-            openPlanWhenReady: true,
             repairAlreadyApplied: true,
           });
         if (savedLink) {
@@ -641,7 +657,7 @@ export default function App() {
         ).writeText(value);
     }, "已复制短链接。");
   }
-  function openLink(link?: Link, usePlatform = false) {
+  function openLink(link?: Link, usePlatform = false, preferredDomainId?: string) {
     linkPrepareSequence.current += 1;
     setError("");
     setCopySource(null);
@@ -659,7 +675,9 @@ export default function App() {
             code: link.code || "",
           }
         : {
-            domainId: state.domains[0]?.id || "",
+            domainId: state.domains.find((domain) => domain.id === preferredDomainId)?.id ||
+              state.domains.find((domain) => domain.id === filter)?.id ||
+              state.domains[0]?.id || "",
             slug: "",
             cnUrl: "",
             defaultUrl: "",
@@ -766,6 +784,7 @@ export default function App() {
     setDnsPreflight(null);
     setDomainAutomaticDns(false);
     setDomainFeedback(null);
+    setDuplicateDomainId("");
     setError("");
   }
   function finishDomainOperation() {
@@ -846,7 +865,6 @@ export default function App() {
   async function refreshDomainPreparation(
     draft = domainDraftRef.current,
     options: {
-      openPlanWhenReady?: boolean;
       repairAlreadyApplied?: boolean;
     } = {},
   ) {
@@ -857,6 +875,24 @@ export default function App() {
       return;
     }
     const host = normalizeHost(draft.input);
+    const existingDomain = stateRef.current.domains.find((domain) => domain.host === host);
+    if (existingDomain) {
+      domainCheckSequence.current += 1;
+      domainOperation.current.sequence += 1;
+      setPlan(null);
+      setPlanKind("");
+      setPreflight(null);
+      setDnsPreflight(null);
+      setDomainAutomaticDns(false);
+      setMigrationAccountId(null);
+      setDuplicateDomainId(existingDomain.id);
+      setDomainFeedback({
+        tone: "warning",
+        message: `${host} 已接入 /${existingDomain.prefix}/ 目录。一个主机名只能接入一个链接目录；请查看已有域名或直接创建短链接。`,
+      });
+      return;
+    }
+    setDuplicateDomainId("");
     const cachedAccounts = stateRef.current.accounts.filter((account) =>
       account.zones?.some((zone) =>
         zone.status === "active" &&
@@ -941,7 +977,7 @@ export default function App() {
         ))
       )
         return;
-      if (!result.canApply && hasOnlyDnsBlocker(result)) {
+      if (!result.canApply && hasOnlyDnsBlocker(result) && !hasOnlyNetworkBlocker(result)) {
         setPreflight(result);
         if (!snapshot.accountId) {
           setDomainFeedback({
@@ -1020,7 +1056,7 @@ export default function App() {
         setPreflight(result);
         setDnsPreflight(null);
         setDomainFeedback(null);
-        if (options.openPlanWhenReady && result.canApply && result.plan)
+        if (result.canApply && result.plan)
           openDomainPlan(result);
       }
     } catch (e) {
@@ -1722,7 +1758,7 @@ export default function App() {
     });
   }
 
-  function detectionLabel(link: Link) {
+  function detectionLabel(link: Link): {tone: "slate" | "amber" | "red" | "green"; label: string} {
     const record = detections[detectionKey(link)];
     if (!record) return { tone: "slate", label: "未检测" };
     if (
@@ -1764,7 +1800,7 @@ export default function App() {
       links: state.links.filter(
         (link) =>
           link.domainId === domain.id &&
-          `${link.slug} ${link.cnUrl} ${link.defaultUrl} ${state.pools?.find((p) => p.id === link.poolId)?.name || ""} ${domain.host}`
+          `${link.slug} ${link.cnUrl} ${link.defaultUrl} ${link.code || ""} ${state.pools?.find((p) => p.id === link.poolId)?.name || ""} ${domain.host}`
             .toLowerCase()
             .includes(search.trim().toLowerCase()),
       ),
@@ -1962,6 +1998,20 @@ export default function App() {
             <div role="status" className="alert success">
               <CheckCircle size={19} />
               <span>{notice}</span>
+              {notice.startsWith("域名已接入。") && state.domains.some((domain) => domain.id === domainSuccessId) && (
+                <button
+                  className="button secondary"
+                  disabled={busy}
+                  onClick={() => {
+                    setPage("links");
+                    setFilter(domainSuccessId);
+                    openLink(undefined, false, domainSuccessId);
+                    setNotice("");
+                  }}
+                >
+                  为新域名创建短链接
+                </button>
+              )}
               <button aria-label="关闭通知" onClick={() => setNotice("")}>
                 <X size={16} />
               </button>
@@ -2107,7 +2157,7 @@ export default function App() {
                         aria-label="搜索链接"
                         value={search}
                         onChange={(e) => setSearch(e.target.value)}
-                        placeholder="搜索路径或目标地址"
+                        placeholder="搜索短链接、平台或邀请码"
                       />
                     </label>
                     <label className="select-wrap">
@@ -2145,7 +2195,7 @@ export default function App() {
                       </button>
                     }
                   />
-                ) : !groups.length || groups.every((g) => !g.links.length) ? (
+                ) : !groups.length ? (
                   <Empty
                     icon={<LinkSimple size={28} />}
                     title={search ? "没有匹配的链接" : "还没有短链接"}
@@ -2167,219 +2217,27 @@ export default function App() {
                     }
                   />
                 ) : (
-                  <div className="link-groups">
-                    {groups.map(({ domain, links }) => (
-                      <div className="domain-group" key={domain.id}>
-                        <div className="group-heading">
-                          <div>
-                            <Globe size={17} />
-                            <strong>{domain.host}</strong>
-                            <span>/{domain.prefix}/</span>
-                          </div>
-                          <small>{links.length} 条链接</small>
-                        </div>
-                        <div className="table-scroll">
-                          <table>
-                            <thead>
-                              <tr>
-                                <th>链接</th>
-                                <th>地区目标</th>
-                                <th>最后更新</th>
-                                <th>操作</th>
-                              </tr>
-                            </thead>
-                            <tbody>
-                              {links.map((link) => (
-                                <tr key={link.slug}>
-                                  <td>
-                                    <div className="link-name">
-                                      <strong>/{link.slug}</strong>
-                                      <span>
-                                        {shortUrl(
-                                          domain.host,
-                                          domain.prefix,
-                                          link.slug,
-                                        )}
-                                      </span>
-                                      <small className="link-source">
-                                        {link.poolId
-                                          ? "跟随平台地址"
-                                          : "手动地址"}
-                                      </small>
-                                      {link.poolId && (
-                                        <small className="pool-link-tag">
-                                          平台地址：
-                                          {state.pools?.find(
-                                            (p) => p.id === link.poolId,
-                                          )?.name || "已移除"}{" "}
-                                          · 邀请码：{link.code}
-                                        </small>
-                                      )}
-                                      <small
-                                        className={`link-detection ${detectionLabel(link).tone}`}
-                                        title={
-                                          detections[detectionKey(link)]
-                                            ?.checkedAt
-                                            ? `${targetSourceLabel(detections[detectionKey(link)].targets.dnsMode)}结果于 ${formatDate(detections[detectionKey(link)].checkedAt)}`
-                                            : undefined
-                                        }
-                                      >
-                                        {detectionLabel(link).label}
-                                        {detections[detectionKey(link)] &&
-                                          ` · ${targetSourceLabel(detections[detectionKey(link)].targets.dnsMode)} · ${formatDate(detections[detectionKey(link)].checkedAt)}`}
-                                      </small>
-                                    </div>
-                                  </td>
-                                  <td>
-                                    <div className="route-lines">
-                                      {link.poolId ? (
-                                        (() => {
-                                          const pool = state.pools?.find(
-                                            (item) => item.id === link.poolId,
-                                          );
-                                          if (!pool)
-                                            return (
-                                              <span>
-                                                <b>平台地址</b>
-                                                <span>平台地址已移除</span>
-                                              </span>
-                                            );
-                                          const official = poolTargetUrl(
-                                            pool.official.prefix,
-                                            pool.official.suffix,
-                                            link.code,
-                                          );
-                                          const enabledCount =
-                                            pool.candidates.filter(
-                                              (candidate) => candidate.enabled,
-                                            ).length;
-                                          return (
-                                            <>
-                                              <span>
-                                                <b>官网链接</b>
-                                                <span title={official}>
-                                                  {official}
-                                                </span>
-                                              </span>
-                                              <details className="advanced">
-                                                <summary>
-                                                  大陆地址 · 已启用 {enabledCount} 个
-                                                </summary>
-                                                <div className="pool-health-row">
-                                                  {pool.candidates.map(
-                                                    (candidate, index) => {
-                                                      const url = poolTargetUrl(
-                                                        candidate.prefix,
-                                                        candidate.suffix,
-                                                        link.code,
-                                                      );
-                                                      return (
-                                                        <div key={candidate.id}>
-                                                          <strong>
-                                                            {index === 0
-                                                              ? "首选"
-                                                              : `备用 ${index}`}
-                                                            {!candidate.enabled &&
-                                                              "（已停用）"}
-                                                          </strong>{" "}
-                                                          · <code title={url}>{url}</code>
-                                                        </div>
-                                                      );
-                                                    },
-                                                  )}
-                                                </div>
-                                              </details>
-                                            </>
-                                          );
-                                        })()
-                                      ) : (
-                                        <>
-                                          <span>
-                                            <b>大陆</b>
-                                            <span title={link.cnUrl}>
-                                              {link.cnUrl}
-                                            </span>
-                                          </span>
-                                          <span>
-                                            <b>其他地区</b>
-                                            <span title={link.defaultUrl}>
-                                              {link.defaultUrl}
-                                            </span>
-                                          </span>
-                                        </>
-                                      )}
-                                    </div>
-                                  </td>
-                                  <td className="date-cell">
-                                    {formatDate(link.updated)}
-                                  </td>
-                                  <td>
-                                    <div className="row-actions">
-                                      <button
-                                        title="复制"
-                                        aria-label={`复制 ${link.slug}`}
-                                        onClick={() =>
-                                          void copy(
-                                            shortUrl(
-                                              domain.host,
-                                              domain.prefix,
-                                              link.slug,
-                                            ),
-                                          )
-                                        }
-                                      >
-                                        <Copy size={15} />
-                                        复制
-                                      </button>
-                                      <button
-                                        title="检测"
-                                        aria-label={`检测 ${link.slug}`}
-                                        onClick={() =>
-                                          void selftest(link, domain)
-                                        }
-                                      >
-                                        <ShieldCheck size={15} />
-                                        检测
-                                      </button>
-                                      {!link.poolId &&
-                                        Boolean(state.pools?.length) && (
-                                          <button
-                                            title="改为平台地址"
-                                            aria-label={`将 ${link.slug} 改为平台地址`}
-                                            onClick={() => openLink(link, true)}
-                                          >
-                                            改为平台地址
-                                          </button>
-                                        )}
-                                      <button
-                                        title="编辑"
-                                        aria-label={`编辑 ${link.slug}`}
-                                        onClick={() => openLink(link)}
-                                      >
-                                        编辑
-                                      </button>
-                                      <button
-                                        title="删除"
-                                        aria-label={`删除 ${link.slug}`}
-                                        onClick={() =>
-                                          void prepare("delete_link", {
-                                            domainId: domain.id,
-                                            slug: link.slug,
-                                          })
-                                        }
-                                      >
-                                        删除
-                                      </button>
-                                    </div>
-                                  </td>
-                                </tr>
-                              ))}
-                            </tbody>
-                          </table>
-                        </div>
-                      </div>
-                    ))}
-                  </div>
+                  <LinkGroups
+                    groups={groups}
+                    pools={state.pools || []}
+                    getDetection={(link) => {
+                      const record = detections[detectionKey(link)];
+                      return {
+                        ...detectionLabel(link),
+                        ...(record ? {
+                          detail: `上次检测 ${formatDate(record.checkedAt)} · ${targetSourceLabel(record.targets.dnsMode)}`,
+                        } : {}),
+                      };
+                    }}
+                    onCopy={(url) => void copy(url)}
+                    onCheck={(link, domain) => void selftest(link, domain)}
+                    onEdit={openLink}
+                    onDelete={(link, domain) => void prepare("delete_link", {
+                      domainId: domain.id,
+                      slug: link.slug,
+                    })}
+                    onCreate={(domainId) => openLink(undefined, false, domainId)}
+                  />
                 )}
               </section>
               <p className="page-footnote">
@@ -2493,6 +2351,18 @@ export default function App() {
                           </span>
                         </div>
                         <div className="card-actions">
+                          {!state.links.some((link) => link.domainId === domain.id) && (
+                            <button
+                              className="button secondary"
+                              onClick={() => {
+                                setPage("links");
+                                setFilter(domain.id);
+                                openLink(undefined, false, domain.id);
+                              }}
+                            >
+                              创建第一条短链接
+                            </button>
+                          )}
                           <button
                             className="button ghost"
                             onClick={() => {
@@ -2847,7 +2717,7 @@ export default function App() {
           title="添加域名"
           eyebrow="DOMAIN SETUP"
           error={domainErrorMessage(error)}
-          errorAction={domainMigrationAccount ? undefined : migrationAction() || domainRecoveryActions()}
+          errorAction={domainMigrationAccount ? undefined : migrationAction() || (isDomainCredentialError(error) ? domainRecoveryActions() : undefined)}
           dismissDisabled={mutation === "prepare_credentials"}
           status={
             domainFeedback ? (
@@ -2856,7 +2726,7 @@ export default function App() {
                 className={`domain-feedback ${domainFeedback.tone}`}
               >
                 <span>{domainFeedback.message}</span>
-                {domainFeedback.tone === "error" && domainRecoveryActions()}
+                {domainFeedback.tone === "error" && isDomainCredentialError(domainFeedback.message) && domainRecoveryActions()}
               </div>
             ) : domainPreparationExpired ? (
               <div role="status" className="domain-feedback error">
@@ -2896,7 +2766,7 @@ export default function App() {
                     ? "检查中…"
                     : preflight || dnsPreflight || domainFeedback?.message === expiredDomainPlanMessage
                       ? "重新检查当前状态"
-                      : "检查并接入"}
+                      : "检查并继续"}
                 </button>
               )}
             </>
@@ -3007,6 +2877,32 @@ export default function App() {
                 </small>
               </label>
             </div>
+            {duplicateDomainId && state.domains.some((domain) => domain.id === duplicateDomainId) && (
+              <div className="domain-duplicate-actions">
+                <button
+                  type="button"
+                  className="button secondary"
+                  onClick={() => {
+                    closeDomain();
+                    setPage("domains");
+                  }}
+                >
+                  查看已有域名
+                </button>
+                <button
+                  type="button"
+                  className="button primary"
+                  onClick={() => {
+                    closeDomain();
+                    setPage("links");
+                    setFilter(duplicateDomainId);
+                    openLink(undefined, false, duplicateDomainId);
+                  }}
+                >
+                  为已有域名创建短链接
+                </button>
+              </div>
+            )}
             {domainMigrationAccount && (
               <div className="warning-box">
                 <p>「{domainMigrationAccount.label}」需要更新本机授权后才能读取域名。当前输入会保留。</p>
@@ -3031,18 +2927,20 @@ export default function App() {
               带 www 和不带 www
               的域名需要分别添加。未启用域名不会出现在可选列表中。
             </p>
-            <div className="form-note">
-              <label className="checkbox-label">
+            <p className="form-note">会先按本机网络检查；若 VPN 返回虚拟地址，会自动用公共 DNS 重查一次。</p>
+            <details className="domain-network-options">
+              <summary>网络检查选项</summary>
+              <label className="domain-network-checkbox">
                 <input type="checkbox" checked={domainDraft.dnsMode === "public"} disabled={domainBusy}
                   onChange={(event) => {
                     setDomainDraft({...domainDraft, dnsMode: event.target.checked ? "public" : "system"});
                     invalidateDomainPreparation();
                   }} />
-                兼容 VPN 网络
+                直接使用公共 DNS（手动兼容 VPN）
               </label>
-              <small>默认先用系统 DNS；仅发现 VPN 虚拟地址时自动重查一次。勾选可直接使用公共 DNS。公共查询只向 Cloudflare 发送域名，不发送账户令牌，不更改你的 DNS 或 VPN 设置。</small>
-              {domainAutomaticDns && <p role="status">本次已自动切换为公共 DNS；接入计划将按同一方式复核，仍需确认后才会接入。</p>}
-            </div>
+              <small>公共查询只向 Cloudflare 发送域名，不发送账户令牌，也不会更改本机 DNS 或 VPN 设置。</small>
+            </details>
+            {domainAutomaticDns && <p role="status" className="inline-warning">本次已自动切换为公共 DNS；接入计划会用同一方式复核，仍需确认后才会接入。</p>}
             {preflight && (
               <div className="preflight">
                 {(() => {
@@ -3081,6 +2979,13 @@ export default function App() {
                     );
                   })}
                 </div>
+                {hasOnlyNetworkBlocker(preflight) && (
+                  <p className="inline-warning">
+                    {preflight.dnsMode === "public"
+                      ? "公共 DNS 仍未完成网络验证。请检查 VPN 或网络连接后重新检查；域名尚未接入。"
+                      : "本机网络未完成验证。请检查网络或 VPN 后重新检查；域名尚未接入。"}
+                  </p>
+                )}
                 {preflight.candidates.length > 1 && (
                   <label>
                     选择账户与区域

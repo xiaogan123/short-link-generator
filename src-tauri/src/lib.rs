@@ -1800,6 +1800,22 @@ impl Backend {
                 suggestions[rand::thread_rng().gen_range(0..suggestions.len())].to_string()
             });
         validate_prefix(&prefix)?;
+        if self.db.domains.iter().any(|domain| domain.host == host) {
+            return Ok(serde_json::to_value(DomainPreparation {
+                host,
+                prefix,
+                dns_mode: dns_mode.as_str().into(),
+                candidates: Vec::new(),
+                checks: vec![domain_check::hard_check(
+                    "本机配置",
+                    false,
+                    "这个主机名已经添加；请查看已有域名或直接创建短链接",
+                )],
+                can_apply: false,
+                plan: None,
+            })
+            .unwrap_or(Value::Null));
+        }
         let choice = payload["accountId"].as_str();
         let candidates = self.domain_candidates(&host, choice).await?;
         let selected = if candidates.len() == 1 && choice.is_none() {
@@ -1809,13 +1825,7 @@ impl Backend {
         };
         let mut checks = Vec::new();
         let mut plan = None;
-        if self.db.domains.iter().any(|d| d.host == host) {
-            checks.push(domain_check::hard_check(
-                "本机配置",
-                false,
-                "这个主机名已经添加",
-            ));
-        } else if candidates.is_empty() {
+        if candidates.is_empty() {
             checks.push(domain_check::hard_check(
                 "域名归属",
                 false,
@@ -7150,6 +7160,33 @@ mod tests {
             .iter()
             .any(|candidate| candidate.account_id == "acct1"));
         assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn duplicate_domain_preparation_stays_local_with_cold_cache_and_other_account() {
+        let (server, mut backend, _dir) = fixture().await;
+        backend.db.domains.push(domain());
+        backend.db.accounts[0].zones.clear();
+        backend.db.accounts[0].mac_credential_schema = 0;
+        let mut other = backend.db.accounts[0].clone();
+        other.id = "acct2".into();
+        backend.db.accounts.push(other);
+        for (prefix, account_id) in [("other", "acct1"), ("go", "acct2")] {
+            let result = backend
+                .dispatch(
+                    "prepare_domain",
+                    &json!({"input":"https://EXAMPLE.com/previous/path","prefix":prefix,"accountId":account_id}),
+                )
+                .await
+                .unwrap();
+            assert_eq!(result["host"], "example.com");
+            assert_eq!(result["canApply"], false);
+            assert!(result["plan"].is_null());
+            assert_eq!(result["checks"][0]["label"], "本机配置");
+        }
+        assert!(mock_key_reads().lock().unwrap().is_empty());
+        assert!(server.received_requests().await.unwrap().is_empty());
+        assert!(backend.plans.is_empty());
     }
 
     #[tokio::test]

@@ -498,6 +498,13 @@ button:disabled{opacity:0.72;}
 .domain-feedback.progress{background:#edf4f0;color:#285c49;border:1px solid #cce0d4;}
 .domain-feedback.success{background:#e8f3eb;color:#226846;border:1px solid #c6decf;}
 .domain-feedback.error{background:#f9e9e5;color:#8b3428;border:1px solid #e9c9c2;}
+.domain-feedback.warning{background:#fbf2e3;color:#795718;border:1px solid #e9d5a9;}
+.domain-duplicate-actions{display:flex;flex-wrap:wrap;gap:8px;}
+.domain-network-options{padding:10px 12px;border:1px solid #dce7d8;border-radius:7px;background:#f7faf5;font-size:11px;color:#536b59;}
+.domain-network-options summary{cursor:pointer;font-weight:700;}
+.form-grid .domain-network-checkbox{display:flex;align-items:center;gap:8px;margin-top:11px;font-weight:500;cursor:pointer;}
+.domain-network-checkbox input{flex:0 0 auto;margin:0;accent-color:#106c4c;}
+.domain-network-options small{display:block;margin-top:8px;line-height:1.6;}
 @media (max-width:520px){.domain-list-refresh{align-items:flex-start;flex-direction:column;}
 .domain-feedback{align-items:stretch;flex-direction:column;}
 .domain-feedback-actions{justify-content:flex-start;}

@@ -34,10 +34,19 @@ vi.mock('./bridge',()=>({
 
 afterEach(cleanup);
 
+it('finds a platform link by its own invitation code and keeps the other links out of the result',async()=>{
+  render(<App/>);
+  await screen.findByRole('heading',{name:'短链接'});
+  fireEvent.change(screen.getByRole('textbox',{name:'搜索链接'}),{target:{value:'DEMO_2'}});
+  expect(screen.getByText('/platform-two')).toBeTruthy();
+  expect(screen.queryByText('/platform-one')).toBeNull();
+  expect(screen.queryByText('/manual')).toBeNull();
+});
+
 it('shows the platform official target and expands every mainland template with each link own code',async()=>{
   render(<App/>);
   await screen.findByRole('heading',{name:'短链接'});
-  const first=screen.getByText('/platform-one').closest('tr') as HTMLElement;
+  const first=screen.getByText('/platform-one').closest('article') as HTMLElement;
   expect(within(first).getByText('官网链接')).toBeTruthy();
   expect(first.textContent).toContain('https://example.com/register?code=DEMO&from=short-link');
   expect(first.textContent).not.toContain('https://stale.example/cn-one');
@@ -45,16 +54,17 @@ it('shows the platform official target and expands every mainland template with 
   fireEvent.click(within(first).getByText('大陆地址 · 已启用 2 个'));
   expect(first.textContent).toContain('https://example.org/mainland/primary/DEMO');
   expect(first.textContent).toContain('https://example.org/mainland/backup/DEMO?source=demo');
-  expect(first.textContent).toContain('备用 2（已停用）');
+  expect(first.textContent).toContain('备用 2');
+  expect(within(first).getByText('已停用')).toBeTruthy();
   const longTarget=within(first).getByTitle('https://example.org/mainland/backup/DEMO?source=demo');
-  expect(longTarget.closest('.pool-health-row')).toBeTruthy();
+  expect(longTarget.closest('.slg-candidate-list')).toBeTruthy();
 
-  const second=screen.getByText('/platform-two').closest('tr') as HTMLElement;
+  const second=screen.getByText('/platform-two').closest('article') as HTMLElement;
   fireEvent.click(within(second).getByText('大陆地址 · 已启用 2 个'));
   expect(second.textContent).toContain('https://example.org/mainland/primary/DEMO_2');
   expect(second.textContent).not.toContain('https://example.org/mainland/primary/DEMO ');
 
-  const manual=screen.getByText('/manual').closest('tr') as HTMLElement;
+  const manual=screen.getByText('/manual').closest('article') as HTMLElement;
   expect(manual.textContent).toContain('大陆');
   expect(manual.textContent).toContain('https://example.com/manual-cn');
   expect(manual.textContent).toContain('其他地区');
