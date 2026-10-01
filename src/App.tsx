@@ -131,6 +131,10 @@ function formatDate(value: string | null) {
         minute: "2-digit",
       }).format(d);
 }
+const expiredDomainPlanMessage = "计划已过期，请重新检查当前状态；域名、账户和网络方式已保留。";
+function isCurrentPlan(plan: Plan | null | undefined) {
+  return Boolean(plan && Number.isFinite(Date.parse(plan.expiresAt)) && Date.parse(plan.expiresAt) > Date.now());
+}
 function targetSourceLabel(dnsMode?: TargetReport["dnsMode"]) {
   return preview ? "本地预览 · 未探测" : dnsMode === "public" ? "本机网络 · 公共 DNS" : "本机网络";
 }
@@ -253,6 +257,11 @@ export default function App() {
   const [manageAccount, setManageAccount] = useState<Account | null>(null);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [clock, setClock] = useState(Date.now());
+  const isDomainPlan = planKind === "add_domain" || planKind === "fix_domain_dns";
+  const domainPreparationExpired = Boolean(
+    (preflight?.plan && !isCurrentPlan(preflight.plan)) ||
+    (dnsPreflight?.plan && !isCurrentPlan(dnsPreflight.plan)),
+  );
   const stateRef = useRef(state);
   const linkDraftRef = useRef(linkDraft);
   const linkPrepareSequence = useRef(0);
@@ -302,6 +311,18 @@ export default function App() {
     const timer = window.setInterval(() => setClock(Date.now()), 60000);
     return () => window.clearInterval(timer);
   }, []);
+  useEffect(() => {
+    const now = Date.now();
+    const expiry = Math.min(...[
+      isDomainPlan ? plan?.expiresAt : undefined,
+      preflight?.plan?.expiresAt,
+      dnsPreflight?.plan?.expiresAt,
+    ].map((value) => value ? Date.parse(value) : NaN)
+      .filter((value) => Number.isFinite(value) && value > now));
+    if (!Number.isFinite(expiry)) return;
+    const timer = window.setTimeout(() => setClock(Date.now()), expiry - now + 1);
+    return () => window.clearTimeout(timer);
+  }, [isDomainPlan, plan?.expiresAt, preflight?.plan?.expiresAt, dnsPreflight?.plan?.expiresAt]);
   useEffect(() => {
     if (!notice) return;
     const id = window.setTimeout(() => setNotice(""), 5000);
@@ -505,6 +526,10 @@ export default function App() {
     return Boolean(next && shouldAccept());
   }
   async function apply() {
+    if (plan && isDomainPlan && !isCurrentPlan(plan)) {
+      if (!mutationRef.current) expireDomainPlan();
+      return;
+    }
     await withMutation("apply", async () => {
       if (!plan) return;
       const appliedKind = planKind;
@@ -730,8 +755,18 @@ export default function App() {
   function isCurrentDomainOperation(sequence: number) {
     return sequence === domainOperation.current.sequence;
   }
+  function expireDomainPlan() {
+    invalidateDomainPreparation();
+    setPlan(null);
+    setDomainOpen(true);
+    setDomainFeedback({ tone: "error", message: expiredDomainPlanMessage });
+  }
   function openDomainPlan(result: DomainPreparation) {
     if (!result.plan) return;
+    if (!isCurrentPlan(result.plan)) {
+      expireDomainPlan();
+      return;
+    }
     setPlanKind("add_domain");
     setPlanDetails([
       `域名：${result.host}`,
@@ -743,6 +778,10 @@ export default function App() {
   }
   function openDnsPlan(result: DomainDnsPreparation) {
     if (!result.plan) return;
+    if (!isCurrentPlan(result.plan)) {
+      expireDomainPlan();
+      return;
+    }
     setPlanKind("fix_domain_dns");
     setPlanDetails([
       `主机名：${result.host}`,
@@ -1093,6 +1132,10 @@ export default function App() {
   }
   function returnFromPlan() {
     if (mutationRef.current === "apply") return;
+    if (plan && isDomainPlan && !isCurrentPlan(plan)) {
+      expireDomainPlan();
+      return;
+    }
     setPlan(null);
     if (planKind === "add_domain" || planKind === "fix_domain_dns")
       setDomainOpen(true);
@@ -2733,6 +2776,10 @@ export default function App() {
                 <span>{domainFeedback.message}</span>
                 {domainFeedback.tone === "error" && domainRecoveryActions()}
               </div>
+            ) : domainPreparationExpired ? (
+              <div role="status" className="domain-feedback error">
+                <span>{expiredDomainPlanMessage}</span>
+              </div>
             ) : domainBusy ? (
               <div role="status" className="domain-feedback progress">
                 <span>
@@ -2748,7 +2795,7 @@ export default function App() {
               <button className="button ghost" onClick={closeDomain} disabled={mutation === "prepare_credentials"}>
                 取消
               </button>
-              {preflight?.canApply && preflight.plan ? (
+              {preflight?.canApply && isCurrentPlan(preflight.plan) ? (
                 <button
                   className="button primary"
                   disabled={busy || domainBusy}
@@ -2765,7 +2812,7 @@ export default function App() {
                 >
                   {domainBusy
                     ? "检查中…"
-                    : preflight || dnsPreflight
+                    : preflight || dnsPreflight || domainFeedback?.message === expiredDomainPlanMessage
                       ? "重新检查当前状态"
                       : "检查并接入"}
                 </button>
@@ -3068,7 +3115,7 @@ export default function App() {
               <button
                 className="button primary"
                 onClick={() => void apply()}
-                disabled={busy || Date.parse(plan.expiresAt) < Date.now()}
+                disabled={busy || (isDomainPlan ? !isCurrentPlan(plan) : Date.parse(plan.expiresAt) < Date.now())}
               >
                 {busy
                   ? "正在提交…"
@@ -3126,9 +3173,15 @@ export default function App() {
                 </div>
               </div>
             )}
-            <small>
-              请在 {formatDate(plan.expiresAt)} 前确认；超时后需重新核对。
-            </small>
+            {isDomainPlan && mutation === "apply" ? (
+              <small>正在等待本次提交结果，请勿重复操作。</small>
+            ) : isDomainPlan && !isCurrentPlan(plan) ? (
+              <p role="status">计划已过期。请点击「返回」后重新检查当前状态；不会自动提交。</p>
+            ) : (
+              <small>
+                请在 {formatDate(plan.expiresAt)} 前确认；超时后需重新核对。
+              </small>
+            )}
           </div>
         </Dialog>
       )}
