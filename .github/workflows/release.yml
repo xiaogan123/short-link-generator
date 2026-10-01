@@ -106,6 +106,28 @@ jobs:
           else
             npm run tauri -- build --target ${{ matrix.target }} --config release-config.json --bundles ${{ matrix.bundles }}
           fi
+      - name: Download the pinned public Windows upgrade baseline
+        if: runner.os == 'Windows'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          $baselineDirectory = Join-Path $env:RUNNER_TEMP 'shortlink-upgrade-baseline'
+          New-Item -ItemType Directory -Path $baselineDirectory -ErrorAction Stop | Out-Null
+          gh release download v0.1.5 --repo "$env:GITHUB_REPOSITORY" --dir "$baselineDirectory" --pattern 'short-link-generator_0.1.5_windows-x86_64.exe' --pattern 'short-link-generator_0.1.5_windows-x86_64.exe.sig'
+          if ($LASTEXITCODE -ne 0) { throw 'Pinned Windows baseline download failed.' }
+      - name: Verify Windows installation upgrade and preserve configuration
+        id: windows_upgrade
+        if: runner.os == 'Windows'
+        env:
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+          RELEASE_SHA: ${{ needs.prepare.outputs.sha }}
+          SLG_UPDATER_PUBLIC_KEY: ${{ vars.UPDATER_PUBLIC_KEY }}
+        shell: pwsh
+        run: |
+          $baselineInstaller = Join-Path $env:RUNNER_TEMP 'shortlink-upgrade-baseline/short-link-generator_0.1.5_windows-x86_64.exe'
+          node scripts/windows-upgrade-smoke.mjs "$baselineInstaller" src-tauri/target/${{ matrix.target }}/release/bundle
+          if ($LASTEXITCODE -ne 0) { throw 'Native Windows upgrade verification failed.' }
       - name: Install and launch the candidate on its native runner
         id: native_smoke
         env:
@@ -129,7 +151,7 @@ jobs:
           fi
           node scripts/artifact-check.mjs src-tauri/target/${{ matrix.target }}/release/bundle
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        if: ${{ !cancelled() && steps.native_smoke.outcome == 'success' && steps.privacy.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.native_smoke.outcome == 'success' && steps.privacy.outcome == 'success' && (runner.os != 'Windows' || steps.windows_upgrade.outcome == 'success') }}
         with:
           name: candidate-${{ matrix.target }}
           path: src-tauri/target/${{ matrix.target }}/release/bundle

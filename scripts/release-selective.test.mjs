@@ -11,6 +11,7 @@ import { isAppInput, matchingAppInputs } from './release-app-inputs.mjs';
 import { updaterPublicKeySha256 } from './updater-signature.mjs';
 import { hash } from './macos-signature.mjs';
 import { readMacUpdater } from './macos-artifact.mjs';
+import { WINDOWS_UPGRADE_BASELINE } from './windows-upgrade-evidence.mjs';
 import { artifactEvidence, bundleEntries, CERT_PIN, nativeSigning, pack, testUpdaterSigner } from './test-fixtures/macos-artifact.mjs';
 
 const root = resolve('.');
@@ -21,12 +22,31 @@ const TEST_SIGNATURE = signer.sign(Buffer.from('test'));
 const TEST_ARCHIVE = pack(bundleEntries());
 const TEST_ARCHIVE_SIGNATURE = signer.sign(TEST_ARCHIVE);
 const TEST_PUBLIC_KEY_SHA256 = updaterPublicKeySha256(TEST_PUBLIC_KEY);
-function fixture() {
+function fixture(version = '0.1.1') {
   const dir = mkdtempSync(join(tmpdir(), 'release-selective-'));
-  writeFileSync(join(dir, 'package.json'), JSON.stringify({ version: '0.1.1', type: 'module' }));
+  writeFileSync(join(dir, 'package.json'), JSON.stringify({ version, type: 'module' }));
   return dir;
 }
 function put(path, value) { mkdirSync(resolve(path, '..'), { recursive: true }); writeFileSync(path, value); }
+// Assembly fixture only: the native checker, not these unit tests, observes Windows.
+function putSyntheticWindowsUpgrade(base, tag, sha, installer) {
+  const startup = { processAlive: true, windowObserved: true, startupSeconds: 2,
+    processExitedAfterObservation: true };
+  const evidence = { schema: 1, tag, sha, target: 'x86_64-pc-windows-msvc',
+    baselineTag: WINDOWS_UPGRADE_BASELINE.tag,
+    baselineInstallerSha256: WINDOWS_UPGRADE_BASELINE.installerSha256,
+    baselineSignatureSha256: WINDOWS_UPGRADE_BASELINE.signatureSha256,
+    installerSha256: digest(installer), updaterSignatureSha256: digest(`${installer}.sig`),
+    updaterPublicKeySha256: TEST_PUBLIC_KEY_SHA256, host: 'win32-x64',
+    checkedAt: '2026-10-01T00:00:00.000Z',
+    baselineBinarySha256: 'a'.repeat(64), candidateBinarySha256: 'b'.repeat(64),
+    startups: { baseline: startup, candidate: { ...startup } }, sameInstallDirectory: true,
+    syntheticConfigurationPreserved: true, nativeRoamingAndLocalDataVerified: true,
+    processExitConfirmed: true, nsisRegistrationAndShortcutsCleaned: true,
+    credentialContinuityTested: false,
+    scope: 'NSIS covering installation, exact executable versions, two native windows and saved synthetic configuration' };
+  put(join(base, 'windows-upgrade-smoke.json'), JSON.stringify(evidence));
+}
 
 test('dispatch selection defaults to Windows and preserves explicit native targets', () => {
   const dir = fixture();
@@ -80,11 +100,11 @@ test('native smoke selects signed packages and identifies x64 PE files', () => {
 });
 
 test('strict assembly checks source and artifact hashes and includes latest.json in SHA256SUMS', () => {
-  const dir = fixture();
+  const dir = fixture('0.1.6');
   try {
     const git = (...args) => execFileSync('git', args, { cwd: dir, stdio: 'pipe', encoding: 'utf8' }).trim();
     git('init', '-q'); git('config', 'user.name', 'Example'); git('config', 'user.email', 'example@example.org');
-    git('add', '.'); git('commit', '-qm', 'fixture'); git('tag', 'v0.1.1');
+    git('add', '.'); git('commit', '-qm', 'fixture'); git('tag', 'v0.1.6');
     const sha = git('rev-parse', 'HEAD');
     for (const target of ['aarch64-apple-darwin', 'x86_64-apple-darwin', 'x86_64-pc-windows-msvc']) {
       const base = join(dir, 'candidates', `candidate-${target}`);
@@ -94,7 +114,7 @@ test('strict assembly checks source and artifact hashes and includes latest.json
       put(installer, `installer-${target}`); put(updater, mac ? TEST_ARCHIVE : 'test');
       put(`${updater}.sig`, mac ? TEST_ARCHIVE_SIGNATURE : TEST_SIGNATURE);
       if (!mac) put(join(base, 'msi', 'Example.msi'), 'unverified alternate installer');
-      put(join(base, 'native-smoke.json'), JSON.stringify({ schema: 1, tag: 'v0.1.1', sha, target,
+      put(join(base, 'native-smoke.json'), JSON.stringify({ schema: 1, tag: 'v0.1.6', sha, target,
         host: target === 'aarch64-apple-darwin' ? 'darwin-arm64' : target === 'x86_64-apple-darwin' ? 'darwin-x64' : 'win32-x64',
         processAlive: true, updaterSignaturePresent: true, updaterSignatureVerified: true,
         updaterSignature: `${updater.split('/').at(-1)}.sig`, updaterSignatureSha256: digest(`${updater}.sig`),
@@ -105,10 +125,21 @@ test('strict assembly checks source and artifact hashes and includes latest.json
         updater: updater.split('/').at(-1), updaterSha256: digest(updater) }));
     }
     const run = (extraEnv = {}) => spawnSync(process.execPath, [join(root, 'scripts/release-manifest.mjs'), 'candidates', '--require-evidence'], {
-      cwd: dir, encoding: 'utf8', env: { ...process.env, RELEASE_TAG: 'v0.1.1', RELEASE_SHA: sha,
+      cwd: dir, encoding: 'utf8', env: { ...process.env, RELEASE_TAG: 'v0.1.6', RELEASE_SHA: sha,
         GITHUB_REPOSITORY: 'sample/short-link-generator', SLG_UPDATER_PUBLIC_KEY: TEST_PUBLIC_KEY, SLG_MACOS_CERT_SHA256: CERT_PIN, ...extraEnv },
     });
+    assert.match(run().stderr, /Missing exact Windows upgrade evidence/);
+    assert.equal(existsSync(join(dir, 'latest.json')), false);
+    const windowsBase = join(dir, 'candidates', 'candidate-x86_64-pc-windows-msvc');
+    putSyntheticWindowsUpgrade(windowsBase, 'v0.1.6', sha, join(windowsBase, 'nsis', 'Example-setup.exe'));
     assert.equal(run().status, 0);
+    const windowsUpgradeEvidence = join(windowsBase, 'windows-upgrade-smoke.json');
+    const passedWindowsUpgrade = readFileSync(windowsUpgradeEvidence, 'utf8');
+    put(windowsUpgradeEvidence, JSON.stringify({ ...JSON.parse(passedWindowsUpgrade), syntheticConfigurationPreserved: false }));
+    assert.match(run().stderr, /cleanup evidence is incomplete/);
+    put(windowsUpgradeEvidence, JSON.stringify({ ...JSON.parse(passedWindowsUpgrade), installerSha256: 'f'.repeat(64) }));
+    assert.match(run().stderr, /does not bind the exact signed candidate/);
+    put(windowsUpgradeEvidence, passedWindowsUpgrade);
     const windowsEvidence = join(dir, 'candidates', 'candidate-x86_64-pc-windows-msvc', 'native-smoke.json');
     const passedWindowsEvidence = readFileSync(windowsEvidence, 'utf8');
     rmSync(windowsEvidence);
@@ -175,7 +206,7 @@ test('strict assembly checks source and artifact hashes and includes latest.json
     put(signature, validSignature);
     const wrongKey = testUpdaterSigner().publicKey;
     const wrongKeyRun = spawnSync(process.execPath, [join(root, 'scripts/release-manifest.mjs'), 'candidates', '--require-evidence'], {
-      cwd: dir, encoding: 'utf8', env: { ...process.env, RELEASE_TAG: 'v0.1.1', RELEASE_SHA: sha,
+      cwd: dir, encoding: 'utf8', env: { ...process.env, RELEASE_TAG: 'v0.1.6', RELEASE_SHA: sha,
         GITHUB_REPOSITORY: 'sample/short-link-generator', SLG_UPDATER_PUBLIC_KEY: wrongKey },
     });
     assert.notEqual(wrongKeyRun.status, 0);
@@ -186,7 +217,7 @@ test('strict assembly checks source and artifact hashes and includes latest.json
 });
 
 test('manual ARM reuse derives the application tree from both commits and rejects dirty inputs', () => {
-  const dir = fixture();
+  const dir = fixture('0.1.6');
   try {
     const git = (...args) => execFileSync('git', args, { cwd: dir, stdio: 'pipe', encoding: 'utf8' }).trim();
     const inputs = {
@@ -201,7 +232,7 @@ test('manual ARM reuse derives the application tree from both commits and reject
     git('add', '.'); git('commit', '-qm', 'built application');
     const buildSha = git('rev-parse', 'HEAD');
     put(join(dir, 'docs', 'release-only.md'), 'release guide');
-    git('add', '.'); git('commit', '-qm', 'release process'); git('tag', 'v0.1.1');
+    git('add', '.'); git('commit', '-qm', 'release process'); git('tag', 'v0.1.6');
     const reviewedSha = git('rev-parse', 'HEAD');
     const expected = matchingAppInputs(buildSha, reviewedSha, dir);
     assert.equal(expected.fileCount, 11);
@@ -220,7 +251,7 @@ test('manual ARM reuse derives the application tree from both commits and reject
       const updater = mac ? join(base, 'macos', 'Example.app.tar.gz') : installer;
       put(installer, `installer-${target}`); put(updater, mac ? TEST_ARCHIVE : 'test');
       put(`${updater}.sig`, mac ? TEST_ARCHIVE_SIGNATURE : TEST_SIGNATURE);
-      const evidence = { tag: 'v0.1.1', target,
+      const evidence = { tag: 'v0.1.6', target,
         host: target === 'aarch64-apple-darwin' ? 'darwin-arm64' : target === 'x86_64-apple-darwin' ? 'darwin-x64' : 'win32-x64',
         processAlive: true, updaterSignaturePresent: true, updaterSignatureVerified: true,
         updaterSignature: `${updater.split('/').at(-1)}.sig`, updaterSignatureSha256: digest(`${updater}.sig`),
@@ -253,10 +284,11 @@ test('manual ARM reuse derives the application tree from both commits and reject
       });
       else Object.assign(evidence, { schema: 1, sha: reviewedSha });
       put(join(base, 'native-smoke.json'), JSON.stringify(evidence));
+      if (!mac) putSyntheticWindowsUpgrade(base, 'v0.1.6', reviewedSha, installer);
     }
     const evidenceFile = join(dir, 'candidates', 'candidate-aarch64-apple-darwin', 'native-smoke.json');
     const run = (releaseSha = reviewedSha) => spawnSync(process.execPath, [join(root, 'scripts/release-manifest.mjs'), 'candidates', '--require-evidence'], {
-      cwd: dir, encoding: 'utf8', env: { ...process.env, RELEASE_TAG: 'v0.1.1', RELEASE_SHA: releaseSha,
+      cwd: dir, encoding: 'utf8', env: { ...process.env, RELEASE_TAG: 'v0.1.6', RELEASE_SHA: releaseSha,
         GITHUB_REPOSITORY: 'sample/short-link-generator', SLG_UPDATER_PUBLIC_KEY: TEST_PUBLIC_KEY, SLG_MACOS_CERT_SHA256: CERT_PIN },
     });
     const assembled = run();
@@ -358,7 +390,7 @@ test('manual ARM reuse derives the application tree from both commits and reject
     put(join(dir, 'src-tauri', 'tauri.conf.json'), JSON.stringify({ bundle: { macOS: { minimumSystemVersion: '12.3' } } }));
     git('add', 'src-tauri/tauri.conf.json'); git('commit', '-qm', 'synthetic minimum-system policy');
     const policySha = git('rev-parse', 'HEAD');
-    git('tag', '-d', 'v0.1.1'); git('tag', 'v0.1.1');
+    git('tag', '-d', 'v0.1.6'); git('tag', 'v0.1.6');
     const policyInputs = matchingAppInputs(policySha, policySha, dir);
     const policyEvidence = { ...valid, buildSha: policySha, reviewedSha: policySha,
       appInputManifestSha256: policyInputs.sha256, appInputFileCount: policyInputs.fileCount,
@@ -369,6 +401,8 @@ test('manual ARM reuse derives the application tree from both commits and reject
       const path = join(dir, 'candidates', `candidate-${target}`, 'native-smoke.json');
       put(path, JSON.stringify({ ...JSON.parse(readFileSync(path, 'utf8')), sha: policySha }));
     }
+    const windowsBase = join(dir, 'candidates', 'candidate-x86_64-pc-windows-msvc');
+    putSyntheticWindowsUpgrade(windowsBase, 'v0.1.6', policySha, join(windowsBase, 'nsis', 'Example-setup.exe'));
     const configuredMinimum = run(policySha);
     assert.equal(configuredMinimum.status, 0, configuredMinimum.stderr);
     put(evidenceFile, JSON.stringify({ ...policyEvidence,
@@ -394,6 +428,17 @@ test('release workflow is manual, selective, and scans before one-day upload', (
   assert.equal(steps[smoke].id, 'native_smoke');
   assert.equal(steps[smoke].env.SLG_UPDATER_PUBLIC_KEY, '${{ vars.UPDATER_PUBLIC_KEY }}');
   assert.equal(steps[smoke].env.SLG_MACOS_CERT_SHA256, '${{ vars.MACOS_SIGNING_CERT_SHA256 }}');
+  const baseline = steps.findIndex(step => step.name === 'Download the pinned public Windows upgrade baseline');
+  const upgrade = steps.findIndex(step => step.id === 'windows_upgrade');
+  assert.ok(baseline >= 0 && upgrade > baseline && smoke > upgrade);
+  assert.equal(steps[baseline].if, "runner.os == 'Windows'");
+  assert.match(steps[baseline].run, /gh release download v0\.1\.5/);
+  assert.match(steps[baseline].run, /LASTEXITCODE -ne 0/);
+  assert.equal(steps[upgrade].if, "runner.os == 'Windows'");
+  assert.equal(steps[upgrade].env.SLG_UPDATER_PUBLIC_KEY, '${{ vars.UPDATER_PUBLIC_KEY }}');
+  assert.equal(steps[upgrade].env.RELEASE_SHA, '${{ needs.prepare.outputs.sha }}');
+  assert.match(steps[upgrade].run, /windows-upgrade-smoke\.mjs "\$baselineInstaller" src-tauri\/target/);
+  assert.match(steps[upgrade].run, /LASTEXITCODE -ne 0/);
   const packageStep = steps.find(step => step.id === 'package');
   const signerStep = steps.find(step => step.name === 'Prepare pinned macOS signing tool');
   assert.ok(steps.indexOf(signerStep) < steps.indexOf(packageStep));
@@ -408,7 +453,7 @@ test('release workflow is manual, selective, and scans before one-day upload', (
   assert.match(steps[scan].env.SLG_MACOS_SIGNING_P12_PASSWORD, /runner\.os == 'macOS'/);
   assert.match(steps[scan].run, /ulimit -S -c 0\s+ulimit -H -c 0/);
   assert.equal(steps[scan].if, "${{ !cancelled() && steps.package.outcome == 'success' }}");
-  assert.equal(steps[upload].if, "${{ !cancelled() && steps.native_smoke.outcome == 'success' && steps.privacy.outcome == 'success' }}");
+  assert.equal(steps[upload].if, "${{ !cancelled() && steps.native_smoke.outcome == 'success' && steps.privacy.outcome == 'success' && (runner.os != 'Windows' || steps.windows_upgrade.outcome == 'success') }}");
   assert.equal(steps[upload].with['retention-days'], 1);
   const assemble = release.jobs.draft.steps.find(step => step.name?.includes('assemble the draft assets'));
   assert.equal(assemble.env.SLG_UPDATER_PUBLIC_KEY, '${{ vars.UPDATER_PUBLIC_KEY }}');

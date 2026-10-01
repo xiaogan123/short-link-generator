@@ -6,6 +6,7 @@ import { matchingAppInputs } from './release-app-inputs.mjs';
 import { updaterPublicKeySha256, verifyUpdaterSignatureFile } from './updater-signature.mjs';
 import { validateMacSigningEvidence } from './macos-signature.mjs';
 import { readMacUpdater, validateMacArtifactEvidence } from './macos-artifact.mjs';
+import { readWindowsUpgradeEvidence, validateWindowsUpgradeEvidence } from './windows-upgrade-evidence.mjs';
 const version=JSON.parse(readFileSync('package.json','utf8')).version;
 const repository=process.env.GITHUB_REPOSITORY;
 if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repository??''))throw new Error('Invalid repository.');
@@ -115,6 +116,10 @@ if(requireEvidence){
     if(evidence.method!=='manual-local'&&(
        evidence.updaterSignature!==basename(signature)||evidence.updaterSignatureSha256!==sha256(signature)||
        evidence.updaterPublicKeySha256!==publicKeySha256))throw new Error(`Native signature evidence is invalid for ${target}.`);
+    if(target==='x86_64-pc-windows-msvc'){
+      const upgrade=readWindowsUpgradeEvidence(candidateRoot);
+      validateWindowsUpgradeEvidence(upgrade,{tag,sha,nativeEvidence:evidence,installer,updater,signature,publicKeySha256});
+    }
     verified.set(installer,{platform:config.platform,suffix:config.installerSuffix==='-setup.exe'?'.exe':config.installerSuffix});
     verified.set(updater,{platform:config.platform,suffix:config.updaterSuffix==='-setup.exe'?'.exe':config.updaterSuffix,signature});
   }

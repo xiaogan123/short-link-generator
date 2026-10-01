@@ -66,12 +66,47 @@ export function nativeGuiSpawnOptions(cwd, env) {
   return { cwd, env, stdio: 'ignore', windowsHide: false };
 }
 
+export async function stopObservedWindowsProcess(child, {
+  killTree = pid => run('taskkill.exe', ['/PID', String(pid), '/T', '/F'], { timeout: 10_000 }),
+  timeoutMs = 10_000,
+} = {}) {
+  if (!running(child)) return;
+  let treeKillFailed = false;
+  try { killTree(child.pid); }
+  catch { treeKillFailed = true; }
+  if (treeKillFailed) {
+    let fallbackSent = false;
+    try { fallbackSent = child.kill() === true; } catch { /* report below */ }
+    if (!fallbackSent) throw new Error('Windows application tree kill and fallback both failed.');
+  }
+  if (running(child)) {
+    await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => finish(new Error('Windows application did not exit before cleanup deadline.')), timeoutMs);
+      const onExit = () => finish();
+      const onError = () => finish(new Error('Windows application exit could not be confirmed.'));
+      function finish(error) {
+        clearTimeout(timer);
+        child.off('exit', onExit);
+        child.off('error', onError);
+        if (error) reject(error);
+        else resolve();
+      }
+      child.once('exit', onExit);
+      child.once('error', onError);
+      if (!running(child)) finish();
+    });
+  }
+  if (running(child)) throw new Error('Windows application exit could not be confirmed.');
+  if (treeKillFailed) throw new Error('Windows taskkill failed; upgrade sequence halted after fallback cleanup.');
+}
+
 export async function observeStartup(binary, cwd, env, expectWindow, args = []) {
   const child = spawn(binary, args, nativeGuiSpawnOptions(cwd, env));
   let launchError;
   child.on('error', error => { launchError = error; });
   let windowObserved = null;
   let startupSeconds = 0;
+  let result;
   try {
     if (expectWindow) {
       const startedAt = Date.now();
@@ -85,7 +120,8 @@ export async function observeStartup(binary, cwd, env, expectWindow, args = []) 
       if (launchError || !running(child)) {
         throw new Error(`Installed application exited after its window appeared (${launchError?.code ?? child.exitCode ?? child.signalCode}).`);
       }
-      return { processAlive: true, windowObserved: true, startupSeconds: Math.ceil((Date.now() - startedAt) / 1_000) };
+      result = { processAlive: true, windowObserved: true, startupSeconds: Math.ceil((Date.now() - startedAt) / 1_000) };
+      return result;
     }
     for (let second = 0; second < 12; second++) {
       await pause(1_000);
@@ -94,17 +130,20 @@ export async function observeStartup(binary, cwd, env, expectWindow, args = []) 
         throw new Error(`Installed application exited during startup (${launchError?.code ?? child.exitCode ?? child.signalCode}).`);
       }
     }
-    return { processAlive: true, windowObserved, startupSeconds };
+    result = { processAlive: true, windowObserved, startupSeconds };
+    return result;
   } finally {
     if (running(child)) {
       if (process.platform === 'win32') {
-        try { run('taskkill.exe', ['/PID', String(child.pid), '/T', '/F'], { timeout: 10_000 }); }
-        catch { child.kill(); }
+        await stopObservedWindowsProcess(child);
+        if (result) result.processExitedAfterObservation = true;
       } else {
         child.kill('SIGTERM');
         await pause(1_000);
         if (running(child)) child.kill('SIGKILL');
       }
+    } else if (process.platform === 'win32' && result) {
+      result.processExitedAfterObservation = true;
     }
   }
 }
