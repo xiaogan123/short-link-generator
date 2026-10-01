@@ -33,7 +33,10 @@ describe('visible local detection provenance',()=>{
     fireEvent.click(within(dialog).getByRole('button',{name:'完成'}));
     const row=screen.getByText(label,{exact:false});
     expect(row.classList.contains(`slg-check-${tone}`)).toBe(true);
-    expect(row.closest('.slg-check-info')?.textContent).toContain('本机网络');
-    expect(row.closest('.slg-check-info')?.textContent).toContain('上次检测');
+    const linkRow=row.closest('tr') as HTMLElement;
+    fireEvent.click(within(linkRow).getByRole('button',{name:'详情 sample'}));
+    const details=linkRow.nextElementSibling as HTMLElement;
+    expect(details.textContent).toContain('本机网络');
+    expect(details.textContent).toContain('上次检测');
   });
 });

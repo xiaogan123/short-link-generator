@@ -36,6 +36,18 @@ if (preview && new URLSearchParams(window.location.search).get('visualReview') =
   local.links[0] = {...local.links[0],poolId:'demo-platform',code:'DEMO2026'};
   local.links[2] = {...local.links[2],poolId:'demo-platform',code:'EXAMPLE88'};
 }
+if (preview && new URLSearchParams(window.location.search).get('manyLinks') === '1') {
+  for (let number = local.links.length + 1; number <= 100; number++) {
+    const slug = `sample-${String(number).padStart(3, '0')}`;
+    local.links.push({
+      domainId: number % 2 ? 'demo-d1' : 'demo-d2',
+      slug,
+      cnUrl: `https://example.com/zh/${slug}`,
+      defaultUrl: `https://example.org/en/${slug}`,
+      updated: now(),
+    });
+  }
+}
 const plans = new Map<string, { plan: Plan; action: string; payload: Record<string, unknown> }>();
 const clone = ():State => {const state=structuredClone(local);state.links=state.links.map(link=>{if(!link.poolId)return link;const pool=state.pools?.find(p=>p.id===link.poolId);if(!pool)return link;const code=encodeURIComponent(link.code||'');const candidate=pool.candidates.find(c=>c.enabled);return {...link,cnUrl:candidate?candidate.prefix+code+candidate.suffix:'',defaultUrl:pool.official.prefix+code+pool.official.suffix};});return state;};
 function makePlan(title: string, steps: string[], warnings: string[], action: string, payload: Record<string, unknown>, domainTakeoverConfirmation?: string): Plan {

@@ -249,8 +249,8 @@ describe('desktop primary flows in explicit preview', () => {
     expect(within(result).getAllByText(/本地预览未发起网络检测/)).toHaveLength(2);
     fireEvent.click(within(result).getByRole('button', {name:'完成'}));
     expect(screen.getByText('暂时无法确认', {exact:false})).toBeTruthy();
-    expect(within(screen.getByRole('article', {name: /\/pool-code$/})).getByText('演示地址池')).toBeTruthy();
-    expect(within(screen.getByRole('article', {name: /\/pool-code$/})).getByText('member_01')).toBeTruthy();
+    expect(within(screen.getByRole('row', {name: /\/pool-code$/})).getByText('演示地址池')).toBeTruthy();
+    expect(within(screen.getByRole('row', {name: /\/pool-code$/})).getByText('邀请码：member_01')).toBeTruthy();
     fireEvent.click(screen.getByRole('button', {name:/^平台地址$/}));
     fireEvent.click(screen.getByRole('button', {name:'编辑地址'}));
     const editPool = screen.getByRole('dialog', {name:'编辑平台地址'});
@@ -262,8 +262,8 @@ describe('desktop primary flows in explicit preview', () => {
     await waitFor(()=>expect(screen.queryByRole('dialog', {name:'保存平台地址'})).toBeNull());
     fireEvent.click(screen.getByRole('button', {name:/^短链接/}));
     expect(screen.getByText('结果已过期', {exact:false})).toBeTruthy();
-    expect(within(screen.getByRole('article', {name: /\/pool-code$/})).getByText('演示地址池')).toBeTruthy();
-    expect(within(screen.getByRole('article', {name: /\/pool-code$/})).getByText('member_01')).toBeTruthy();
+    expect(within(screen.getByRole('row', {name: /\/pool-code$/})).getByText('演示地址池')).toBeTruthy();
+    expect(within(screen.getByRole('row', {name: /\/pool-code$/})).getByText('邀请码：member_01')).toBeTruthy();
   });
   it('prepares optional monitoring without displaying its secret in the plan', async () => {
     render(<App />);

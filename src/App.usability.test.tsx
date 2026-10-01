@@ -161,6 +161,7 @@ it('marks manual links and clears a prepared domain plan after input changes',as
   render(<App/>);
   await screen.findByText('/manual');
   expect(screen.getByText('手动地址')).toBeTruthy();
+  fireEvent.click(screen.getByRole('button',{name:'详情 manual'}));
   fireEvent.click(screen.getByRole('button',{name:'将 manual 改为平台地址'}));
   const editor=screen.getByRole('dialog',{name:'编辑短链接'});
   expect(within(editor).getByRole('button',{name:'平台地址'}).className).toContain('selected');

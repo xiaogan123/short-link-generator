@@ -70,3 +70,21 @@ it('keeps public-DNS preview results unconfirmed and rejects unsupported modes',
   expect(report.checks.every(check=>check.status==='unknown'&&check.message.includes('本地预览'))).toBe(true);
   for(const dnsMode of ['other',null,true,{}])await expect(dispatch('check_link_targets',{dnsMode})).rejects.toThrow('查询方式');
 });
+
+it('adds 100 neutral links across domains only with explicit preview manyLinks mode',async()=>{
+  window.history.replaceState({}, '', '/?preview=1&manyLinks=1');
+  const {dispatch}=await import('./bridge');
+  const state=await dispatch<import('./types').State>('get_state');
+  expect(state.links).toHaveLength(100);
+  expect(new Set(state.links.map(link=>link.domainId)).size).toBeGreaterThan(1);
+  expect(state.links.every(link=>link.cnUrl.startsWith('https://example.com/') || link.cnUrl.startsWith('https://example.org/'))).toBe(true);
+  expect(state.pools).toEqual([]);
+  vi.resetModules();
+  window.history.replaceState({}, '', '/?manyLinks=1');
+  const regular=await import('./bridge');
+  expect(regular.preview).toBe(false);
+  vi.resetModules();
+  window.history.replaceState({}, '', '/?preview=1');
+  const normal=await import('./bridge');
+  expect((await normal.dispatch<import('./types').State>('get_state')).links).toHaveLength(3);
+});

@@ -1,4 +1,5 @@
-import { CaretDown, Copy, Globe, PencilSimple, Plus, ShieldCheck, Trash } from "@phosphor-icons/react";
+import { Fragment, useId, useRef, useState } from "react";
+import { CaretDown, CaretLeft, CaretRight, Copy, Globe, PencilSimple, Plus, ShieldCheck, Trash } from "@phosphor-icons/react";
 import { shortUrl } from "./validators";
 import type { Domain, Link, Pool } from "./types";
 import "./LinkGroups.css";
@@ -21,6 +22,8 @@ type Props = {
   onDelete: (link: Link, domain: Domain) => void;
   onCreate: (domainId: string) => void;
 };
+
+const pageSizes = [25, 50, 100] as const;
 
 function formatUpdated(value: string) {
   if (!value) return "暂无更新时间";
@@ -104,101 +107,131 @@ function Targets({ link, pool }: { link: Link; pool: Pool | undefined }) {
   );
 }
 
-export default function LinkGroups({
-  groups,
-  pools,
-  getDetection,
-  onCopy,
-  onCheck,
-  onEdit,
-  onDelete,
-  onCreate,
-}: Props) {
+function LinkGroupSection({ domain, links, pools, getDetection, onCopy, onCheck, onEdit, onDelete, onCreate }: Props & LinkGroup) {
+  const detailPrefix = useId();
+  const [pageSize, setPageSize] = useState<(typeof pageSizes)[number]>(25);
+  const [pageState, setPageState] = useState({ linkKey: "", page: 1 });
+  const [expanded, setExpanded] = useState<Set<string>>(() => new Set());
+  const headerRef = useRef<HTMLElement>(null);
+  const linkKey = JSON.stringify(links.map((link) => link.slug));
+  if (pageState.linkKey !== linkKey) {
+    setPageState({ linkKey, page: 1 });
+    setExpanded(new Set());
+  }
+  const pageCount = Math.max(1, Math.ceil(links.length / pageSize));
+  const page = pageState.linkKey === linkKey ? Math.min(pageState.page, pageCount) : 1;
+  const start = (page - 1) * pageSize;
+  const visible = links.slice(start, start + pageSize);
   const poolById = new Map(pools.map((pool) => [pool.id, pool]));
+  const showPageStart = () => headerRef.current?.scrollIntoView?.({ block: "start" });
+  const choosePage = (next: number) => {
+    setPageState({ linkKey, page: Math.min(Math.max(next, 1), pageCount) });
+    showPageStart();
+  };
+  const toggleDetails = (slug: string) => setExpanded((current) => {
+    const next = new Set(current);
+    if (next.has(slug)) next.delete(slug);
+    else next.add(slug);
+    return next;
+  });
+
   return (
-    <div className="slg-groups">
-      {groups.map(({ domain, links }) => (
-        <section className="slg-group" key={domain.id} aria-label={`${domain.host} 的短链接`}>
-          <header className="slg-group-head">
-            <div className="slg-domain-identity">
-              <Globe size={19} aria-hidden="true" />
-              <div>
-                <h3>{domain.host}</h3>
-                <span>/{domain.prefix}/</span>
-              </div>
-            </div>
-            <span className="slg-group-count">{links.length} 条链接</span>
-          </header>
-          {links.length ? (
-            <div className="slg-cards">
-              {links.map((link) => {
+    <section className="slg-group" aria-label={`${domain.host} 的短链接`}>
+      <header className="slg-group-head" ref={headerRef}>
+        <div className="slg-domain-identity">
+          <Globe size={19} aria-hidden="true" />
+          <div>
+            <h3>{domain.host}</h3>
+            <span>/{domain.prefix}/</span>
+          </div>
+        </div>
+        <span className="slg-group-count">{links.length} 条链接</span>
+        {pageCount > 1 && <div className="slg-head-pager" aria-label={`${domain.host} 顶部分页`}>
+          <button type="button" aria-label={`${domain.host} 顶部上一页`} disabled={page === 1} onClick={() => choosePage(page - 1)}><CaretLeft size={14} aria-hidden="true" /></button>
+          <span>{page} / {pageCount}</span>
+          <button type="button" aria-label={`${domain.host} 顶部下一页`} disabled={page === pageCount} onClick={() => choosePage(page + 1)}><CaretRight size={14} aria-hidden="true" /></button>
+        </div>}
+      </header>
+      {links.length ? (
+        <>
+          <table className="slg-table" aria-label={`${domain.host} 的链接列表`}>
+            <colgroup><col className="slg-col-link" /><col className="slg-col-kind" /><col className="slg-col-check" /><col className="slg-col-actions" /></colgroup>
+            <thead><tr><th scope="col">短链接</th><th scope="col">目标类型</th><th scope="col">检测与更新</th><th scope="col">操作</th></tr></thead>
+            <tbody>
+              {visible.map((link) => {
                 const url = shortUrl(domain.host, domain.prefix, link.slug);
                 const pool = link.poolId ? poolById.get(link.poolId) : undefined;
                 const detection = getDetection(link);
+                const open = expanded.has(link.slug);
+                const detailId = `${detailPrefix}-${encodeURIComponent(link.slug)}`;
                 return (
-                  <article className="slg-card" key={link.slug} aria-label={url}>
-                    <div className="slg-card-head">
-                      <div className="slg-link-identity">
-                        <h4>/{link.slug}</h4>
+                  <Fragment key={`${domain.id}:${link.slug}`}>
+                    <tr className="slg-link-row" aria-label={url}>
+                      <th scope="row" className="slg-link-cell">
+                        <span className="slg-link-slug">/{link.slug}</span>
                         <span className="slg-short-url" title={url}>{url}</span>
-                      </div>
-                      <button className="slg-copy" type="button" aria-label={`复制 ${link.slug}`} onClick={() => onCopy(url)}>
-                        <Copy size={17} aria-hidden="true" />复制链接
-                      </button>
-                    </div>
-                    <div className="slg-meta">
-                      <span className="slg-kind">{link.poolId ? "跟随平台地址" : "手动地址"}</span>
-                      {link.poolId && (
-                        <>
-                          <span className="slg-meta-item"><span>平台</span><strong>{pool?.name || "已移除"}</strong></span>
-                          <span className="slg-meta-item"><span>邀请码</span><strong>{link.code || "未填写"}</strong></span>
-                        </>
-                      )}
-                    </div>
-                    <Targets link={link} pool={pool} />
-                    <footer className="slg-card-foot">
-                      <div className="slg-check-info">
+                      </th>
+                      <td className="slg-kind-cell">
+                        <span className="slg-kind">{link.poolId ? "跟随平台地址" : "手动地址"}</span>
+                        {link.poolId && <span className="slg-platform-name" title={pool?.name || "已移除"}>{pool?.name || "已移除"}</span>}
+                        {link.poolId && <span className="slg-code" title={link.code || "未填写"}>邀请码：{link.code || "未填写"}</span>}
+                      </td>
+                      <td className="slg-status-cell">
                         <span className={`slg-check slg-check-${detection.tone}`} title={detection.title}>
-                          <span className="slg-check-dot" aria-hidden="true" />
-                          {detection.label}
+                          <span className="slg-check-dot" aria-hidden="true" />{detection.label}
                         </span>
-                        {detection.detail && <span className="slg-check-detail">{detection.detail}</span>}
                         <span className="slg-updated">{link.updated && "更新于 "}{formatUpdated(link.updated)}</span>
-                      </div>
-                      <div className="slg-actions">
-                        <button type="button" aria-label={`检测 ${link.slug}`} onClick={() => onCheck(link, domain)}>
-                          <ShieldCheck size={16} aria-hidden="true" />检测
-                        </button>
-                        <button type="button" aria-label={`编辑 ${link.slug}`} onClick={() => onEdit(link)}>
-                          <PencilSimple size={16} aria-hidden="true" />编辑
-                        </button>
-                        {!link.poolId && pools.length > 0 && (
-                          <button type="button" aria-label={`将 ${link.slug} 改为平台地址`} onClick={() => onEdit(link, true)}>
-                            改为平台地址
-                          </button>
-                        )}
-                        <button className="slg-delete" type="button" aria-label={`删除 ${link.slug}`} onClick={() => onDelete(link, domain)}>
-                          <Trash size={15} aria-hidden="true" />删除
-                        </button>
-                      </div>
-                    </footer>
-                  </article>
+                      </td>
+                      <td className="slg-action-cell">
+                        <div className="slg-actions">
+                          <button className="slg-copy" type="button" aria-label={`复制 ${link.slug}`} title="复制链接" onClick={() => onCopy(url)}><Copy size={15} aria-hidden="true" /><span>复制</span></button>
+                          <button type="button" aria-label={`检测 ${link.slug}`} title="检测链接" onClick={() => onCheck(link, domain)}><ShieldCheck size={15} aria-hidden="true" /><span>检测</span></button>
+                          <button type="button" aria-label={`编辑 ${link.slug}`} title="编辑链接" onClick={() => onEdit(link)}><PencilSimple size={15} aria-hidden="true" /><span>编辑</span></button>
+                          <button className="slg-details-toggle" type="button" aria-label={`详情 ${link.slug}`} aria-expanded={open} aria-controls={open ? detailId : undefined} onClick={() => toggleDetails(link.slug)}><CaretDown size={15} aria-hidden="true" /><span>详情</span></button>
+                        </div>
+                      </td>
+                    </tr>
+                    {open && (
+                      <tr className="slg-detail-row" id={detailId}>
+                        <td colSpan={4}>
+                          <div className="slg-detail-body">
+                            <Targets link={link} pool={pool} />
+                            {detection.detail && <p className="slg-check-detail">{detection.detail}</p>}
+                            <div className="slg-detail-actions">
+                              {!link.poolId && pools.length > 0 && <button type="button" aria-label={`将 ${link.slug} 改为平台地址`} onClick={() => onEdit(link, true)}>改为平台地址</button>}
+                              <button className="slg-delete" type="button" aria-label={`删除 ${link.slug}`} onClick={() => onDelete(link, domain)}><Trash size={15} aria-hidden="true" />删除链接</button>
+                            </div>
+                          </div>
+                        </td>
+                      </tr>
+                    )}
+                  </Fragment>
                 );
               })}
+            </tbody>
+          </table>
+          <div className="slg-pagination" aria-label={`${domain.host} 的分页`}>
+            <span>显示 {start + 1}–{start + visible.length} / 共 {links.length} 条</span>
+            <label>每页 <select aria-label={`${domain.host} 每页条数`} value={pageSize} onChange={(event) => { setPageSize(Number(event.target.value) as (typeof pageSizes)[number]); setPageState({ linkKey, page: 1 }); showPageStart(); }}>
+              {pageSizes.map((size) => <option value={size} key={size}>{size}</option>)}
+            </select> 条</label>
+            <div className="slg-page-controls">
+              <button type="button" aria-label={`${domain.host} 上一页`} disabled={page === 1} onClick={() => choosePage(page - 1)}>上一页</button>
+              <span>第 {page} / {pageCount} 页</span>
+              <button type="button" aria-label={`${domain.host} 下一页`} disabled={page === pageCount} onClick={() => choosePage(page + 1)}>下一页</button>
             </div>
-          ) : (
-            <div className="slg-domain-empty">
-              <div>
-                <strong>这个域名还没有短链接</strong>
-                <span>可以从 /{domain.prefix}/ 创建第一条。</span>
-              </div>
-              <button className="slg-create" type="button" onClick={() => onCreate(domain.id)}>
-                <Plus size={16} aria-hidden="true" />创建第一条短链接
-              </button>
-            </div>
-          )}
-        </section>
-      ))}
-    </div>
+          </div>
+        </>
+      ) : (
+        <div className="slg-domain-empty">
+          <div><strong>这个域名还没有短链接</strong><span>可以从 /{domain.prefix}/ 创建第一条。</span></div>
+          <button className="slg-create" type="button" onClick={() => onCreate(domain.id)}><Plus size={16} aria-hidden="true" />创建第一条短链接</button>
+        </div>
+      )}
+    </section>
   );
+}
+
+export default function LinkGroups(props: Props) {
+  return <div className="slg-groups">{props.groups.map((group) => <LinkGroupSection key={group.domain.id} {...props} {...group} />)}</div>;
 }
