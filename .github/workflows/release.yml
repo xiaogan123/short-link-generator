@@ -99,6 +99,7 @@ jobs:
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          SLG_UPDATER_PUBLIC_KEY: ${{ vars.UPDATER_PUBLIC_KEY }}
           SLG_MACOS_SIGNING_P12_BASE64: ${{ runner.os == 'macOS' && secrets.MACOS_SIGNING_P12_BASE64 || '' }}
           SLG_MACOS_SIGNING_P12_PASSWORD: ${{ runner.os == 'macOS' && secrets.MACOS_SIGNING_P12_PASSWORD || '' }}
           SLG_MACOS_CERT_SHA256: ${{ vars.MACOS_SIGNING_CERT_SHA256 }}

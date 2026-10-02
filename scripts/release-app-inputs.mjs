@@ -16,6 +16,10 @@ const releaseOnlyFiles = new Set([
   'scripts/release-manifest.mjs', 'scripts/release-selective.test.mjs',
   'scripts/release-secret-material.mjs', 'scripts/release-secret-material.test.mjs',
   'scripts/updater-signature.mjs', 'scripts/updater-signature.test.mjs',
+  'scripts/macos-updater-owner-normalize.mjs', 'scripts/macos-updater-owner-normalize.test.mjs',
+  'scripts/stable-macos-sign.mjs', 'scripts/stable-macos-sign.test.mjs',
+  'scripts/macos-dmg-owner-stage.mjs', 'scripts/macos-dmg-owner-stage.test.mjs',
+  'scripts/normalize-macos-dmg-owners.py', 'tests/test_normalize_macos_dmg_owners.py',
   'scripts/release.test.mjs',
 ]);
 const releaseOnlyPrefixes = [

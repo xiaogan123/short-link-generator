@@ -13,6 +13,23 @@ import { classifyCodesignError, executeSigning, readSigningContext, signingArgum
 // No test creates/imports a real Keychain, invokes native signing, or reads user credentials.
 const openssl = process.platform === 'darwin' && existsSync('/opt/homebrew/bin/openssl') ? '/opt/homebrew/bin/openssl' : 'openssl';
 const supported = process.platform !== 'win32';
+
+test('captured-tool timeout stops a spawned descendant before private cleanup', { skip: !supported }, async () => {
+  const temp = mkdtempSync(join(tmpdir(), 'slg-tool-group-fixture-'));
+  const ready = join(temp, 'ready'); const marker = join(temp, 'late-marker');
+  const grandchild = 'setTimeout(() => require("node:fs").writeFileSync(process.argv[1], "late"), 900)';
+  const parent = 'const {spawn}=require("node:child_process"); const fs=require("node:fs"); ' +
+    'spawn(process.execPath,["-e",process.argv[3],process.argv[1]],{stdio:"ignore"}); ' +
+    'fs.writeFileSync(process.argv[2],"ready"); setInterval(()=>{},1000)';
+  try {
+    await assert.rejects(runCaptured(process.execPath, ['-e', parent, marker, ready, grandchild],
+      { env: process.env, timeout: 350 }), /Isolated macOS signing failed/);
+    assert.equal(existsSync(ready), true, 'the child actually spawned before timeout');
+    await new Promise(resolve => setTimeout(resolve, 1100));
+    assert.equal(existsSync(marker), false, 'a surviving descendant must not write after timeout');
+  } finally { rmSync(temp, { recursive: true, force: true }); }
+});
+
 function fixture(fixtureOpenSSL = openssl) {
   const temp = mkdtempSync(join(tmpdir(), 'slg-signing-fixture-'));
   const key = join(temp, 'test-key.pem'); const cert = join(temp, 'test-cert.pem'); const p12 = join(temp, 'test.p12');
@@ -260,11 +277,11 @@ test('build wrapper signs without Keychain writes and cleans success, cancellati
   const sourceTool = join(temp, 'reviewed-tool'); writeFileSync(sourceTool, 'synthetic tool', { mode: 0o500 });
   try {
     for (const mode of ['success', 'core-failure', 'tool-failure', 'copy-mismatch', 'material-failure', 'requirement-failure',
-      'build-failure', 'verify-failure', 'search-list-changed', 'default-changed', 'interrupted-during-tool',
+      'build-failure', 'updater-failure', 'dmg-failure', 'verify-failure', 'search-list-changed', 'default-changed', 'interrupted-during-tool',
       'interrupted-during-material', 'interrupted-during-requirement', 'interrupted-during-build', 'cleanup-failure', 'build-and-cleanup-failure']) {
       const parent = join(temp, mode); mkdirSync(parent);
       const output = join(parent, 'output'); mkdirSync(join(output, 'release/bundle/macos/Example.app'), { recursive: true });
-      const calls = []; let loaded = 0, built = 0, inventoryCalls = 0, verifiedTools = 0;
+      const calls = []; let loaded = 0, built = 0, normalized = 0, dmgNormalized = 0, inventoryCalls = 0, verifiedTools = 0;
       const run = async (command, args, options) => {
         assert.deepEqual(Object.keys(options.env).sort(), ['HOME', 'LANG', 'LC_ALL', 'PATH', 'TMPDIR']);
         calls.push([command, args]); assert.equal(args.includes('synthetic-secret-password'), false);
@@ -306,12 +323,28 @@ test('build wrapper signs without Keychain writes and cleans success, cancellati
         const context = readSigningContext(env.SLG_PRIVATE_SIGNING_CONTEXT);
         assert.notEqual(context.tool.path, sourceTool); assert.equal(context.certificateSha1, info.certificateSha1);
         const shim = readFileSync(join(env.PATH.split(':')[0], 'codesign'), 'utf8');
-        assert.ok(shim.includes('exec /usr/bin/env -i ')); assert.equal(shim.includes('updater'), false); assert.equal(shim.includes('password'), false);
+        assert.ok(shim.includes('exec /usr/bin/env -i '));
+        assert.equal(shim.includes('synthetic-updater-key'), false);
+        assert.equal(shim.includes('synthetic-updater-password'), false);
         if (mode === 'build-failure' || mode === 'build-and-cleanup-failure') throw new Error('private failure');
         if (mode === 'interrupted-during-build') process.emit('SIGTERM');
       };
       const promise = withStableSigning({ command: ['synthetic-build'], platform: 'darwin', arch: 'arm64', run, build,
-        verify: () => { if (mode === 'verify-failure') throw new Error('private failure'); return evidence(info); }, verifyTool, materialPreparer,
+        normalizeUpdater: ({ bundle, target, sourceEnv }) => {
+          assert.equal(built, 1); assert.equal(target, ''); assert.ok(bundle.endsWith('/release/bundle'));
+          assert.equal(sourceEnv.TAURI_SIGNING_PRIVATE_KEY, 'synthetic-updater-key');
+          normalized++;
+          if (mode === 'updater-failure') throw new Error('private failure');
+          return { present: false };
+        },
+        normalizeDmg: ({ bundle, app, target, shim }) => {
+          assert.equal(normalized, 1); assert.equal(target, '');
+          assert.ok(bundle.endsWith('/release/bundle')); assert.ok(app.endsWith('/Example.app'));
+          assert.ok(shim.endsWith('/bin/codesign')); dmgNormalized++;
+          if (mode === 'dmg-failure') throw new Error('private failure');
+          return { present: false };
+        },
+        verify: () => { assert.equal(normalized, 1); assert.equal(dmgNormalized, 1); if (mode === 'verify-failure') throw new Error('private failure'); return evidence(info); }, verifyTool, materialPreparer,
         materialLoader: () => { loaded++; return { p12: Buffer.from('synthetic'), password: 'synthetic-secret-password' }; }, tempRoot: parent,
         removeTemp: path => { if (mode.includes('cleanup-failure')) throw new Error('private failure'); rmSync(path, { recursive: true, force: true }); },
         env: { PATH: process.env.PATH, CARGO_TARGET_DIR: output, SLG_RCODESIGN_PATH: sourceTool,
@@ -326,6 +359,8 @@ test('build wrapper signs without Keychain writes and cleans success, cancellati
       } else await assert.rejects(promise, error => {
         const stage = mode.startsWith('interrupted-') ? 'interrupted' : ({ 'core-failure': 'core-limits', 'tool-failure': 'signer-tool',
           'copy-mismatch': 'signer-tool', 'material-failure': 'material', 'requirement-failure': 'requirement', 'build-failure': 'build',
+          'updater-failure': 'updater-normalize',
+          'dmg-failure': 'dmg-normalize',
           'verify-failure': 'verify', 'search-list-changed': 'searchlist', 'default-changed': 'searchlist', 'cleanup-failure': 'cleanup',
           'build-and-cleanup-failure': 'build' })[mode];
         assert.equal(error.stage, stage);
@@ -349,4 +384,47 @@ test('wrapper rejects cross-architecture targets, duplicate targets and unreview
     await assert.rejects(withStableSigning({ command, platform: 'darwin', arch: 'arm64', env: { ...env, ...patch },
       materialLoader: () => { assert.fail('configuration must fail before material'); } }), error => error.stage === 'configuration');
   }
+  await assert.rejects(withStableSigning({ command: ['/bin/sh', '-c', ':', '--target', 'aarch64-apple-darwin'],
+    postBuildOnly: true, platform: 'darwin', arch: 'arm64', env,
+    materialLoader: () => { assert.fail('post-build-only must reject a disguised no-op command'); } }),
+  error => error.stage === 'configuration');
+});
+
+test('post-build-only mode checks the existing signed app/helper and never invokes a build', { skip: !supported }, async () => {
+  const temp = mkdtempSync(join(tmpdir(), 'slg-post-build-only-fixture-'));
+  const info = { certificateSha1: 'a'.repeat(40), certificateSha256: 'b'.repeat(64) };
+  const toolPath = join(temp, 'reviewed-tool'); writeFileSync(toolPath, 'synthetic tool', { mode: 0o500 });
+  const output = join(temp, 'output');
+  mkdirSync(join(output, 'aarch64-apple-darwin/release/bundle/macos/Example.app'), { recursive: true });
+  let builds = 0; let appVerifications = 0; let helperVerifications = 0; const sequence = [];
+  try {
+    const run = async (command, args) => {
+      if (command === '/bin/sh') return Buffer.from('0\n0\n');
+      if (command === '/usr/bin/csreq') { writeFileSync(args.at(-1), 'synthetic DR', { mode: 0o600 }); return Buffer.alloc(0); }
+      if (command === '/usr/bin/security') return Buffer.from('unchanged');
+      assert.fail('unexpected native command');
+    };
+    const result = await withStableSigning({ command: ['--target', 'aarch64-apple-darwin'], postBuildOnly: true,
+      platform: 'darwin', arch: 'arm64', run, tempRoot: temp,
+      env: { PATH: process.env.PATH, CARGO_TARGET_DIR: output, SLG_RCODESIGN_PATH: toolPath,
+        SLG_MACOS_CERT_SHA256: info.certificateSha256, SLG_MACOS_HELPER_TREE_SHA256_ARM64: 'c'.repeat(64) },
+      verifyTool: async path => ({ path, sha256: 'd'.repeat(64), version: '0.29.0', arch: 'arm64' }),
+      materialLoader: () => ({ p12: Buffer.from('synthetic'), password: 'synthetic' }),
+      materialPreparer: async (material, pin, options) => {
+        material.p12.fill(0); assert.equal(pin, info.certificateSha256);
+        const importPath = join(options.temp, 'import.p12'); writeFileSync(importPath, 'synthetic', { mode: 0o600 });
+        return { ...info, importPath, importPassword: 'synthetic' };
+      },
+      build: async () => { builds++; assert.fail('existing-artifact mode must not build'); },
+      verify: app => { appVerifications++; sequence.push('app'); assert.ok(app.endsWith('/Example.app')); return evidence(info); },
+      verifyHelper: (app, pin) => { helperVerifications++; sequence.push('helper'); assert.equal(pin, 'c'.repeat(64)); },
+      normalizeUpdater: () => { sequence.push('updater'); return { present: true }; },
+      normalizeDmg: () => { sequence.push('dmg'); return { present: true }; },
+    });
+    assert.equal(builds, 0);
+    assert.equal(appVerifications, 2);
+    assert.equal(helperVerifications, 1);
+    assert.deepEqual(sequence, ['app', 'helper', 'updater', 'dmg', 'app']);
+    assert.equal(result.postBuildOnly, true);
+  } finally { rmSync(temp, { recursive: true, force: true }); }
 });

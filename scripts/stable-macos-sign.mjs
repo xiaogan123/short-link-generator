@@ -8,6 +8,9 @@ import { X509Certificate } from 'node:crypto';
 import { certificateInfo, cleanSigningEnvironment, stableRequirement, verifyMacSigning } from './macos-signature.mjs';
 import { signingToolEnvironment } from './macos-codesign.mjs';
 import { verifyRcodesignTool } from './rcodesign-tool.mjs';
+import { normalizeOptionalMacUpdater } from './macos-updater-owner-normalize.mjs';
+import { normalizeOptionalMacDmg } from './macos-dmg-owner-stage.mjs';
+import { verifyEmbeddedHelper } from './macos-credential-helper-bytes.mjs';
 
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 const shellQuote = value => `'${value.replace(/'/g, `'"'"'`)}'`;
@@ -50,18 +53,28 @@ export function loadMaterial(env, cwd) {
   return { p12, password };
 }
 
+function killToolGroup(child) {
+  if (!child?.pid) return;
+  try {
+    if (process.platform === 'win32') child.kill('SIGKILL');
+    else process.kill(-child.pid, 'SIGKILL');
+  } catch {}
+}
+
 // Captures all tool output. Neither tool errors nor command arguments may print secret material.
 export function runCaptured(command, args, { env, input, timeout = 60_000, onChild } = {}) {
   return new Promise((resolveResult, reject) => {
-    const child = spawn(command, args, { env, stdio: ['pipe', 'pipe', 'pipe'] });
+    // Each tool owns a process group so a timeout also stops its sandbox/signing
+    // descendants before callers remove the private working directory.
+    const child = spawn(command, args, { env, detached: process.platform !== 'win32', stdio: ['pipe', 'pipe', 'pipe'] });
     onChild?.(child);
     const chunks = [];
     let size = 0;
     let failed = false;
-    const timer = setTimeout(() => { failed = true; child.kill('SIGKILL'); }, timeout);
+    const timer = setTimeout(() => { failed = true; killToolGroup(child); }, timeout);
     child.stdout.on('data', chunk => {
       size += chunk.length;
-      if (size > 8 * 1024 * 1024) { failed = true; child.kill('SIGKILL'); }
+      if (size > 8 * 1024 * 1024) { failed = true; killToolGroup(child); }
       else chunks.push(chunk);
     });
     child.stderr.resume();
@@ -122,13 +135,18 @@ async function runBuild(command, env, cwd, state) {
 
 export async function withStableSigning({ command, env = process.env, cwd = process.cwd(), platform = process.platform,
   arch = process.arch, run = runCaptured, build = runBuild, verify = verifyMacSigning, materialLoader = loadMaterial,
-  materialPreparer = prepareMaterial, verifyTool = verifyRcodesignTool, tempRoot = tmpdir(), removeTemp = path => rmSync(path, { recursive: true, force: true }) }) {
+  materialPreparer = prepareMaterial, verifyTool = verifyRcodesignTool,
+  normalizeUpdater = normalizeOptionalMacUpdater, normalizeDmg = normalizeOptionalMacDmg,
+  verifyHelper = verifyEmbeddedHelper, postBuildOnly = false,
+  tempRoot = tmpdir(), removeTemp = path => rmSync(path, { recursive: true, force: true }) }) {
   if (platform !== 'darwin' || !command?.length || !/^[a-f0-9]{64}$/.test(env.SLG_MACOS_CERT_SHA256 ?? '') ||
       !env.SLG_RCODESIGN_PATH || env.SLG_MACOS_OPENSSL !== undefined) throw fail();
   const targetIndex = command.indexOf('--target');
+  const requiredTarget = ({ arm64: 'aarch64-apple-darwin', x64: 'x86_64-apple-darwin' })[arch];
   if (!['arm64', 'x64'].includes(arch) || command.filter(value => value === '--target').length > 1 ||
       command.some(value => value.startsWith('--target=')) ||
-      (targetIndex >= 0 && command[targetIndex + 1] !== ({ arm64: 'aarch64-apple-darwin', x64: 'x86_64-apple-darwin' })[arch])) throw fail();
+      (targetIndex >= 0 && command[targetIndex + 1] !== requiredTarget) ||
+      (postBuildOnly && (command.length !== 2 || command[0] !== '--target' || command[1] !== requiredTarget))) throw fail();
   const temp = mkdtempSync(join(tempRoot, 'slg-macos-sign-'));
   const toolEnv = signingToolEnvironment({ ...env, TMPDIR: temp });
   const inventoryEnv = signingToolEnvironment(env);
@@ -136,7 +154,7 @@ export async function withStableSigning({ command, env = process.env, cwd = proc
   let killTimer;
   const stop = () => {
     state.interrupted = true;
-    state.toolChild?.kill('SIGKILL');
+    killToolGroup(state.toolChild);
     if (state.child?.pid) {
       const pid = state.child.pid;
       try { process.kill(-pid, 'SIGTERM'); } catch {}
@@ -154,7 +172,7 @@ export async function withStableSigning({ command, env = process.env, cwd = proc
     defaultKeychain: (await run('/usr/bin/security', ['default-keychain', '-d', 'user'], { env: inventoryEnv })).toString(),
   });
   for (const name of ['SIGTERM', 'SIGINT', 'SIGHUP']) process.on(name, stop);
-  let before, result, tool, operationFailure, cleanupFailure;
+  let before, result, tool, updaterResult, dmgResult, operationFailure, cleanupFailure;
   let stage = 'configuration';
   try {
     chmodSync(temp, 0o700);
@@ -198,17 +216,36 @@ export async function withStableSigning({ command, env = process.env, cwd = proc
     const shim = `#!/bin/sh\nexec /usr/bin/env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin LANG=C LC_ALL=C HOME=${shellQuote(home)} TMPDIR=${shellQuote(buildTemp)} SLG_PRIVATE_SIGNING_CONTEXT=${shellQuote(contextPath)} ${shellQuote(process.execPath)} ${shellQuote(join(scriptDir, 'macos-codesign.mjs'))} "$@"\n`;
     writeFileSync(join(bin, 'codesign'), shim, { mode: 0o700, flag: 'wx' });
     check(); stage = 'build';
-    await build(command, { ...cleanBuildEnvironment(env), APPLE_SIGNING_IDENTITY: prepared.certificateSha1,
+    if (!postBuildOnly) await build(command, { ...cleanBuildEnvironment(env), APPLE_SIGNING_IDENTITY: prepared.certificateSha1,
       TMPDIR: buildTemp, SLG_PRIVATE_SIGNING_CONTEXT: contextPath,
       PATH: `${bin}:${cleanSigningEnvironment(env).PATH ?? '/usr/bin:/bin'}` }, cwd, state);
-    check(); stage = 'verify';
+    check(); stage = 'updater-normalize';
     const targetAt = command.indexOf('--target');
     const target = targetAt < 0 ? '' : command[targetAt + 1];
     if (targetAt >= 0 && !['aarch64-apple-darwin', 'x86_64-apple-darwin'].includes(target)) throw fail();
-    const bundle = join(outputRoot, target, 'release', 'bundle', 'macos');
+    const bundleRoot = join(outputRoot, target, 'release', 'bundle');
+    const bundle = join(bundleRoot, 'macos');
     const apps = readdirSync(bundle).filter(name => name.endsWith('.app'));
     if (apps.length !== 1) throw fail();
-    result = verify(join(bundle, apps[0]), env.SLG_MACOS_CERT_SHA256, (cmd, args, options) =>
+    const app = join(bundle, apps[0]);
+    if (postBuildOnly) {
+      stage = 'existing-app-preflight';
+      verify(app, env.SLG_MACOS_CERT_SHA256, (cmd, args, options) =>
+        execFileSync(cmd, args, { ...options, env: toolEnv, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 60_000, killSignal: 'SIGKILL' }));
+      const helperPin = env[target === 'aarch64-apple-darwin' ? 'SLG_MACOS_HELPER_TREE_SHA256_ARM64' : 'SLG_MACOS_HELPER_TREE_SHA256_X64'];
+      if (!/^[a-f0-9]{64}$/.test(helperPin ?? '')) throw fail();
+      verifyHelper(app, helperPin);
+      check(); stage = 'updater-normalize';
+    }
+    updaterResult = normalizeUpdater({ bundle: bundleRoot, target, releaseRoot: cwd,
+      publicKey: env.SLG_UPDATER_PUBLIC_KEY, sourceEnv: env });
+    check(); stage = 'dmg-normalize';
+    dmgResult = await normalizeDmg({ bundle: bundleRoot, app, target,
+      certificateSha1: prepared.certificateSha1, certificateSha256: prepared.certificateSha256,
+      shim: join(bin, 'codesign'), run: checkedRun, env: toolEnv });
+    if (postBuildOnly && (updaterResult?.present !== true || dmgResult?.present !== true)) throw fail();
+    check(); stage = 'verify';
+    result = verify(app, env.SLG_MACOS_CERT_SHA256, (cmd, args, options) =>
       execFileSync(cmd, args, { ...options, env: toolEnv, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 60_000, killSignal: 'SIGKILL' }));
     check();
   } catch (error) { operationFailure = state.interrupted ? 'interrupted' : error.stage === 'interrupted' ? 'interrupted' : stage; }
@@ -231,14 +268,17 @@ export async function withStableSigning({ command, env = process.env, cwd = proc
   }
   return { nativeSigning: result, backend: 'rcodesign', signerVersion: tool.version, signerSha256: tool.sha256,
     signerArch: tool.arch, temporarySigningFilesRemoved: true, searchListUnchanged: true,
-    defaultKeychainUnchanged: true, keychainWrites: 0, trustWrites: 0 };
+    defaultKeychainUnchanged: true, keychainWrites: 0, trustWrites: 0,
+    postBuildOnly, updaterOwnerNormalized: updaterResult?.present === true,
+    dmgOwnerNormalized: dmgResult?.present === true };
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   const args = process.argv.slice(2);
-  const command = args[0] === '--' ? args.slice(1) : [];
-  withStableSigning({ command }).then(result => console.log(JSON.stringify(result))).catch(error => {
-    const stages = ['configuration', 'core-limits', 'signer-tool', 'material', 'requirement', 'build', 'verify', 'cleanup', 'searchlist', 'interrupted'];
+  const postBuildOnly = args[0] === '--post-build-only';
+  const command = postBuildOnly ? args.slice(1) : args[0] === '--' ? args.slice(1) : [];
+  withStableSigning({ command, postBuildOnly }).then(result => console.log(JSON.stringify(result))).catch(error => {
+    const stages = ['configuration', 'core-limits', 'signer-tool', 'material', 'requirement', 'build', 'existing-app-preflight', 'updater-normalize', 'dmg-normalize', 'verify', 'cleanup', 'searchlist', 'interrupted'];
     console.error(JSON.stringify({ ok: false, stage: stages.includes(error.stage) ? error.stage : 'cleanup',
       cleanupStage: stages.includes(error.cleanupStage) ? error.cleanupStage : null, candidateApproved: false }));
     process.exitCode = 1;
