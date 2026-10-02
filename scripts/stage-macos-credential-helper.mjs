@@ -15,9 +15,9 @@ const approvalPath = resolve(scriptDir, '../src-tauri/native/credential-helper-a
 const clientCoreManifestPath = resolve(scriptDir, '../src-tauri/native/credential-core/SOURCE-MANIFEST.sha256');
 const checkedInArchiveRoot = resolve(scriptDir, '../src-tauri/native/credential-helper-archives');
 const stageRoot = resolve(scriptDir, '../_private/credential-helper-stage');
-const APPROVAL_MANIFEST_SHA256 = '9ef6fe4298caf0e5f15a9c5502ba3d8677f9526a8e8c4d4da4bcc724bf1282b1';
-const CLIENT_CORE_MANIFEST_SHA256 = '4d674ca38c1d3719764fbd3ed2dd73b492495d0b9ef0b5b06f88921366d6606f';
-const CLIENT_CORE_REVIEW_MANIFEST_SHA256 = '6fd49df68520ee95ff3f007e082b2b60a0c56fd24b7c205529c9dea0593f86eb';
+const APPROVAL_MANIFEST_SHA256 = '2a2ee5a6cb2191784db19148becb8bceee7f8dd264fbff9de21ed73b12abc397';
+const CLIENT_CORE_MANIFEST_SHA256 = 'b26d8a06b948cc0d240a062b90f3ca274d3c10a87030e7a2f2efb4e7579d0443';
+const CLIENT_CORE_REVIEW_MANIFEST_SHA256 = '963def8e73d64af7773682c84ab36a2c86bcda5c14d187a2eefc01eb038725c5';
 const sha256 = bytes => createHash('sha256').update(bytes).digest('hex');
 const hex64 = value => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
 const fail = () => new Error('Frozen credential helper archive is not approved for staging.');

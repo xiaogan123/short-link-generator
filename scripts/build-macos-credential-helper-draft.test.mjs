@@ -17,7 +17,7 @@ function fixture(t) {
 
 test('reviewed source manifest and fixed compiler flags are pinned', t => {
   const { core } = fixture(t);
-  assert.equal(verifyReviewedCore(core), '4d674ca38c1d3719764fbd3ed2dd73b492495d0b9ef0b5b06f88921366d6606f');
+  assert.equal(verifyReviewedCore(core), 'b26d8a06b948cc0d240a062b90f3ca274d3c10a87030e7a2f2efb4e7579d0443');
   const args = helperCompileArgs(core, '/tmp/inert-output', 'arm64');
   assert.ok(args.includes('-fblocks'));
   assert.ok(args.includes('-g0'));

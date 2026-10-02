@@ -97,7 +97,7 @@ test('pure mock staging copies exact bytes once and rejects mismatched inputs', 
 
 test('actual signed-helper inspector enforces build version and name-only provenance policy before codesign', t => {
   const f = fixture(t);
-  const record = { ...f.approval.archives[TARGET], helperVersion: '1.0.0' };
+  const record = { ...f.approval.archives[TARGET], helperVersion: '1.0.1' };
   function probe(loadCommands, listedAttributes = '') {
     const calls = [];
     const run = (command, args) => {
@@ -106,7 +106,7 @@ test('actual signed-helper inspector enforces build version and name-only proven
         return {
           'Print :CFBundleIdentifier': 'org.shortlink.generator.credential-helper',
           'Print :CFBundleExecutable': 'credential-helper',
-          'Print :CFBundleShortVersionString': '1.0.0',
+          'Print :CFBundleShortVersionString': '1.0.1',
           'Print :XPCService:JoinExistingSession': 'true',
         }[args[1]];
       }

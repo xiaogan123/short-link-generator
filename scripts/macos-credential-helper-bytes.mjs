@@ -10,7 +10,7 @@ const REQUIRED = new Set([
   'Contents/MacOS/credential-helper',
   'Contents/_CodeSignature/CodeResources',
 ]);
-export const REVIEWED_HELPER_INFO_SHA256 = '4c97904ba69f213c212c50638d8506d4342e7982c8faf81b08bbbbd611720723';
+export const REVIEWED_HELPER_INFO_SHA256 = '87c8fdacf498ebdcf98e1f99674aa1f3c172c0e9f0e5a46a731a5d8249f8805e';
 
 export function helperPinForTarget(target, env) {
   const name = {

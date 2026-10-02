@@ -8,7 +8,7 @@ import { requireMacOS11BuildVersion } from './macos-build-version.mjs';
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 const sourceRoot = resolve(scriptDir, '../src-tauri/native/credential-core');
 const outputRoot = resolve(scriptDir, '../src-tauri/target/credential-helper-unlaunched');
-const REVIEWED_MANIFEST_SHA256 = '4d674ca38c1d3719764fbd3ed2dd73b492495d0b9ef0b5b06f88921366d6606f';
+const REVIEWED_MANIFEST_SHA256 = 'b26d8a06b948cc0d240a062b90f3ca274d3c10a87030e7a2f2efb4e7579d0443';
 const SOURCE_FILES = [
   'identity.c', 'policy.c', 'entitlements.c', 'credential_policy.c',
   'credential_protocol.c', 'xpc_credential.c', 'credential_native.c', 'helper.c',

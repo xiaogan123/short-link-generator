@@ -53,16 +53,15 @@ static bool identity_for_path(const char *path, uid_t user,
         || after.st_uid != user || after.st_nlink != 1
         || after.st_dev != before.st_dev || after.st_ino != before.st_ino)
         return false;
-    static const char domain[] = "shortlink-keychain-user-default-v1";
-    const size_t length = strlen(path);
+    static const char domain[] = "shortlink-keychain-user-default-v2";
+    const size_t length = strlen(canonical);
     CC_SHA256_CTX hash;
     if (CC_SHA256_Init(&hash) != 1) return false;
     CC_SHA256_Update(&hash, domain, (CC_LONG)sizeof(domain));
     hash_u64(&hash, (uint64_t)length);
-    CC_SHA256_Update(&hash, path, (CC_LONG)length);
+    CC_SHA256_Update(&hash, canonical, (CC_LONG)length);
     hash_u64(&hash, (uint64_t)before.st_uid);
     hash_u64(&hash, (uint64_t)before.st_dev);
-    hash_u64(&hash, (uint64_t)before.st_ino);
     return CC_SHA256_Final(identity, &hash) == 1
         && product_location_id_valid(identity);
 }
