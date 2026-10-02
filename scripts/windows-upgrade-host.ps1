@@ -49,6 +49,13 @@ try {
     Add-Type -TypeDefinition @'
 using System;
 using System.Runtime.InteropServices;
+[ComImport, Guid("000214F9-0000-0000-C000-000000000046"),
+ InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+interface IUpgradeShellLinkW {
+    [PreserveSig]
+    int GetPath([Out, MarshalAs(UnmanagedType.LPWStr)] System.Text.StringBuilder path,
+                int capacity, IntPtr findData, uint flags);
+}
 public static class UpgradeKnownFolder {
     [DllImport("shell32.dll")]
     private static extern int SHGetKnownFolderPath(ref Guid id, uint flags, IntPtr token, out IntPtr path);
@@ -59,6 +66,20 @@ public static class UpgradeKnownFolder {
         Marshal.ThrowExceptionForHR(hr);
         try { return Marshal.PtrToStringUni(pointer); }
         finally { Marshal.FreeCoTaskMem(pointer); }
+    }
+    public static string ReadShortcut(string path) {
+        object link = Activator.CreateInstance(Type.GetTypeFromCLSID(
+            new Guid("00021401-0000-0000-C000-000000000046"), true));
+        try {
+            // Load the existing Unicode filename read-only; never create, resolve or save it.
+            ((System.Runtime.InteropServices.ComTypes.IPersistFile)link).Load(path, 0);
+            var target = new System.Text.StringBuilder(260);
+            int hr = ((IUpgradeShellLinkW)link).GetPath(target, target.Capacity, IntPtr.Zero, 4);
+            Marshal.ThrowExceptionForHR(hr);
+            if (hr != 0 || target.Length == 0 || target.Length >= target.Capacity - 1)
+                throw new COMException("Shortcut target could not be read.");
+            return target.ToString();
+        } finally { Marshal.FinalReleaseComObject(link); }
     }
 }
 '@
@@ -118,11 +139,10 @@ public static class UpgradeKnownFolder {
         }
     }
     $shortcuts = [System.Collections.Generic.List[object]]::new()
-    $shell = New-Object -ComObject WScript.Shell
     foreach ($path in ($shortcutPaths | Select-Object -Unique)) {
         if (Test-Path -LiteralPath $path -PathType Any -ErrorAction Stop) {
             $item = Get-Item -LiteralPath $path -Force -ErrorAction Stop
-            $target = if ($item.PSIsContainer) { '' } else { [string]$shell.CreateShortcut($path).TargetPath }
+            $target = if ($item.PSIsContainer) { '' } else { [UpgradeKnownFolder]::ReadShortcut($path) }
             $shortcuts.Add(@{ path = $path; target = $target })
         }
     }
