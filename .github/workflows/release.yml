@@ -89,6 +89,11 @@ jobs:
       - name: Prepare pinned macOS signing tool
         if: runner.os == 'macOS'
         run: node scripts/rcodesign-tool.mjs --install
+      # Stage only the approved, hash-pinned, checked-in archive for this target.
+      # The current UNAPPROVED manifest stops this draft before extraction.
+      - name: Stage approved frozen macOS credential helper
+        if: runner.os == 'macOS'
+        run: node scripts/stage-macos-credential-helper.mjs ${{ matrix.target }}
       - name: Build installers locally on native runner
         id: package
         env:
@@ -135,6 +140,8 @@ jobs:
           RELEASE_SHA: ${{ needs.prepare.outputs.sha }}
           SLG_UPDATER_PUBLIC_KEY: ${{ vars.UPDATER_PUBLIC_KEY }}
           SLG_MACOS_CERT_SHA256: ${{ vars.MACOS_SIGNING_CERT_SHA256 }}
+          SLG_MACOS_HELPER_TREE_SHA256_ARM64: ${{ vars.MACOS_HELPER_TREE_SHA256_ARM64 }}
+          SLG_MACOS_HELPER_TREE_SHA256_X64: ${{ vars.MACOS_HELPER_TREE_SHA256_X64 }}
         run: node scripts/native-smoke.mjs src-tauri/target/${{ matrix.target }}/release/bundle ${{ matrix.target }}
       - name: Inspect candidate contents before upload
         id: privacy
@@ -184,6 +191,8 @@ jobs:
           RELEASE_SHA: ${{ needs.prepare.outputs.sha }}
           SLG_UPDATER_PUBLIC_KEY: ${{ vars.UPDATER_PUBLIC_KEY }}
           SLG_MACOS_CERT_SHA256: ${{ vars.MACOS_SIGNING_CERT_SHA256 }}
+          SLG_MACOS_HELPER_TREE_SHA256_ARM64: ${{ vars.MACOS_HELPER_TREE_SHA256_ARM64 }}
+          SLG_MACOS_HELPER_TREE_SHA256_X64: ${{ vars.MACOS_HELPER_TREE_SHA256_X64 }}
         run: node scripts/release-manifest.mjs candidates --require-evidence
       - name: Create a draft for final review
         env:

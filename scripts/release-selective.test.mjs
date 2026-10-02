@@ -12,7 +12,7 @@ import { updaterPublicKeySha256 } from './updater-signature.mjs';
 import { hash } from './macos-signature.mjs';
 import { readMacUpdater } from './macos-artifact.mjs';
 import { WINDOWS_UPGRADE_BASELINE } from './windows-upgrade-evidence.mjs';
-import { artifactEvidence, bundleEntries, CERT_PIN, nativeSigning, pack, testUpdaterSigner } from './test-fixtures/macos-artifact.mjs';
+import { artifactEvidence, bundleEntries, CERT_PIN, HELPER_TREE_PIN, nativeSigning, pack, testUpdaterSigner } from './test-fixtures/macos-artifact.mjs';
 
 const root = resolve('.');
 const digest = path => createHash('sha256').update(readFileSync(path)).digest('hex');
@@ -126,7 +126,8 @@ test('strict assembly checks source and artifact hashes and includes latest.json
     }
     const run = (extraEnv = {}) => spawnSync(process.execPath, [join(root, 'scripts/release-manifest.mjs'), 'candidates', '--require-evidence'], {
       cwd: dir, encoding: 'utf8', env: { ...process.env, RELEASE_TAG: 'v0.1.6', RELEASE_SHA: sha,
-        GITHUB_REPOSITORY: 'sample/short-link-generator', SLG_UPDATER_PUBLIC_KEY: TEST_PUBLIC_KEY, SLG_MACOS_CERT_SHA256: CERT_PIN, ...extraEnv },
+        GITHUB_REPOSITORY: 'sample/short-link-generator', SLG_UPDATER_PUBLIC_KEY: TEST_PUBLIC_KEY, SLG_MACOS_CERT_SHA256: CERT_PIN,
+        SLG_MACOS_HELPER_TREE_SHA256_ARM64: HELPER_TREE_PIN, SLG_MACOS_HELPER_TREE_SHA256_X64: HELPER_TREE_PIN, ...extraEnv },
     });
     assert.match(run().stderr, /Missing exact Windows upgrade evidence/);
     assert.equal(existsSync(join(dir, 'latest.json')), false);
@@ -289,7 +290,8 @@ test('manual ARM reuse derives the application tree from both commits and reject
     const evidenceFile = join(dir, 'candidates', 'candidate-aarch64-apple-darwin', 'native-smoke.json');
     const run = (releaseSha = reviewedSha) => spawnSync(process.execPath, [join(root, 'scripts/release-manifest.mjs'), 'candidates', '--require-evidence'], {
       cwd: dir, encoding: 'utf8', env: { ...process.env, RELEASE_TAG: 'v0.1.6', RELEASE_SHA: releaseSha,
-        GITHUB_REPOSITORY: 'sample/short-link-generator', SLG_UPDATER_PUBLIC_KEY: TEST_PUBLIC_KEY, SLG_MACOS_CERT_SHA256: CERT_PIN },
+        GITHUB_REPOSITORY: 'sample/short-link-generator', SLG_UPDATER_PUBLIC_KEY: TEST_PUBLIC_KEY, SLG_MACOS_CERT_SHA256: CERT_PIN,
+        SLG_MACOS_HELPER_TREE_SHA256_ARM64: HELPER_TREE_PIN, SLG_MACOS_HELPER_TREE_SHA256_X64: HELPER_TREE_PIN },
     });
     const assembled = run();
     assert.equal(assembled.status, 0, assembled.stderr);
@@ -428,6 +430,8 @@ test('release workflow is manual, selective, and scans before one-day upload', (
   assert.equal(steps[smoke].id, 'native_smoke');
   assert.equal(steps[smoke].env.SLG_UPDATER_PUBLIC_KEY, '${{ vars.UPDATER_PUBLIC_KEY }}');
   assert.equal(steps[smoke].env.SLG_MACOS_CERT_SHA256, '${{ vars.MACOS_SIGNING_CERT_SHA256 }}');
+  assert.equal(steps[smoke].env.SLG_MACOS_HELPER_TREE_SHA256_ARM64, '${{ vars.MACOS_HELPER_TREE_SHA256_ARM64 }}');
+  assert.equal(steps[smoke].env.SLG_MACOS_HELPER_TREE_SHA256_X64, '${{ vars.MACOS_HELPER_TREE_SHA256_X64 }}');
   const baseline = steps.findIndex(step => step.name === 'Download the pinned public Windows upgrade baseline');
   const upgrade = steps.findIndex(step => step.id === 'windows_upgrade');
   assert.ok(baseline >= 0 && upgrade > baseline && smoke > upgrade);
@@ -441,7 +445,15 @@ test('release workflow is manual, selective, and scans before one-day upload', (
   assert.match(steps[upgrade].run, /LASTEXITCODE -ne 0/);
   const packageStep = steps.find(step => step.id === 'package');
   const signerStep = steps.find(step => step.name === 'Prepare pinned macOS signing tool');
+  const helperStageStep = steps.find(step => step.name === 'Stage approved frozen macOS credential helper');
   assert.ok(steps.indexOf(signerStep) < steps.indexOf(packageStep));
+  assert.ok(steps.indexOf(signerStep) < steps.indexOf(helperStageStep) && steps.indexOf(helperStageStep) < steps.indexOf(packageStep));
+  assert.equal(helperStageStep.if, "runner.os == 'macOS'");
+  assert.match(helperStageStep.run, /stage-macos-credential-helper\.mjs.*matrix\.target/);
+  assert.equal(helperStageStep.env, undefined);
+  const helperStageSource = readFileSync(join(root, 'scripts/stage-macos-credential-helper.mjs'), 'utf8');
+  assert.match(helperStageSource, /checkedInArchiveRoot = resolve\(scriptDir, '\.\.\/src-tauri\/native\/credential-helper-archives'\)/);
+  assert.match(helperStageSource, /archive = join\(archiveRoot, `\$\{target\}\.zip`\)/);
   assert.equal(signerStep.if, "runner.os == 'macOS'");
   assert.equal(signerStep.env, undefined);
   assert.equal(signerStep.run, 'node scripts/rcodesign-tool.mjs --install');
@@ -458,5 +470,7 @@ test('release workflow is manual, selective, and scans before one-day upload', (
   const assemble = release.jobs.draft.steps.find(step => step.name?.includes('assemble the draft assets'));
   assert.equal(assemble.env.SLG_UPDATER_PUBLIC_KEY, '${{ vars.UPDATER_PUBLIC_KEY }}');
   assert.equal(assemble.env.SLG_MACOS_CERT_SHA256, '${{ vars.MACOS_SIGNING_CERT_SHA256 }}');
+  assert.equal(assemble.env.SLG_MACOS_HELPER_TREE_SHA256_ARM64, '${{ vars.MACOS_HELPER_TREE_SHA256_ARM64 }}');
+  assert.equal(assemble.env.SLG_MACOS_HELPER_TREE_SHA256_X64, '${{ vars.MACOS_HELPER_TREE_SHA256_X64 }}');
   assert.equal(existsSync('.github/workflows/release.yml'), true);
 });

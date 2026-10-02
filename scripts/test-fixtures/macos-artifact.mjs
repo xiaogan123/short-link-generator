@@ -1,8 +1,10 @@
 import { createHash, generateKeyPairSync, sign } from 'node:crypto';
 import { gzipSync } from 'node:zlib';
 import { stableRequirement, hash } from '../macos-signature.mjs';
+import { REVIEWED_HELPER_INFO_SHA256 } from '../macos-credential-helper-bytes.mjs';
 
 export const CERT_PIN = 'd'.repeat(64);
+export const HELPER_TREE_PIN = 'c'.repeat(64);
 const certificateSha1 = 'e'.repeat(40);
 const designatedRequirement = stableRequirement(certificateSha1);
 export const nativeSigning = { identity: 'self-signed', identityVerified: true, signatureVerified: true,
@@ -60,5 +62,7 @@ export function testUpdaterSigner() {
 export function artifactEvidence(manifest, buildBundleCompared = true) {
   return { schema: 1, updaterBundleVerified: true, contentMatchVerified: true, modesMatchVerified: true,
     buildBundleCompared, bundleManifestSha256: manifest.sha256, entryCount: manifest.entryCount, fileCount: manifest.fileCount,
+    helperTreeSha256: HELPER_TREE_PIN, helperInfoSha256: REVIEWED_HELPER_INFO_SHA256,
+    helperByteIdentityVerified: true, helperMetadataVerified: true, helperVerifiedAppCount: buildBundleCompared ? 3 : 2,
     updaterSigning: { ...nativeSigning }, ...(buildBundleCompared ? { buildSigning: { ...nativeSigning } } : {}) };
 }

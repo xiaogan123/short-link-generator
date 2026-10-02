@@ -3,6 +3,7 @@ import { chmodSync, lchmodSync, lstatSync, mkdirSync, readFileSync, readdirSync,
 import { join, posix, resolve, sep } from 'node:path';
 import { gunzipSync } from 'node:zlib';
 import { validateMacSigningEvidence, verifyMacSigning } from './macos-signature.mjs';
+import { REVIEWED_HELPER_INFO_SHA256, verifyEmbeddedHelper } from './macos-credential-helper-bytes.mjs';
 
 // Fail closed beyond these bounds. Normal Tauri bundles are much smaller.
 const MAX_COMPRESSED = 256 * 1024 * 1024;
@@ -206,12 +207,17 @@ export function bundleManifest(app) {
   return manifest(entries, 'Bundle.app');
 }
 
-export function validateMacArtifactEvidence(evidence, pin, updaterManifest, nativeSigning) {
+export function validateMacArtifactEvidence(evidence, pin, updaterManifest, nativeSigning, helperTreePin) {
   const hex = value => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
   if (!evidence || evidence.schema !== 1 || evidence.updaterBundleVerified !== true || evidence.contentMatchVerified !== true ||
       evidence.modesMatchVerified !== true || typeof evidence.buildBundleCompared !== 'boolean' || !hex(evidence.bundleManifestSha256) ||
       !Number.isInteger(evidence.entryCount) || evidence.entryCount < 1 || !Number.isInteger(evidence.fileCount) || evidence.fileCount < 1 ||
       evidence.fileCount > evidence.entryCount || evidence.entryCount > MAX_ENTRIES) throw new Error('macOS artifact comparison evidence is incomplete.');
+  if (!hex(helperTreePin) || evidence.helperTreeSha256 !== helperTreePin ||
+      evidence.helperInfoSha256 !== REVIEWED_HELPER_INFO_SHA256 || evidence.helperByteIdentityVerified !== true ||
+      evidence.helperMetadataVerified !== true || evidence.helperVerifiedAppCount !== (evidence.buildBundleCompared ? 3 : 2)) {
+    throw new Error('macOS credential helper archive evidence is incomplete.');
+  }
   for (const signing of [nativeSigning, evidence.updaterSigning, ...(evidence.buildBundleCompared ? [evidence.buildSigning] : [])]) {
     validateMacSigningEvidence(signing, pin);
     if (signing.certificateSha1 !== nativeSigning.certificateSha1 || signing.designatedRequirementSha256 !== nativeSigning.designatedRequirementSha256) {
@@ -224,7 +230,9 @@ export function validateMacArtifactEvidence(evidence, pin, updaterManifest, nati
   }
 }
 
-export function verifyMacArtifactSet({ updater, installedApp, builtApp, destination, pin, verify = verifyMacSigning }) {
+export function verifyMacArtifactSet({ updater, installedApp, builtApp, destination, pin, helperTreePin,
+  verify = verifyMacSigning, verifyHelper = verifyEmbeddedHelper }) {
+  if (!/^[a-f0-9]{64}$/.test(helperTreePin ?? '')) throw new Error('Approved credential helper archive pin is required.');
   const extracted = extractMacUpdater(updater, destination);
   const installed = bundleManifest(installedApp);
   if (extracted.manifest.sha256 !== installed.sha256) throw new Error('DMG and updater bundle content or modes differ.');
@@ -235,9 +243,19 @@ export function verifyMacArtifactSet({ updater, installedApp, builtApp, destinat
     if (bundleManifest(builtApp).sha256 !== installed.sha256) throw new Error('Build and packaged bundle content or modes differ.');
     buildSigning = verify(builtApp, pin);
   }
+  // The same approved signed helper archive must survive the built bundle,
+  // read-only DMG extraction and updater extraction byte-for-byte.
+  for (const app of [installedApp, extracted.app, ...(builtApp ? [builtApp] : [])]) {
+    const helper = verifyHelper(app, helperTreePin);
+    if (helper?.treeSha256 !== helperTreePin || helper.infoSha256 !== REVIEWED_HELPER_INFO_SHA256) {
+      throw new Error('macOS credential helper archive differs across artifacts.');
+    }
+  }
   const macArtifacts = { schema: 1, updaterBundleVerified: true, contentMatchVerified: true, modesMatchVerified: true,
     buildBundleCompared: Boolean(builtApp), bundleManifestSha256: installed.sha256, entryCount: installed.entryCount, fileCount: installed.fileCount,
+    helperTreeSha256: helperTreePin, helperInfoSha256: REVIEWED_HELPER_INFO_SHA256,
+    helperByteIdentityVerified: true, helperMetadataVerified: true, helperVerifiedAppCount: builtApp ? 3 : 2,
     updaterSigning, ...(buildSigning ? { buildSigning } : {}) };
-  validateMacArtifactEvidence(macArtifacts, pin, extracted.manifest, nativeSigning);
+  validateMacArtifactEvidence(macArtifacts, pin, extracted.manifest, nativeSigning, helperTreePin);
   return { nativeSigning, macArtifacts };
 }

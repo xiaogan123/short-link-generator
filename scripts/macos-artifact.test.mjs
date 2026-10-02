@@ -2,10 +2,11 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { chmodSync, existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, truncateSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { gzipSync } from 'node:zlib';
 import { bundleManifest, extractMacUpdater, readMacUpdater, validateMacArtifactEvidence, verifyMacArtifactSet } from './macos-artifact.mjs';
-import { artifactEvidence, bundleEntries, CERT_PIN, nativeSigning, pack, pax, tarBytes } from './test-fixtures/macos-artifact.mjs';
+import { artifactEvidence, bundleEntries, CERT_PIN, HELPER_TREE_PIN, nativeSigning, pack, pax, tarBytes } from './test-fixtures/macos-artifact.mjs';
+import { helperTreeDigest, REVIEWED_HELPER_INFO_SHA256 } from './macos-credential-helper-bytes.mjs';
 import { inspect } from './privacy-check.mjs';
 
 function fixture(t) {
@@ -148,14 +149,50 @@ test('verifies exact DMG, updater and build bundles plus independent stable iden
   const builtApp = extractMacUpdater(archive, join(dir, 'built')).app;
   let calls = [];
   const verify = (app, pin) => { calls.push(app); assert.equal(pin, CERT_PIN); return { ...nativeSigning }; };
-  const result = verifyMacArtifactSet({ updater: archive, installedApp, builtApp, destination: join(dir, 'checked'), pin: CERT_PIN, verify });
+  const helperCalls = [];
+  const verifyHelper = (app, pin) => { helperCalls.push(app); assert.equal(pin, HELPER_TREE_PIN);
+    return { treeSha256: pin, infoSha256: REVIEWED_HELPER_INFO_SHA256 }; };
+  const result = verifyMacArtifactSet({ updater: archive, installedApp, builtApp, destination: join(dir, 'checked'),
+    pin: CERT_PIN, helperTreePin: HELPER_TREE_PIN, verify, verifyHelper });
   assert.equal(calls.length, 3); assert.equal(new Set(calls).size, 3);
-  validateMacArtifactEvidence(result.macArtifacts, CERT_PIN, readMacUpdater(archive).manifest, result.nativeSigning);
+  assert.equal(helperCalls.length, 3); assert.equal(new Set(helperCalls).size, 3);
+  validateMacArtifactEvidence(result.macArtifacts, CERT_PIN, readMacUpdater(archive).manifest, result.nativeSigning, HELPER_TREE_PIN);
   const executable = join(builtApp, 'Contents/MacOS/short-link-generator'); chmodSync(executable, 0o644);
-  assert.throws(() => verifyMacArtifactSet({ updater: archive, installedApp, builtApp, destination: join(dir, 'mode'), pin: CERT_PIN, verify }), /Build and packaged/);
+  assert.throws(() => verifyMacArtifactSet({ updater: archive, installedApp, builtApp, destination: join(dir, 'mode'),
+    pin: CERT_PIN, helperTreePin: HELPER_TREE_PIN, verify, verifyHelper }), /Build and packaged/);
   chmodSync(executable, 0o755); writeFileSync(join(installedApp, 'Contents/Info.plist'), 'changed'); calls = [];
-  assert.throws(() => verifyMacArtifactSet({ updater: archive, installedApp, destination: join(dir, 'changed'), pin: CERT_PIN, verify }), /DMG and updater/);
+  assert.throws(() => verifyMacArtifactSet({ updater: archive, installedApp, destination: join(dir, 'changed'),
+    pin: CERT_PIN, helperTreePin: HELPER_TREE_PIN, verify, verifyHelper }), /DMG and updater/);
   assert.equal(calls.length, 0);
+});
+
+test('native artifact path checks the helper in all three actual app trees', t => {
+  const { dir, archive } = fixture(t);
+  const root = 'Example.app/Contents/XPCServices/credential-helper.xpc';
+  const reviewedInfo = readFileSync(resolve(import.meta.dirname, '../src-tauri/native/credential-core/helper-Info.plist'));
+  const helperEntries = [
+    { path: 'Example.app/Contents/XPCServices', type: '5' },
+    { path: root, type: '5' },
+    { path: `${root}/Contents`, type: '5' },
+    { path: `${root}/Contents/Info.plist`, data: reviewedInfo },
+    { path: `${root}/Contents/MacOS`, type: '5' },
+    { path: `${root}/Contents/MacOS/credential-helper`, data: Buffer.from([0xcf, 0xfa, 0xed, 0xfe]), mode: 0o755 },
+    { path: `${root}/Contents/_CodeSignature`, type: '5' },
+    { path: `${root}/Contents/_CodeSignature/CodeResources`, data: 'mock-signature-only' },
+  ];
+  writeFileSync(archive, pack([...bundleEntries(), ...helperEntries]));
+  const installedApp = extractMacUpdater(archive, join(dir, 'installed')).app;
+  const builtApp = extractMacUpdater(archive, join(dir, 'built')).app;
+  const pin = helperTreeDigest(join(installedApp, 'Contents/XPCServices/credential-helper.xpc'));
+  const verify = () => ({ ...nativeSigning });
+  const result = verifyMacArtifactSet({ updater: archive, installedApp, builtApp,
+    destination: join(dir, 'updater'), pin: CERT_PIN, helperTreePin: pin, verify });
+  assert.equal(result.macArtifacts.helperVerifiedAppCount, 3);
+  assert.equal(result.macArtifacts.helperTreeSha256, pin);
+  writeFileSync(archive, pack(bundleEntries()));
+  const missing = extractMacUpdater(archive, join(dir, 'missing-installed')).app;
+  assert.throws(() => verifyMacArtifactSet({ updater: archive, installedApp: missing,
+    destination: join(dir, 'missing-updater'), pin: CERT_PIN, helperTreePin: pin, verify }));
 });
 
 test('rejects stripped, forged and mismatched archive evidence including missing stable pin', t => {
@@ -164,11 +201,15 @@ test('rejects stripped, forged and mismatched archive evidence including missing
   for (const patch of [{ updaterBundleVerified: false }, { contentMatchVerified: false }, { modesMatchVerified: false },
     { schema: 0 }, { bundleManifestSha256: 'a'.repeat(64) }, { entryCount: 0 }, { fileCount: 999 },
     { updaterSigning: undefined }, { buildSigning: undefined }, { buildBundleCompared: false },
+    { helperTreeSha256: 'a'.repeat(64) }, { helperInfoSha256: 'a'.repeat(64) },
+    { helperByteIdentityVerified: false }, { helperMetadataVerified: false }, { helperVerifiedAppCount: 2 },
     { updaterSigning: { ...nativeSigning, certificateSha256: 'b'.repeat(64) } },
     { updaterSigning: { ...nativeSigning, designatedRequirement: 'identifier org.shortlink.generator' } }]) {
-    assert.throws(() => validateMacArtifactEvidence({ ...evidence, ...patch }, CERT_PIN, manifest, nativeSigning));
+    assert.throws(() => validateMacArtifactEvidence({ ...evidence, ...patch }, CERT_PIN, manifest, nativeSigning, HELPER_TREE_PIN));
   }
-  assert.throws(() => validateMacArtifactEvidence(evidence, undefined, manifest, nativeSigning));
-  assert.throws(() => validateMacArtifactEvidence(evidence, 'b'.repeat(64), manifest, nativeSigning));
-  assert.throws(() => validateMacArtifactEvidence(evidence, CERT_PIN, manifest, { ...nativeSigning, certificateSha1: '1'.repeat(40) }));
+  assert.throws(() => validateMacArtifactEvidence(evidence, undefined, manifest, nativeSigning, HELPER_TREE_PIN));
+  assert.throws(() => validateMacArtifactEvidence(evidence, CERT_PIN, manifest, nativeSigning, undefined));
+  assert.throws(() => validateMacArtifactEvidence(evidence, CERT_PIN, manifest, nativeSigning, 'b'.repeat(64)));
+  assert.throws(() => validateMacArtifactEvidence(evidence, 'b'.repeat(64), manifest, nativeSigning, HELPER_TREE_PIN));
+  assert.throws(() => validateMacArtifactEvidence(evidence, CERT_PIN, manifest, { ...nativeSigning, certificateSha1: '1'.repeat(40) }, HELPER_TREE_PIN));
 });

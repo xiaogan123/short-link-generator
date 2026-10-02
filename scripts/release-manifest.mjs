@@ -6,6 +6,7 @@ import { matchingAppInputs } from './release-app-inputs.mjs';
 import { updaterPublicKeySha256, verifyUpdaterSignatureFile } from './updater-signature.mjs';
 import { validateMacSigningEvidence } from './macos-signature.mjs';
 import { readMacUpdater, validateMacArtifactEvidence } from './macos-artifact.mjs';
+import { helperPinForTarget } from './macos-credential-helper-bytes.mjs';
 import { readWindowsUpgradeEvidence, validateWindowsUpgradeEvidence } from './windows-upgrade-evidence.mjs';
 const version=JSON.parse(readFileSync('package.json','utf8')).version;
 const repository=process.env.GITHUB_REPOSITORY;
@@ -109,7 +110,7 @@ if(requireEvidence){
     if(!files.includes(signature)||lstatSync(signature).isSymbolicLink()||!readFileSync(signature,'utf8').trim())throw new Error(`Missing updater signature for ${target}.`);
     verifyUpdaterSignatureFile(updater,signature,updaterPublicKey,version);
     if(target.includes('apple')){
-      validateMacArtifactEvidence(evidence.macArtifacts,process.env.SLG_MACOS_CERT_SHA256,readMacUpdater(updater).manifest,evidence.nativeSigning);
+      validateMacArtifactEvidence(evidence.macArtifacts,process.env.SLG_MACOS_CERT_SHA256,readMacUpdater(updater).manifest,evidence.nativeSigning,helperPinForTarget(target,process.env));
       if(evidence.method!=='manual-local'&&evidence.macArtifacts.buildBundleCompared!==true)throw new Error('Native macOS build comparison evidence is required.');
     }
     verifiedSignatures.add(signature);

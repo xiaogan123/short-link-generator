@@ -1,6 +1,6 @@
 [package]
 name = "short-link-generator"
-version = "0.1.12"
+version = "0.1.13"
 description = "短连接生成器"
 authors = ["Contributors"]
 edition = "2021"
@@ -11,6 +11,8 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
+cc = "1"
+sha2 = "0.10"
 
 [dependencies]
 tauri = { version = "2", features = [] }

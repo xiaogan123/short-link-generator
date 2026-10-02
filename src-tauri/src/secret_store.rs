@@ -15,14 +15,10 @@ use std::{
 };
 #[cfg(not(test))]
 use std::{sync::OnceLock, time::Instant};
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
-#[cfg(not(test))]
-const KEYRING_SERVICE: &str = if cfg!(target_os = "macos") {
-    "org.shortlink.generator.credentials.v2"
-} else {
-    "org.shortlink.generator"
-};
+#[cfg(all(not(test), not(target_os = "macos")))]
+const KEYRING_SERVICE: &str = "org.shortlink.generator";
 #[cfg(not(test))]
 const CACHE_IDLE_TTL: Duration = Duration::from_secs(30 * 60);
 #[cfg(not(test))]
@@ -44,6 +40,8 @@ pub(crate) enum SecretError {
     Conflict,
     #[cfg(any(target_os = "macos", test))]
     ReadbackMismatch,
+    #[cfg(any(target_os = "macos", test))]
+    LocationUnavailable,
     #[cfg(any(target_os = "macos", target_os = "windows", test))]
     DeletionNotConfirmed,
 }
@@ -64,6 +62,10 @@ impl fmt::Display for SecretError {
             Self::Conflict => "本机凭据在更新期间发生冲突，未覆盖任何已有值；请重新核对并确认",
             #[cfg(any(target_os = "macos", test))]
             Self::ReadbackMismatch => "新本机凭据读回不一致，未完成授权更新；旧凭据已保留",
+            #[cfg(any(target_os = "macos", test))]
+            Self::LocationUnavailable => {
+                "系统凭据库位置已变化或无法核对，请重新打开应用后重试；本机账户记录保留"
+            }
             #[cfg(any(target_os = "macos", target_os = "windows", test))]
             Self::DeletionNotConfirmed => "无法确认本机凭据已删除，账户记录已保留，请稍后重试",
         })
@@ -71,6 +73,9 @@ impl fmt::Display for SecretError {
 }
 
 trait CredentialBackend: Send + Sync + 'static {
+    fn location_check(&self) -> Result<(), SecretError> {
+        Ok(())
+    }
     fn get(&self, id: &str, kind: &str) -> Result<Zeroizing<String>, SecretError>;
     fn set(&self, id: &str, kind: &str, value: &str) -> Result<(), SecretError>;
     fn delete(&self, id: &str, kind: &str) -> Result<(), SecretError>;
@@ -97,17 +102,17 @@ impl Clock for SystemClock {
     }
 }
 
-#[cfg(not(test))]
+#[cfg(all(not(test), not(target_os = "macos")))]
 struct KeyringBackend;
 
-#[cfg(not(test))]
+#[cfg(all(not(test), not(target_os = "macos")))]
 impl KeyringBackend {
     fn entry(id: &str, kind: &str) -> Result<keyring::Entry, SecretError> {
         keyring::Entry::new(KEYRING_SERVICE, &format!("{kind}:{id}")).map_err(map_keyring_error)
     }
 }
 
-#[cfg(not(test))]
+#[cfg(all(not(test), not(target_os = "macos")))]
 impl CredentialBackend for KeyringBackend {
     fn get(&self, id: &str, kind: &str) -> Result<Zeroizing<String>, SecretError> {
         Self::entry(id, kind)?
@@ -130,6 +135,7 @@ impl CredentialBackend for KeyringBackend {
     }
 }
 
+#[cfg(any(test, not(target_os = "macos")))]
 fn map_keyring_error(error: keyring::Error) -> SecretError {
     match error {
         keyring::Error::NoEntry => SecretError::Missing,
@@ -272,7 +278,27 @@ impl<B: CredentialBackend, C: Clock> SecretStore<B, C> {
             .clone()
     }
 
+    fn check_location(&self) -> Result<(), SecretError> {
+        let result = self.backend.location_check();
+        if result.is_err() {
+            self.clear_all();
+        }
+        result
+    }
+
     fn get(&self, id: &str, kind: &str) -> Result<String, SecretError> {
+        self.check_location()?;
+        let mut result = self.get_inner(id, kind);
+        if let Err(error) = self.check_location() {
+            if let Ok(secret) = &mut result {
+                secret.zeroize();
+            }
+            return Err(error);
+        }
+        result
+    }
+
+    fn get_inner(&self, id: &str, kind: &str) -> Result<String, SecretError> {
         let store_epoch = self.epoch.load(std::sync::atomic::Ordering::SeqCst);
         let slot = self.slot(id, kind);
         let mut waited_load = None;
@@ -394,6 +420,13 @@ impl<B: CredentialBackend, C: Clock> SecretStore<B, C> {
     }
 
     fn set(&self, id: &str, kind: &str, value: &str) -> Result<(), SecretError> {
+        self.check_location()?;
+        let result = self.set_inner(id, kind, value);
+        self.check_location()?;
+        result
+    }
+
+    fn set_inner(&self, id: &str, kind: &str, value: &str) -> Result<(), SecretError> {
         let store_epoch = self.epoch.load(std::sync::atomic::Ordering::SeqCst);
         let slot = self.slot(id, kind);
         let generation = self.begin_mutation(&slot);
@@ -418,6 +451,13 @@ impl<B: CredentialBackend, C: Clock> SecretStore<B, C> {
     }
 
     fn delete(&self, id: &str, kind: &str) -> Result<(), SecretError> {
+        self.check_location()?;
+        let result = self.delete_inner(id, kind);
+        self.check_location()?;
+        result
+    }
+
+    fn delete_inner(&self, id: &str, kind: &str) -> Result<(), SecretError> {
         let store_epoch = self.epoch.load(std::sync::atomic::Ordering::SeqCst);
         let slot = self.slot(id, kind);
         let operation = self.begin_mutation(&slot);
@@ -533,12 +573,47 @@ fn wait<'a, T>(condvar: &Condvar, guard: MutexGuard<'a, T>) -> MutexGuard<'a, T>
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-#[cfg(not(test))]
+#[cfg(all(not(test), target_os = "macos"))]
+struct MacHelperBackend;
+
+#[cfg(all(not(test), target_os = "macos"))]
+impl CredentialBackend for MacHelperBackend {
+    fn location_check(&self) -> Result<(), SecretError> {
+        crate::mac_helper_adapter::verify_location().map(|_| ())
+    }
+    fn get(&self, id: &str, kind: &str) -> Result<Zeroizing<String>, SecretError> {
+        crate::mac_helper_adapter::current_read(id, kind)
+    }
+
+    fn set(&self, id: &str, kind: &str, value: &str) -> Result<(), SecretError> {
+        crate::mac_helper_adapter::current_upsert(id, kind, value)
+    }
+
+    fn delete(&self, id: &str, kind: &str) -> Result<(), SecretError> {
+        crate::mac_helper_adapter::current_delete(id, kind)
+    }
+}
+
+#[cfg(all(not(test), not(target_os = "macos")))]
 fn store() -> &'static SecretStore<KeyringBackend, SystemClock> {
     static STORE: OnceLock<SecretStore<KeyringBackend, SystemClock>> = OnceLock::new();
     STORE.get_or_init(|| {
         SecretStore::new(
             Arc::new(KeyringBackend),
+            SystemClock::new(),
+            CACHE_IDLE_TTL,
+            CACHE_MAX_LIFETIME,
+            MISSING_CACHE_TTL,
+        )
+    })
+}
+
+#[cfg(all(not(test), target_os = "macos"))]
+fn store() -> &'static SecretStore<MacHelperBackend, SystemClock> {
+    static STORE: OnceLock<SecretStore<MacHelperBackend, SystemClock>> = OnceLock::new();
+    STORE.get_or_init(|| {
+        SecretStore::new(
+            Arc::new(MacHelperBackend),
             SystemClock::new(),
             CACHE_IDLE_TTL,
             CACHE_MAX_LIFETIME,
@@ -618,35 +693,46 @@ pub(crate) fn register_routes(accounts: &[crate::model::Account]) {
 
 /// The token is supplied by the user and already validated for this account.
 /// This limited entry point never reads the legacy namespace or activates a route.
+#[cfg(all(not(test), target_os = "macos"))]
+fn finish_mac_location_scope<T>(result: Result<T, SecretError>) -> Result<T, SecretError> {
+    let location = crate::mac_helper_adapter::verify_location();
+    store().clear_all();
+    location?;
+    result
+}
+
 #[cfg(not(test))]
 pub(crate) fn set_explicit_token(id: &str, value: &str, replace: bool) -> Result<(), SecretError> {
     #[cfg(target_os = "macos")]
     {
         use crate::credential_migration::MigrationBackend;
         let backend = crate::mac_credentials::NativeMigration;
+        crate::mac_helper_adapter::verify_location()?;
         // Invalidate before native work, including every failure/readback path.
         store().clear_all();
-        let created = if replace {
-            KeyringBackend.set(id, "token", value)?;
-            None
-        } else {
-            Some(backend.create(id, "token", value)?)
-        };
-        let actual = backend.current(id, "token")?;
-        if actual.as_str() != value {
-            return Err(
-                if matches!(
-                    created,
-                    Some(crate::credential_migration::Created::AlreadyExists)
-                ) {
-                    SecretError::Conflict
-                } else {
-                    SecretError::ReadbackMismatch
-                },
-            );
-        }
-        store().clear_all();
-        Ok(())
+        let result = (|| {
+            let created = if replace {
+                MacHelperBackend.set(id, "token", value)?;
+                None
+            } else {
+                Some(backend.create(id, "token", value)?)
+            };
+            let actual = backend.current(id, "token")?;
+            if actual.as_str() != value {
+                return Err(
+                    if matches!(
+                        created,
+                        Some(crate::credential_migration::Created::AlreadyExists)
+                    ) {
+                        SecretError::Conflict
+                    } else {
+                        SecretError::ReadbackMismatch
+                    },
+                );
+            }
+            Ok(())
+        })();
+        finish_mac_location_scope(result)
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -660,11 +746,13 @@ pub(crate) fn set_explicit_token(id: &str, value: &str, replace: bool) -> Result
 #[cfg(all(not(test), target_os = "macos"))]
 pub(crate) fn remove_current_account(id: &str) -> Result<(), SecretError> {
     use crate::credential_migration::MigrationBackend;
+    crate::mac_helper_adapter::verify_location()?;
     store().clear_all();
-    crate::credential_migration::remove_current_verified(
-        |kind| KeyringBackend.delete(id, kind),
+    let result = crate::credential_migration::remove_current_verified(
+        |kind| MacHelperBackend.delete(id, kind),
         |kind| crate::mac_credentials::NativeMigration.current(id, kind),
-    )
+    );
+    finish_mac_location_scope(result)
 }
 
 #[cfg(any(all(not(test), target_os = "windows"), test))]
@@ -692,10 +780,10 @@ pub(crate) fn remove_current_account(id: &str) -> Result<(), SecretError> {
 
 #[cfg(all(not(test), target_os = "macos"))]
 pub(crate) fn migrate_account(id: &str) -> Result<(), SecretError> {
+    crate::mac_helper_adapter::verify_location()?;
     store().clear_all();
     let result = crate::credential_migration::migrate(&crate::mac_credentials::NativeMigration, id);
-    store().clear_all();
-    result
+    finish_mac_location_scope(result)
 }
 
 #[cfg(test)]
@@ -792,6 +880,8 @@ mod tests {
 
     #[derive(Default)]
     struct MockBackend {
+        expected_location: AtomicU64,
+        observed_location: AtomicU64,
         values: Mutex<HashMap<CacheKey, String>>,
         get_count: AtomicUsize,
         set_count: AtomicUsize,
@@ -823,6 +913,16 @@ mod tests {
     }
 
     impl CredentialBackend for MockBackend {
+        fn location_check(&self) -> Result<(), SecretError> {
+            if self.observed_location.load(Ordering::SeqCst)
+                != self.expected_location.load(Ordering::SeqCst)
+            {
+                Err(SecretError::LocationUnavailable)
+            } else {
+                Ok(())
+            }
+        }
+
         fn get(&self, id: &str, kind: &str) -> Result<Zeroizing<String>, SecretError> {
             self.get_count.fetch_add(1, Ordering::SeqCst);
             let error = *lock(&self.get_error);
@@ -1239,5 +1339,83 @@ mod tests {
         backend.release_gets();
         assert!(success(rx.recv_timeout(StdDuration::from_secs(1)).unwrap()) == "two");
         assert!(success(slow.join().unwrap()) == "one");
+    }
+
+    #[test]
+    fn location_drift_is_checked_before_positive_and_missing_cache_hits() {
+        let (store, backend, _) = fixture(Duration::from_secs(600));
+        backend.put("acct", "token", "synthetic");
+        assert!(success(store.get("acct", "token")) == "synthetic");
+        assert!(matches!(
+            store.get("absent", "token"),
+            Err(SecretError::Missing)
+        ));
+        assert_eq!(backend.get_count.load(Ordering::SeqCst), 2);
+
+        backend.observed_location.store(1, Ordering::SeqCst);
+        assert!(matches!(
+            store.get("acct", "token"),
+            Err(SecretError::LocationUnavailable)
+        ));
+        assert!(matches!(
+            store.get("absent", "token"),
+            Err(SecretError::LocationUnavailable)
+        ));
+        assert_eq!(backend.get_count.load(Ordering::SeqCst), 2);
+        for id in ["acct", "absent"] {
+            assert!(matches!(
+                lock(&store.slot(id, "token").inner).state,
+                SlotState::Empty
+            ));
+        }
+    }
+
+    #[test]
+    fn location_drift_invalidates_inflight_read_before_it_can_refill() {
+        let (store, backend, _) = fixture(Duration::from_secs(600));
+        backend.put("acct", "token", "synthetic");
+        backend.block_gets();
+        let reader_store = store.clone();
+        let reader = thread::spawn(move || reader_store.get("acct", "token"));
+        backend.wait_until_get_entered();
+
+        backend.observed_location.store(1, Ordering::SeqCst);
+        assert!(matches!(
+            store.get("acct", "token"),
+            Err(SecretError::LocationUnavailable)
+        ));
+        backend.release_gets();
+        assert!(matches!(
+            reader.join().unwrap(),
+            Err(SecretError::LocationUnavailable)
+        ));
+        assert!(matches!(
+            lock(&store.slot("acct", "token").inner).state,
+            SlotState::Empty
+        ));
+    }
+
+    #[test]
+    fn location_drift_after_dispatched_write_fails_without_cached_success() {
+        let (store, backend, _) = fixture(Duration::from_secs(600));
+        backend.set_gate.block();
+        let setter_store = store.clone();
+        let setter = thread::spawn(move || setter_store.set("acct", "token", "synthetic"));
+        backend.set_gate.wait_until_entered();
+        backend.observed_location.store(1, Ordering::SeqCst);
+        backend.set_gate.release();
+        assert!(matches!(
+            setter.join().unwrap(),
+            Err(SecretError::LocationUnavailable)
+        ));
+        assert!(matches!(
+            lock(&store.slot("acct", "token").inner).state,
+            SlotState::Empty
+        ));
+        assert!(matches!(
+            store.delete("acct", "token"),
+            Err(SecretError::LocationUnavailable)
+        ));
+        assert_eq!(backend.delete_count.load(Ordering::SeqCst), 0);
     }
 }

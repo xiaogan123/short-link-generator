@@ -11,6 +11,10 @@ mod link_create_only_tests;
 mod local_check;
 #[cfg(target_os = "macos")]
 mod mac_credentials;
+#[cfg(target_os = "macos")]
+mod mac_helper_adapter;
+#[cfg(all(target_os = "macos", not(test)))]
+mod mac_helper_ffi;
 mod model;
 mod pools;
 mod secret_store;

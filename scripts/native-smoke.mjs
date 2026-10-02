@@ -9,6 +9,7 @@ import {
 } from './updater-signature.mjs';
 import { observeWindowsWindow } from './windows-window-observer.mjs';
 import { bundleManifest, verifyMacArtifactSet } from './macos-artifact.mjs';
+import { helperPinForTarget } from './macos-credential-helper-bytes.mjs';
 
 const targets = {
   'aarch64-apple-darwin': { host: 'darwin', arch: 'arm64', binaryArch: 'arm64', updater: '.app.tar.gz' },
@@ -148,7 +149,7 @@ export async function observeStartup(binary, cwd, env, expectWindow, args = []) 
   }
 }
 
-async function smokeMac(installer, updater, bundle, config, temp) {
+async function smokeMac(installer, updater, bundle, config, temp, target) {
   const mount = join(temp, 'mount');
   mkdirSync(mount);
   let attached = false;
@@ -164,7 +165,9 @@ async function smokeMac(installer, updater, bundle, config, temp) {
     const builtApps = readdirSync(join(bundle, 'macos')).filter(name => name.endsWith('.app'));
     if (builtApps.length !== 1) throw new Error('Expected exactly one built macOS application.');
     const { nativeSigning, macArtifacts } = verifyMacArtifactSet({ updater, installedApp: app,
-      builtApp: join(bundle, 'macos', builtApps[0]), destination: join(temp, 'updater'), pin: process.env.SLG_MACOS_CERT_SHA256 });
+      builtApp: join(bundle, 'macos', builtApps[0]), destination: join(temp, 'updater'),
+      pin: process.env.SLG_MACOS_CERT_SHA256,
+      helperTreePin: helperPinForTarget(target, process.env) });
     const binary = join(app, 'Contents', 'MacOS', 'short-link-generator');
     const archs = run('lipo', ['-archs', binary]).split(/\s+/);
     if (archs.length !== 1 || archs[0] !== config.binaryArch) {
@@ -223,7 +226,7 @@ export async function main(args = process.argv.slice(2)) {
   const temp = mkdtempSync(join(process.env.RUNNER_TEMP ?? tmpdir(), 'slg-native-smoke-'));
   try {
     const result = config.host === 'darwin'
-      ? await smokeMac(installer, updater, bundle, config, temp)
+      ? await smokeMac(installer, updater, bundle, config, temp, target)
       : await smokeWindows(installer, temp);
     const evidence = { schema: 1, tag, sha, target,
       host: `${process.platform}-${process.arch}`, checkedAt: new Date().toISOString(),

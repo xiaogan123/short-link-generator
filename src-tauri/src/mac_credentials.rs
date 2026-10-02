@@ -1,4 +1,4 @@
-//! macOS-only default-ACL creation and exclusive local configuration lifetime.
+//! macOS-only configuration lifetime and explicit helper-backed migration.
 use std::{
     fs::{File, OpenOptions},
     os::unix::{
@@ -56,14 +56,14 @@ impl crate::credential_migration::MigrationBackend for NativeMigration {
         id: &str,
         kind: &str,
     ) -> Result<zeroize::Zeroizing<String>, crate::secret_store::SecretError> {
-        read("org.shortlink.generator.credentials.v2", id, kind)
+        crate::mac_helper_adapter::current_read(id, kind)
     }
     fn legacy(
         &self,
         id: &str,
         kind: &str,
     ) -> Result<zeroize::Zeroizing<String>, crate::secret_store::SecretError> {
-        read("org.shortlink.generator", id, kind)
+        crate::mac_helper_adapter::explicit_legacy_read(id, kind)
     }
     fn create(
         &self,
@@ -71,56 +71,8 @@ impl crate::credential_migration::MigrationBackend for NativeMigration {
         kind: &str,
         value: &str,
     ) -> Result<crate::credential_migration::Created, crate::secret_store::SecretError> {
-        use crate::{credential_migration::Created, secret_store::SecretError};
-        use security_framework::os::macos::keychain::{SecKeychain, SecPreferencesDomain};
-        if !crate::credential_migration::KINDS.contains(&kind) {
-            return Err(SecretError::Other);
-        }
-        let keychain =
-            SecKeychain::default_for_domain(SecPreferencesDomain::User).map_err(native_error)?;
-        match keychain.add_generic_password(
-            "org.shortlink.generator.credentials.v2",
-            &format!("{kind}:{id}"),
-            value.as_bytes(),
-        ) {
-            Ok(()) => Ok(Created::New),
-            Err(error) if error.code() == -25299 => Ok(Created::AlreadyExists),
-            Err(error) => Err(native_error(error)),
-        }
+        crate::mac_helper_adapter::current_create_only(id, kind, value)
     }
-}
-
-#[cfg(not(test))]
-fn native_error(error: security_framework::base::Error) -> crate::secret_store::SecretError {
-    use crate::secret_store::SecretError;
-    match error.code() {
-        -25300 => SecretError::Missing,
-        -25293 | -25308 | -128 => SecretError::AccessDenied,
-        _ => SecretError::Unavailable,
-    }
-}
-
-#[cfg(not(test))]
-fn read(
-    service: &str,
-    id: &str,
-    kind: &str,
-) -> Result<zeroize::Zeroizing<String>, crate::secret_store::SecretError> {
-    use crate::secret_store::SecretError;
-    if !crate::credential_migration::KINDS.contains(&kind) {
-        return Err(SecretError::Other);
-    }
-    let entry =
-        keyring::Entry::new(service, &format!("{kind}:{id}")).map_err(|_| SecretError::Other)?;
-    entry
-        .get_password()
-        .map(zeroize::Zeroizing::new)
-        .map_err(|error| match error {
-            keyring::Error::NoEntry => SecretError::Missing,
-            keyring::Error::NoStorageAccess(_) => SecretError::AccessDenied,
-            keyring::Error::PlatformFailure(_) => SecretError::Unavailable,
-            _ => SecretError::Other,
-        })
 }
 
 #[cfg(test)]
