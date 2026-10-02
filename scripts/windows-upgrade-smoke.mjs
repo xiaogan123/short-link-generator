@@ -19,13 +19,196 @@ const appId = 'org.shortlink.generator';
 const ownerFile = 'upgrade-smoke-owner';
 const hostScript = fileURLToPath(new URL('./windows-upgrade-host.ps1', import.meta.url));
 const digest = path => createHash('sha256').update(readFileSync(path)).digest('hex');
-const run = (command, args) => {
+
+export const WINDOWS_UPGRADE_STAGES = Object.freeze({
+  BASELINE_INSTALL: 'baseline-install',
+  BASELINE_REGISTRATION: 'baseline-registration',
+  BASELINE_VERSION: 'baseline-version',
+  BASELINE_STARTUP: 'baseline-startup',
+  BASELINE_SAVED_STATE: 'baseline-saved-state',
+  CANDIDATE_INSTALL: 'candidate-install',
+  CANDIDATE_REGISTRATION: 'candidate-registration',
+  CANDIDATE_VERSION: 'candidate-version',
+  CANDIDATE_STARTUP: 'candidate-startup',
+  CANDIDATE_SAVED_STATE: 'candidate-saved-state',
+  CLEANUP: 'cleanup',
+});
+
+const stageValues = new Set(Object.values(WINDOWS_UPGRADE_STAGES));
+const phaseStages = Object.freeze({
+  baseline: Object.freeze({
+    install: WINDOWS_UPGRADE_STAGES.BASELINE_INSTALL,
+    registration: WINDOWS_UPGRADE_STAGES.BASELINE_REGISTRATION,
+    version: WINDOWS_UPGRADE_STAGES.BASELINE_VERSION,
+    startup: WINDOWS_UPGRADE_STAGES.BASELINE_STARTUP,
+    state: WINDOWS_UPGRADE_STAGES.BASELINE_SAVED_STATE,
+  }),
+  candidate: Object.freeze({
+    install: WINDOWS_UPGRADE_STAGES.CANDIDATE_INSTALL,
+    registration: WINDOWS_UPGRADE_STAGES.CANDIDATE_REGISTRATION,
+    version: WINDOWS_UPGRADE_STAGES.CANDIDATE_VERSION,
+    startup: WINDOWS_UPGRADE_STAGES.CANDIDATE_STARTUP,
+    state: WINDOWS_UPGRADE_STAGES.CANDIDATE_SAVED_STATE,
+  }),
+});
+const diagnosticMessages = Object.freeze({
+  'operation-failed': 'Windows upgrade smoke operation failed.',
+  'native-command-failed': 'Native upgrade command failed.',
+  'nsis-command-failed': 'Owned NSIS operation did not complete successfully.',
+});
+const safeErrorCodes = new Set([
+  'EACCES', 'EAGAIN', 'EBUSY', 'ECONNRESET', 'EEXIST', 'EIO', 'EISDIR', 'EMFILE',
+  'ENFILE', 'ENOENT', 'ENOMEM', 'ENOSPC', 'ENOTDIR', 'ENOTEMPTY', 'EPERM', 'EPIPE',
+  'ETIMEDOUT', 'UNKNOWN', 'ERR_CHILD_PROCESS_IPC_REQUIRED',
+  'ERR_CHILD_PROCESS_STDIO_MAXBUFFER', 'ERR_INVALID_ARG_VALUE',
+]);
+const safeSignals = new Set([
+  'SIGABRT', 'SIGALRM', 'SIGBUS', 'SIGCHLD', 'SIGCONT', 'SIGFPE', 'SIGHUP', 'SIGILL',
+  'SIGINT', 'SIGIO', 'SIGKILL', 'SIGPIPE', 'SIGPROF', 'SIGQUIT', 'SIGSEGV', 'SIGSTOP',
+  'SIGSYS', 'SIGTERM', 'SIGTRAP', 'SIGTSTP', 'SIGTTIN', 'SIGTTOU', 'SIGURG',
+  'SIGUSR1', 'SIGUSR2', 'SIGVTALRM', 'SIGWINCH', 'SIGXCPU', 'SIGXFSZ',
+]);
+const hostDiagnosticPrefix = 'SLG_WINDOWS_HOST_DIAGNOSTIC:';
+const hostDiagnosticStages = new Set([
+  'initialize', 'owned-location', 'known-folders', 'registry', 'shortcuts', 'serialize',
+]);
+const hostDiagnosticExceptions = new Set([
+  'MethodInvocationException', 'RuntimeException', 'ArgumentException',
+  'UnauthorizedAccessException', 'COMException', 'IOException', 'Other',
+]);
+const signedInt32 = value => Number.isInteger(value) && value >= -2147483648 && value <= 2147483647;
+const readSafeProperty = (value, key) => {
+  try { return value !== null && (typeof value === 'object' || typeof value === 'function') ? value[key] : undefined; }
+  catch { return undefined; }
+};
+const exactKeys = (value, keys) => value !== null && typeof value === 'object' && !Array.isArray(value)
+  && JSON.stringify(Object.keys(value).sort()) === JSON.stringify([...keys].sort());
+
+function parseWindowsHostDiagnostic(stderr) {
+  let text;
+  if (Buffer.isBuffer(stderr)) {
+    if (stderr.length > 4096) return null;
+    text = stderr.toString('utf8');
+  } else if (typeof stderr === 'string' && stderr.length <= 4096) text = stderr;
+  else return null;
+  const matches = text.split(/\r?\n/).filter(line => line.startsWith(hostDiagnosticPrefix));
+  if (matches.length !== 1 || Buffer.byteLength(matches[0], 'utf8') > 512) return null;
+  let record;
+  try { record = JSON.parse(matches[0].slice(hostDiagnosticPrefix.length)); }
+  catch { return null; }
+  if (!exactKeys(record, ['stage', 'exception', 'category', 'hresult'])
+      || !hostDiagnosticStages.has(record.stage)
+      || !hostDiagnosticExceptions.has(record.exception)
+      || !signedInt32(record.category) || !signedInt32(record.hresult)) return null;
+  return Object.freeze({ hostStage: record.stage, exceptionClass: record.exception,
+    category: record.category, hresult: record.hresult });
+}
+
+function controlledProcessDetails(error, hostDiagnostic = null) {
+  const details = {};
+  const status = readSafeProperty(error, 'status');
+  const code = readSafeProperty(error, 'code');
+  const signal = readSafeProperty(error, 'signal');
+  if (signedInt32(status)) details.exitStatus = status;
+  else if (signedInt32(code)) details.exitStatus = code;
+  if (typeof code === 'string' && safeErrorCodes.has(code)) details.errorCode = code;
+  if (typeof signal === 'string' && safeSignals.has(signal)) details.signal = signal;
+  if (hostDiagnostic) Object.assign(details, hostDiagnostic);
+  return Object.freeze(details);
+}
+
+class UpgradeCommandError extends Error {
+  constructor(reason, cause, hostDiagnostic = null) {
+    super(diagnosticMessages[reason], { cause });
+    this.name = 'UpgradeCommandError';
+    this.reason = reason;
+    this.diagnostic = controlledProcessDetails(cause, hostDiagnostic);
+  }
+}
+
+class UpgradeStageError extends Error {
+  constructor(stage, cause) {
+    super('Windows upgrade smoke stage failed.', { cause });
+    this.name = 'UpgradeStageError';
+    this.stage = stage;
+  }
+}
+
+class UpgradeLifecycleError extends AggregateError {
+  constructor(failures) {
+    super(failures.map(failure => failure.error), 'Windows upgrade smoke lifecycle failed.');
+    this.name = 'UpgradeLifecycleError';
+    this.failures = failures;
+  }
+}
+
+async function runUpgradeStage(stage, action) {
+  if (!stageValues.has(stage)) throw new Error('Unknown Windows upgrade smoke stage.');
+  try { return await action(); }
+  catch (error) {
+    if (error instanceof UpgradeStageError && error.stage === stage) throw error;
+    throw new UpgradeStageError(stage, error);
+  }
+}
+
+export function formatWindowsUpgradeFailure(error, { baselineOnly = false } = {}) {
+  const diagnostics = [];
+  const seen = new Set();
+  let truncated = false;
+  const append = (reason, context, details = {}) => {
+    if (diagnostics.length >= 16) { truncated = true; return; }
+    const diagnostic = { reason, message: diagnosticMessages[reason] };
+    if (context.origin === 'execution' || context.origin === 'cleanup') diagnostic.origin = context.origin;
+    if (stageValues.has(context.stage)) diagnostic.stage = context.stage;
+    Object.assign(diagnostic, details);
+    diagnostics.push(diagnostic);
+  };
+  const visit = (value, context = {}) => {
+    if (diagnostics.length >= 16) { truncated = true; return; }
+    if (value !== null && (typeof value === 'object' || typeof value === 'function')) {
+      if (seen.has(value)) { append('operation-failed', context); return; }
+      seen.add(value);
+    }
+    if (value instanceof UpgradeLifecycleError) {
+      for (const failure of value.failures) visit(failure.error, { ...context, origin: failure.origin });
+      return;
+    }
+    if (value instanceof UpgradeStageError) {
+      visit(value.cause, { ...context, stage: value.stage });
+      return;
+    }
+    if (value instanceof UpgradeCommandError) {
+      append(value.reason, context, value.diagnostic);
+      return;
+    }
+    if (value instanceof AggregateError) {
+      if (value.errors.length === 0) append('operation-failed', context);
+      else for (const nested of value.errors) visit(nested, context);
+      return;
+    }
+    const cause = readSafeProperty(value, 'cause');
+    if (cause !== undefined && cause !== value) visit(cause, context);
+    else append('operation-failed', context, controlledProcessDetails(value));
+  };
+  visit(error);
+  if (diagnostics.length === 0) diagnostics.push({ reason: 'operation-failed',
+    message: diagnosticMessages['operation-failed'] });
+  return JSON.stringify({ schema: 1, result: 'failed', baselineOnly: baselineOnly === true,
+    message: 'Windows upgrade smoke failed.', diagnostics, ...(truncated ? { diagnosticsTruncated: true } : {}) });
+}
+
+export const runUpgradeCommand = (command, args, execute = execFileSync) => {
   try {
-    return execFileSync(command, args, {
+    return execute(command, args, {
       encoding: 'utf8', stdio: 'pipe', windowsHide: true, timeout: 120_000,
     }).trim();
-  } catch { throw new Error(`Native upgrade check failed while running ${basename(command)}.`); }
+  } catch (error) {
+    const hostDiagnostic = basename(command).toLowerCase() === 'pwsh.exe'
+      ? parseWindowsHostDiagnostic(readSafeProperty(error, 'stderr')) : null;
+    throw new UpgradeCommandError('native-command-failed', error, hostDiagnostic);
+  }
 };
+const run = runUpgradeCommand;
 
 export function runOwnedNsis(binary, install, uninstall = false, execute = execFileSync) {
   for (const path of [binary, install]) {
@@ -41,7 +224,7 @@ export function runOwnedNsis(binary, install, uninstall = false, execute = execF
       argv0: `"${binary}"`, windowsVerbatimArguments: true, shell: false,
       encoding: 'utf8', stdio: 'pipe', windowsHide: true, timeout: 120_000,
     });
-  } catch { throw new Error('Owned NSIS operation did not complete successfully.'); }
+  } catch (error) { throw new UpgradeCommandError('nsis-command-failed', error); }
 }
 
 export function validateUpgradeContext(env, platform, arch, cwd, head) {
@@ -242,57 +425,106 @@ export async function runUpgradeLifecycle({ execute, cleanup, publish }) {
   let result;
   let executionError;
   try { result = await execute(); } catch (error) { executionError = error; }
-  try { await cleanup(); }
-  catch (cleanupError) {
-    if (executionError) throw new AggregateError([executionError, cleanupError], 'Upgrade and cleanup both failed.');
-    throw cleanupError;
-  }
-  if (executionError) throw executionError;
+  let cleanupError;
+  try { await runUpgradeStage(WINDOWS_UPGRADE_STAGES.CLEANUP, cleanup); }
+  catch (error) { cleanupError = error; }
+  const failures = [];
+  if (executionError) failures.push({ origin: 'execution', error: executionError });
+  if (cleanupError) failures.push({ origin: 'cleanup', error: cleanupError });
+  if (failures.length) throw new UpgradeLifecycleError(failures);
   await publish(result);
   return result;
 }
 
 // Dependency injection keeps failure-order tests off the Windows installer and user storage.
-export async function checkUpgradeSequence({ install, inspect, launch, assertState }) {
-  await install('baseline');
-  const before = await inspect('baseline');
-  await launch('baseline');
-  await assertState();
-  await install('candidate');
-  const after = await inspect('candidate');
-  if (before.sha256 === after.sha256) throw new Error('Upgrade left the old executable in place.');
-  await assertState();
-  await launch('candidate');
-  await assertState();
+export async function checkUpgradeSequence({ install, assertRegistration, inspect,
+  launch, assertState, baselineOnly = false }) {
+  const baselineStages = phaseStages.baseline;
+  await runUpgradeStage(baselineStages.install, () => install('baseline'));
+  await runUpgradeStage(baselineStages.registration, () => assertRegistration('baseline'));
+  const before = await runUpgradeStage(baselineStages.version, () => inspect('baseline'));
+  await runUpgradeStage(baselineStages.startup, () => launch('baseline'));
+  await runUpgradeStage(baselineStages.state, assertState);
+  if (baselineOnly === true) return { baselineBinarySha256: before.sha256 };
+
+  const candidateStages = phaseStages.candidate;
+  await runUpgradeStage(candidateStages.install, () => install('candidate'));
+  await runUpgradeStage(candidateStages.registration, () => assertRegistration('candidate'));
+  const after = await runUpgradeStage(candidateStages.version, async () => {
+    const observation = await inspect('candidate');
+    if (before.sha256 === observation.sha256) throw new Error('Upgrade left the old executable in place.');
+    return observation;
+  });
+  // Check once after installation and again after first launch. Both belong to the
+  // same fixed saved-state stage so public diagnostics cannot contain free-form labels.
+  await runUpgradeStage(candidateStages.state, assertState);
+  await runUpgradeStage(candidateStages.startup, () => launch('candidate'));
+  await runUpgradeStage(candidateStages.state, assertState);
   return { baselineBinarySha256: before.sha256, candidateBinarySha256: after.sha256 };
 }
 
+export async function runUpgradeMode({ baselineOnly = false, prepare = () => {}, actions, cleanup,
+  buildResult = result => result, publishReceipt, publishBaselineSummary }) {
+  return runUpgradeLifecycle({
+    execute: async () => {
+      await runUpgradeStage(WINDOWS_UPGRADE_STAGES.BASELINE_SAVED_STATE, prepare);
+      const sequence = await checkUpgradeSequence({ ...actions, baselineOnly: baselineOnly === true });
+      return buildResult(sequence);
+    },
+    cleanup,
+    publish: result => baselineOnly === true ? publishBaselineSummary(result) : publishReceipt(result),
+  });
+}
+
+export function parseWindowsUpgradeArgs(args) {
+  if (args.length === 2 && args[0] === '--baseline-only') {
+    return { baselineOnly: true, baselineArg: args[1], bundleArg: null };
+  }
+  if (args.length === 2 && !args.includes('--baseline-only')) {
+    return { baselineOnly: false, baselineArg: args[0], bundleArg: args[1] };
+  }
+  throw new Error('Usage: windows-upgrade-smoke.mjs [--baseline-only] <reviewed-baseline.exe> [candidate-bundle]');
+}
+
 export async function main(args = process.argv.slice(2)) {
-  const [baselineArg, bundleArg] = args;
-  if (args.length !== 2) throw new Error('Usage: windows-upgrade-smoke.mjs <reviewed-baseline.exe> <candidate-bundle>');
+  const { baselineOnly, baselineArg, bundleArg } = parseWindowsUpgradeArgs(args);
   validateUpgradeContext(process.env, process.platform, process.arch, '.', run('git', ['rev-parse', 'HEAD']));
   const key = process.env.SLG_UPDATER_PUBLIC_KEY;
   if (!key) throw new Error('Configured updater public key is required.');
   const baseline = resolve(baselineArg);
-  const bundle = resolve(bundleArg);
   verifyWindowsBaseline(baseline, key);
-  const { installer, updater, signature } = selectArtifacts(bundle, target);
-  verifyUpdaterSignatureFile(updater, signature, key, process.env.RELEASE_TAG);
-  const config = JSON.parse(readFileSync(fileURLToPath(new URL('../src-tauri/tauri.conf.json', import.meta.url)), 'utf8'));
-  if (config.productName !== '短连接生成器' || config.identifier !== appId
-      || config.app?.appDirectoriesOverride || config.app?.windows?.some(window => window.dataDirectory)
-      || config.bundle?.publisher || config.bundle?.windows) {
-    throw new Error('Candidate packaging no longer matches the reviewed Windows installation footprint.');
+  let bundle = null;
+  let installer = null;
+  let signature = null;
+  let receipt = null;
+  if (!baselineOnly) {
+    bundle = resolve(bundleArg);
+    const artifacts = selectArtifacts(bundle, target);
+    installer = artifacts.installer;
+    signature = artifacts.signature;
+    verifyUpdaterSignatureFile(artifacts.updater, signature, key, process.env.RELEASE_TAG);
+    const config = JSON.parse(readFileSync(fileURLToPath(new URL('../src-tauri/tauri.conf.json', import.meta.url)), 'utf8'));
+    if (config.productName !== '短连接生成器' || config.identifier !== appId
+        || config.app?.appDirectoriesOverride || config.app?.windows?.some(window => window.dataDirectory)
+        || config.bundle?.publisher || config.bundle?.windows) {
+      throw new Error('Candidate packaging no longer matches the reviewed Windows installation footprint.');
+    }
+    receipt = join(bundle, 'windows-upgrade-smoke.json');
+    if (statOrAbsent(receipt)) throw new Error('An earlier upgrade smoke receipt already exists.');
   }
   const { appData, appLocalData } = assertCleanWindowsHost(nativeHost(), process.env);
-  const receipt = join(bundle, 'windows-upgrade-smoke.json');
-  if (statOrAbsent(receipt)) throw new Error('An earlier upgrade smoke receipt already exists.');
   const temp = mkdtempSync(join(process.env.RUNNER_TEMP, 'slg-upgrade-smoke-'));
   const install = join(temp, 'installed');
   const marker = randomUUID();
   const owned = { roaming: false, local: false };
-  const versions = { baseline: WINDOWS_BASELINE.tag.slice(1), candidate: process.env.RELEASE_TAG.slice(1) };
+  const versions = baselineOnly
+    ? { baseline: WINDOWS_BASELINE.tag.slice(1) }
+    : { baseline: WINDOWS_BASELINE.tag.slice(1), candidate: process.env.RELEASE_TAG.slice(1) };
+  const installers = baselineOnly ? { baseline } : { baseline, candidate: installer };
   const startups = {};
+  const state = JSON.stringify({ accounts: [], domains: [], links: [], pools: [],
+    pendingOperations: [`Synthetic upgrade fixture ${marker}`] }, null, 2);
+  const versionScript = fileURLToPath(new URL('./windows-installed-version.ps1', import.meta.url));
   const verifyMarker = path => {
     realDirectory(path);
     if (readFileSync(markerAt(path), 'utf8') !== marker) {
@@ -300,17 +532,18 @@ export async function main(args = process.argv.slice(2)) {
     }
   };
   writeFileSync(markerAt(temp), marker, { flag: 'wx' });
-  await runUpgradeLifecycle({
-    execute: async () => {
-    createOwnedDataDirectories({ appData, appLocalData, marker, owned });
-    const state = JSON.stringify({ accounts: [], domains: [], links: [], pools: [],
-      pendingOperations: [`Synthetic upgrade fixture ${marker}`] }, null, 2);
-    writeFileSync(join(appData, 'state.json'), state, { flag: 'wx' });
-    mkdirSync(install);
-    const versionScript = fileURLToPath(new URL('./windows-installed-version.ps1', import.meta.url));
-    const result = await checkUpgradeSequence({
+  await runUpgradeMode({
+    baselineOnly,
+    prepare: () => {
+      createOwnedDataDirectories({ appData, appLocalData, marker, owned });
+      writeFileSync(join(appData, 'state.json'), state, { flag: 'wx' });
+      mkdirSync(install);
+    },
+    actions: {
       install: phase => {
-        runOwnedNsis(phase === 'baseline' ? baseline : installer, install);
+        runOwnedNsis(installers[phase], install);
+      },
+      assertRegistration: phase => {
         assertOwnedRegistration(nativeHost(), install, [versions[phase]], true);
       },
       inspect: phase => {
@@ -331,8 +564,9 @@ export async function main(args = process.argv.slice(2)) {
         verifyMarker(appLocalData);
         if (readFileSync(join(appData, 'state.json'), 'utf8') !== state) throw new Error('Upgrade changed or removed the saved synthetic configuration.');
       },
-    });
-    return { schema: 1, tag: process.env.RELEASE_TAG, sha: process.env.RELEASE_SHA, target,
+    },
+    buildResult: result => baselineOnly ? result : ({
+      schema: 1, tag: process.env.RELEASE_TAG, sha: process.env.RELEASE_SHA, target,
       baselineTag: WINDOWS_BASELINE.tag, baselineInstallerSha256: digest(baseline),
       baselineSignatureSha256: digest(`${baseline}.sig`), installerSha256: digest(installer),
       updaterSignatureSha256: digest(signature), updaterPublicKeySha256: updaterPublicKeySha256(key),
@@ -340,8 +574,8 @@ export async function main(args = process.argv.slice(2)) {
       sameInstallDirectory: true, syntheticConfigurationPreserved: true,
       nativeRoamingAndLocalDataVerified: true, processExitConfirmed: true,
       nsisRegistrationAndShortcutsCleaned: true,
-      credentialContinuityTested: false, scope: 'NSIS covering installation, exact executable versions, two native windows and saved synthetic configuration' };
-    },
+      credentialContinuityTested: false, scope: 'NSIS covering installation, exact executable versions, two native windows and saved synthetic configuration',
+    }),
     cleanup: () => cleanupUpgradeFixture({
       inspect: nativeHost, install, allowedVersions: Object.values(versions),
       assertUninstaller: path => { realDirectory(install); realFile(path); },
@@ -354,13 +588,17 @@ export async function main(args = process.argv.slice(2)) {
       removeData: () => removeOwnedDataDirectories({ appData, appLocalData, marker, owned }),
       removeTemp: () => { verifyMarker(temp); assertNoLinksInside(temp); rmSync(temp, { recursive: true }); },
     }),
-    publish: evidence => {
+    publishReceipt: evidence => {
       writeFileSync(receipt, JSON.stringify(evidence, null, 2) + '\n', { flag: 'wx' });
       console.log(JSON.stringify({ result: 'passed', baselineTag: WINDOWS_BASELINE.tag, tag: evidence.tag }));
     },
+    publishBaselineSummary: () => console.log(JSON.stringify({
+      result: 'passed', baselineOnly: true, baselineTag: WINDOWS_BASELINE.tag,
+    })),
   });
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  main().catch(error => { console.error(error.message); process.exitCode = 1; });
+  const baselineOnly = process.argv[2] === '--baseline-only';
+  main().catch(error => { console.error(formatWindowsUpgradeFailure(error, { baselineOnly })); process.exitCode = 1; });
 }

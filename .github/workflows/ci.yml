@@ -7,7 +7,7 @@ on:
     inputs:
       platform:
         type: choice
-        options: [mac-arm, mac-intel, windows]
+        options: [mac-arm, mac-intel, windows, windows-baseline]
         default: windows
       include_source:
         description: Also run Linux source checks; disable only when reusing reviewed passing evidence
@@ -49,7 +49,7 @@ jobs:
       - run: cargo clippy --manifest-path src-tauri/Cargo.toml --locked --all-targets -- -D warnings
       - run: node scripts/privacy-check.mjs --public --working-tree --history
   native:
-    if: github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'workflow_dispatch' && inputs.platform != 'windows-baseline'
     runs-on: ${{ inputs.platform == 'windows' && 'windows-2022' || inputs.platform == 'mac-intel' && 'macos-15-intel' || 'macos-15' }}
     timeout-minutes: 35
     steps:
@@ -70,3 +70,35 @@ jobs:
       - run: cargo fmt --manifest-path src-tauri/Cargo.toml --check
       - run: cargo test --manifest-path src-tauri/Cargo.toml --locked --target ${{ inputs.platform == 'windows' && 'x86_64-pc-windows-msvc' || inputs.platform == 'mac-intel' && 'x86_64-apple-darwin' || 'aarch64-apple-darwin' }} -- --show-output
       - run: cargo clippy --manifest-path src-tauri/Cargo.toml --locked --target ${{ inputs.platform == 'windows' && 'x86_64-pc-windows-msvc' || inputs.platform == 'mac-intel' && 'x86_64-apple-darwin' || 'aarch64-apple-darwin' }} --all-targets -- -D warnings
+  windows-baseline:
+    if: github.event_name == 'workflow_dispatch' && inputs.platform == 'windows-baseline'
+    runs-on: windows-2022
+    timeout-minutes: 8
+    environment: release
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '24'
+      - run: npm ci
+      - name: Diagnose the pinned Windows baseline without rebuilding the candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SLG_UPDATER_PUBLIC_KEY: ${{ vars.UPDATER_PUBLIC_KEY }}
+        shell: pwsh
+        run: |
+          $baselineDirectory = Join-Path $env:RUNNER_TEMP 'shortlink-upgrade-baseline'
+          New-Item -ItemType Directory -Path $baselineDirectory -ErrorAction Stop | Out-Null
+          gh release download v0.1.5 --repo "$env:GITHUB_REPOSITORY" --dir "$baselineDirectory" --pattern 'short-link-generator_0.1.5_windows-x86_64.exe' --pattern 'short-link-generator_0.1.5_windows-x86_64.exe.sig'
+          if ($LASTEXITCODE -ne 0) { throw 'Pinned Windows baseline download failed.' }
+          Remove-Item Env:GH_TOKEN
+          $version = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          if ($version -notmatch '^\d+\.\d+\.\d+$') { throw 'A stable candidate version is required.' }
+          $env:RELEASE_TAG = "v$version"
+          $env:RELEASE_SHA = (git rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0) { throw 'Source identity could not be read.' }
+          $baselineInstaller = Join-Path $baselineDirectory 'short-link-generator_0.1.5_windows-x86_64.exe'
+          node scripts/windows-upgrade-smoke.mjs --baseline-only "$baselineInstaller"
+          if ($LASTEXITCODE -ne 0) { throw 'Pinned Windows baseline diagnosis failed.' }

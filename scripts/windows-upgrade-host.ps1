@@ -8,9 +8,11 @@ $ErrorActionPreference = 'Stop'
 $product = '短连接生成器'
 $uninstallKey = "Software\Microsoft\Windows\CurrentVersion\Uninstall\$product"
 $locationKey = "Software\shortlink\$product"
+$diagnosticStage = 'initialize'
 
 try {
     if ($Mode -eq 'RemoveOwnedLocation') {
+        $diagnosticStage = 'owned-location'
         if ([string]::IsNullOrWhiteSpace($ExpectedInstall) -or
             -not [IO.Path]::IsPathFullyQualified($ExpectedInstall)) {
             throw 'An absolute owned installation path is required.'
@@ -43,6 +45,7 @@ try {
         exit 0
     }
 
+    $diagnosticStage = 'known-folders'
     Add-Type -TypeDefinition @'
 using System;
 using System.Runtime.InteropServices;
@@ -78,6 +81,7 @@ public static class UpgradeKnownFolder {
     $roamingReparse = Test-ReparseAncestor $roaming
     $localReparse = Test-ReparseAncestor $local
 
+    $diagnosticStage = 'registry'
     $registrations = [System.Collections.Generic.List[object]]::new()
     foreach ($hiveName in @('CurrentUser', 'LocalMachine')) {
         foreach ($viewName in @('Registry64', 'Registry32')) {
@@ -103,6 +107,7 @@ public static class UpgradeKnownFolder {
         }
     }
 
+    $diagnosticStage = 'shortcuts'
     $shortcutPaths = [System.Collections.Generic.List[string]]::new()
     foreach ($folderName in @('Programs', 'CommonPrograms', 'DesktopDirectory', 'CommonDesktopDirectory')) {
         $folder = [Environment]::GetFolderPath($folderName)
@@ -121,11 +126,29 @@ public static class UpgradeKnownFolder {
             $shortcuts.Add(@{ path = $path; target = $target })
         }
     }
+    $diagnosticStage = 'serialize'
     @{ roaming = $roaming; local = $local;
        roamingReparse = $roamingReparse; localReparse = $localReparse;
        registrations = @($registrations.ToArray()); shortcuts = @($shortcuts.ToArray()) } |
         ConvertTo-Json -Compress -Depth 5
 } catch {
-    [Console]::Error.WriteLine('Windows upgrade host inspection or owned cleanup failed.')
+    # Do not publish exception messages, paths, registry values or command output.
+    $failure = $_.Exception
+    for ($depth = 0; $depth -lt 3 -and $null -ne $failure.InnerException; $depth++) {
+        $failure = $failure.InnerException
+    }
+    $exceptionKind = switch ($failure.GetType().Name) {
+        'MethodInvocationException' { 'MethodInvocationException' }
+        'RuntimeException' { 'RuntimeException' }
+        'ArgumentException' { 'ArgumentException' }
+        'UnauthorizedAccessException' { 'UnauthorizedAccessException' }
+        'COMException' { 'COMException' }
+        'IOException' { 'IOException' }
+        default { 'Other' }
+    }
+    $diagnostic = @{ stage = $diagnosticStage; exception = $exceptionKind;
+        category = [int]$_.CategoryInfo.Category; hresult = [int]$failure.HResult } |
+        ConvertTo-Json -Compress
+    [Console]::Error.WriteLine("SLG_WINDOWS_HOST_DIAGNOSTIC:$diagnostic")
     exit 1
 }

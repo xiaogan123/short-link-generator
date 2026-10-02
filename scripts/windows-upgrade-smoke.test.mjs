@@ -6,8 +6,25 @@ import { join, resolve, win32 } from 'node:path';
 import { tmpdir } from 'node:os';
 import { stopObservedWindowsProcess } from './native-smoke.mjs';
 import { assertCleanWindowsHost, assertInstalledVersion, assertOwnedRegistration, checkUpgradeSequence,
-  cleanupUpgradeFixture, createOwnedDataDirectories, removeOwnedDataDirectories, runUpgradeLifecycle,
-  runOwnedNsis, validateUpgradeContext, verifyWindowsBaseline, WINDOWS_BASELINE } from './windows-upgrade-smoke.mjs';
+  cleanupUpgradeFixture, createOwnedDataDirectories, formatWindowsUpgradeFailure, parseWindowsUpgradeArgs,
+  removeOwnedDataDirectories, runUpgradeCommand, runUpgradeLifecycle, runUpgradeMode, runOwnedNsis,
+  validateUpgradeContext, verifyWindowsBaseline, WINDOWS_BASELINE,
+  WINDOWS_UPGRADE_STAGES } from './windows-upgrade-smoke.mjs';
+
+async function rejected(promise) {
+  let failure;
+  try { await promise; } catch (error) { failure = error; }
+  assert.ok(failure, 'expected rejection');
+  return failure;
+}
+
+const failureReport = (error, options) => JSON.parse(formatWindowsUpgradeFailure(error, options));
+
+async function rejectsAt(promise, stage) {
+  const report = failureReport(await rejected(promise));
+  assert.equal(report.diagnostics.some(diagnostic => diagnostic.stage === stage), true);
+  return report;
+}
 
 test('NSIS uses a quoted executable and final unquoted spaced directory, waiting for the real uninstaller', () => {
   const binary = 'C:\\Runner Temp\\setup or uninstall.exe';
@@ -62,39 +79,203 @@ test('baseline replacement is rejected before any signature or installer invocat
   } finally { rmSync(dir, { recursive: true }); }
 });
 
+test('CLI preserves the release mode and accepts only the pinned baseline-only shape', () => {
+  assert.deepEqual(parseWindowsUpgradeArgs(['baseline.exe', 'candidate']), {
+    baselineOnly: false, baselineArg: 'baseline.exe', bundleArg: 'candidate',
+  });
+  assert.deepEqual(parseWindowsUpgradeArgs(['--baseline-only', 'baseline.exe']), {
+    baselineOnly: true, baselineArg: 'baseline.exe', bundleArg: null,
+  });
+  for (const args of [[], ['--baseline-only'], ['--baseline-only', 'baseline.exe', 'candidate'],
+    ['baseline.exe', '--baseline-only']]) assert.throws(() => parseWindowsUpgradeArgs(args));
+});
+
+function formattedCommandFailure(stderr, overrides = {}) {
+  let failure;
+  try {
+    runUpgradeCommand('pwsh.exe', ['private-argument'], () => {
+      throw Object.assign(new Error('private-message C:\\private\\fixture'), {
+        status: 1603, code: 'ENOENT', signal: 'SIGTERM', stderr,
+        stdout: 'private-stdout', path: 'C:\\private\\fixture', argv: ['private-argument'],
+        environment: { PRIVATE_TOKEN: 'private-token' }, ...overrides,
+      });
+    });
+  } catch (error) { failure = error; }
+  assert.ok(failure);
+  return formatWindowsUpgradeFailure(failure);
+}
+
+test('PowerShell host diagnostics accept only the exact bounded safe contract', () => {
+  const secret = 'private-host-output';
+  const valid = formattedCommandFailure(`${secret}\nSLG_WINDOWS_HOST_DIAGNOSTIC:{"stage":"registry","exception":"UnauthorizedAccessException","category":18,"hresult":-2147024891}`);
+  assert.equal(valid.includes(secret), false);
+  assert.deepEqual(JSON.parse(valid).diagnostics[0], {
+    reason: 'native-command-failed', message: 'Native upgrade command failed.',
+    exitStatus: 1603, errorCode: 'ENOENT', signal: 'SIGTERM', hostStage: 'registry',
+    exceptionClass: 'UnauthorizedAccessException', category: 18, hresult: -2147024891,
+  });
+
+  const rejectedStderr = [
+    'arbitrary private stderr C:\\private\\fixture',
+    'SLG_WINDOWS_HOST_DIAGNOSTIC:{"stage":"registry","exception":"Other","category":1,"hresult":2,"extra":"private-extra"}',
+    'SLG_WINDOWS_HOST_DIAGNOSTIC:{"stage":"private-stage","exception":"Other","category":1,"hresult":2}',
+    'SLG_WINDOWS_HOST_DIAGNOSTIC:{"stage":"registry","exception":"PrivateException","category":1,"hresult":2}',
+    'SLG_WINDOWS_HOST_DIAGNOSTIC:{"stage":"registry","exception":"Other","category":2147483648,"hresult":2}',
+    'SLG_WINDOWS_HOST_DIAGNOSTIC:{"stage":"registry","exception":"Other","category":1,"hresult":1.5}',
+    `SLG_WINDOWS_HOST_DIAGNOSTIC:{"stage":"registry","exception":"Other","category":1,"hresult":2}${' '.repeat(600)}`,
+  ];
+  for (const stderr of rejectedStderr) {
+    const text = formattedCommandFailure(stderr);
+    const diagnostic = JSON.parse(text).diagnostics[0];
+    assert.equal('hostStage' in diagnostic, false);
+    assert.equal('exceptionClass' in diagnostic, false);
+    assert.equal(text.includes('private'), false);
+    assert.equal(text.includes('fixture'), false);
+  }
+});
+
 function sequence({ failAt, sameBinary = false } = {}) {
   const calls = [];
   let states = 0;
   const step = name => { calls.push(name); if (name === failAt) throw new Error('injected failure'); };
   return { calls, actions: {
     install: phase => step(`install:${phase}`),
+    assertRegistration: phase => step(`registration:${phase}`),
     inspect: phase => { step(`inspect:${phase}`); return { sha256: sameBinary ? 'same' : phase }; },
     launch: phase => step(`launch:${phase}`),
     assertState: () => step(`state:${++states}`),
   } };
 }
 test('baseline must start and preserve configuration before the candidate is installed', async () => {
-  for (const failAt of ['install:baseline', 'inspect:baseline', 'launch:baseline', 'state:1']) {
+  for (const [failAt, stage] of [
+    ['install:baseline', WINDOWS_UPGRADE_STAGES.BASELINE_INSTALL],
+    ['registration:baseline', WINDOWS_UPGRADE_STAGES.BASELINE_REGISTRATION],
+    ['inspect:baseline', WINDOWS_UPGRADE_STAGES.BASELINE_VERSION],
+    ['launch:baseline', WINDOWS_UPGRADE_STAGES.BASELINE_STARTUP],
+    ['state:1', WINDOWS_UPGRADE_STAGES.BASELINE_SAVED_STATE],
+  ]) {
     const f = sequence({ failAt });
-    await assert.rejects(checkUpgradeSequence(f.actions), /injected failure/);
+    await rejectsAt(checkUpgradeSequence(f.actions), stage);
     assert.equal(f.calls.includes('install:candidate'), false);
   }
 });
 test('failed install, stale binary or lost configuration cannot be reported as an upgrade', async () => {
-  for (const failAt of ['install:candidate', 'inspect:candidate', 'state:2', 'launch:candidate', 'state:3']) {
+  for (const [failAt, stage] of [
+    ['install:candidate', WINDOWS_UPGRADE_STAGES.CANDIDATE_INSTALL],
+    ['registration:candidate', WINDOWS_UPGRADE_STAGES.CANDIDATE_REGISTRATION],
+    ['inspect:candidate', WINDOWS_UPGRADE_STAGES.CANDIDATE_VERSION],
+    ['state:2', WINDOWS_UPGRADE_STAGES.CANDIDATE_SAVED_STATE],
+    ['launch:candidate', WINDOWS_UPGRADE_STAGES.CANDIDATE_STARTUP],
+    ['state:3', WINDOWS_UPGRADE_STAGES.CANDIDATE_SAVED_STATE],
+  ]) {
     const f = sequence({ failAt });
-    await assert.rejects(checkUpgradeSequence(f.actions), /injected failure/);
+    await rejectsAt(checkUpgradeSequence(f.actions), stage);
     assert.equal(f.calls.at(-1), failAt);
   }
   const f = sequence({ sameBinary: true });
-  await assert.rejects(checkUpgradeSequence(f.actions), /old executable/);
+  await rejectsAt(checkUpgradeSequence(f.actions), WINDOWS_UPGRADE_STAGES.CANDIDATE_VERSION);
   assert.equal(f.calls.includes('launch:candidate'), false);
 });
 test('successful covering upgrade records two distinct executables and checks state after both launches', async () => {
   const f = sequence();
   assert.deepEqual(await checkUpgradeSequence(f.actions), { baselineBinarySha256: 'baseline', candidateBinarySha256: 'candidate' });
-  assert.deepEqual(f.calls, ['install:baseline', 'inspect:baseline', 'launch:baseline', 'state:1',
-    'install:candidate', 'inspect:candidate', 'state:2', 'launch:candidate', 'state:3']);
+  assert.deepEqual(f.calls, ['install:baseline', 'registration:baseline', 'inspect:baseline', 'launch:baseline', 'state:1',
+    'install:candidate', 'registration:candidate', 'inspect:candidate', 'state:2', 'launch:candidate', 'state:3']);
+});
+
+test('nested aggregate and filesystem failures expose only fixed stages and controlled codes', async () => {
+  const secret = 'private-nested-message C:\\private\\state.json';
+  const filesystemError = Object.assign(new Error(secret), {
+    code: 'ENOENT', path: 'C:\\private\\state.json', stdout: secret, stderr: secret,
+  });
+  const f = sequence();
+  f.actions.install = phase => {
+    f.calls.push(`install:${phase}`);
+    throw new AggregateError([
+      new AggregateError([filesystemError], secret),
+      Object.assign(new Error(secret), { code: 'PRIVATE_SECRET_CODE', signal: 'PRIVATE_SIGNAL' }),
+    ], secret);
+  };
+  const text = formatWindowsUpgradeFailure(await rejected(checkUpgradeSequence(f.actions)));
+  const report = JSON.parse(text);
+  assert.equal(report.diagnostics.length, 2);
+  assert.equal(report.diagnostics.every(diagnostic =>
+    diagnostic.stage === WINDOWS_UPGRADE_STAGES.BASELINE_INSTALL), true);
+  assert.equal(report.diagnostics[0].errorCode, 'ENOENT');
+  assert.equal('errorCode' in report.diagnostics[1], false);
+  assert.equal('signal' in report.diagnostics[1], false);
+  assert.equal(text.includes('private'), false);
+  assert.equal(text.includes('state.json'), false);
+});
+
+test('execution and cleanup diagnostics are both retained while cleanup still runs and receipt stays absent', async () => {
+  const calls = [];
+  let published = false;
+  const f = sequence();
+  f.actions.install = phase => {
+    calls.push(`install:${phase}`);
+    runOwnedNsis('C:\\Runner\\baseline.exe', 'C:\\Runner\\owned', false, () => {
+      throw Object.assign(new Error('private installer path C:\\private\\baseline.exe'), {
+        status: 1603, stdout: 'private stdout', stderr: 'private stderr',
+      });
+    });
+  };
+  const failure = await rejected(runUpgradeLifecycle({
+    execute: () => checkUpgradeSequence(f.actions),
+    cleanup: () => {
+      calls.push('cleanup');
+      throw Object.assign(new Error('private cleanup C:\\private\\owned'), {
+        code: 'EACCES', path: 'C:\\private\\owned',
+      });
+    },
+    publish: () => { published = true; },
+  }));
+  const text = formatWindowsUpgradeFailure(failure);
+  const diagnostics = JSON.parse(text).diagnostics;
+  assert.deepEqual(diagnostics.map(({ origin, stage, reason }) => ({ origin, stage, reason })), [
+    { origin: 'execution', stage: WINDOWS_UPGRADE_STAGES.BASELINE_INSTALL, reason: 'nsis-command-failed' },
+    { origin: 'cleanup', stage: WINDOWS_UPGRADE_STAGES.CLEANUP, reason: 'operation-failed' },
+  ]);
+  assert.equal(diagnostics[0].exitStatus, 1603);
+  assert.equal(diagnostics[1].errorCode, 'EACCES');
+  assert.equal(calls.includes('cleanup'), true);
+  assert.equal(published, false);
+  assert.equal(text.includes('private'), false);
+});
+
+test('baseline-only reuses the staged sequence, never reaches candidate or formal receipt, and publishes after cleanup', async () => {
+  const f = sequence();
+  let receiptPublished = false;
+  let summaryPublished = false;
+  const result = await runUpgradeMode({
+    baselineOnly: true,
+    prepare: () => { f.calls.push('prepare'); },
+    actions: f.actions,
+    cleanup: () => { f.calls.push('cleanup'); },
+    publishReceipt: () => { receiptPublished = true; },
+    publishBaselineSummary: () => { summaryPublished = true; f.calls.push('baseline-summary'); },
+  });
+  assert.deepEqual(result, { baselineBinarySha256: 'baseline' });
+  assert.deepEqual(f.calls, ['prepare', 'install:baseline', 'registration:baseline', 'inspect:baseline',
+    'launch:baseline', 'state:1', 'cleanup', 'baseline-summary']);
+  assert.equal(f.calls.some(call => call.includes('candidate')), false);
+  assert.equal(receiptPublished, false);
+  assert.equal(summaryPublished, true);
+
+  const failed = sequence();
+  receiptPublished = false;
+  summaryPublished = false;
+  const report = failureReport(await rejected(runUpgradeMode({
+    baselineOnly: true,
+    actions: failed.actions,
+    cleanup: () => { throw new Error('private cleanup failure'); },
+    publishReceipt: () => { receiptPublished = true; },
+    publishBaselineSummary: () => { summaryPublished = true; },
+  })), { baselineOnly: true });
+  assert.equal(report.baselineOnly, true);
+  assert.equal(report.diagnostics[0].stage, WINDOWS_UPGRADE_STAGES.CLEANUP);
+  assert.equal(receiptPublished, false);
+  assert.equal(summaryPublished, false);
 });
 
 const installPath = 'C:\\Runner\\Temp\\slg-upgrade\\installed';
@@ -176,11 +357,12 @@ test('partial install runs only the exact owned uninstaller, then removes owned 
   const residue = { ...emptyHost(), registrations: [registered().registrations[1]] };
   const f = cleanupActions([registered(), residue, emptyHost()]);
   let published = false;
-  await assert.rejects(runUpgradeLifecycle({
+  const report = failureReport(await rejected(runUpgradeLifecycle({
     execute: () => { throw new Error('partial candidate install'); },
     cleanup: () => cleanupUpgradeFixture(f.actions),
     publish: () => { published = true; },
-  }), /partial candidate install/);
+  })));
+  assert.equal(report.diagnostics[0].origin, 'execution');
   assert.deepEqual(f.calls, ['inspect', `assert:${win32.join(installPath, 'uninstall.exe')}`,
     'uninstall', 'inspect', 'remove-location:Registry64', 'inspect', 'remove-data', 'remove-temp']);
   assert.equal(published, false);
@@ -190,11 +372,12 @@ test('uninstaller failure and residual registration stop cleanup before data rem
   for (const f of [cleanupActions([registered()], { failUninstall: true }),
     cleanupActions([registered(), registered()])]) {
     let published = false;
-    await assert.rejects(runUpgradeLifecycle({
+    const report = failureReport(await rejected(runUpgradeLifecycle({
       execute: () => ({ passed: true }),
       cleanup: () => cleanupUpgradeFixture(f.actions),
       publish: () => { published = true; },
-    }), /uninstaller failed|left an uninstall registration/);
+    })));
+    assert.equal(report.diagnostics[0].stage, WINDOWS_UPGRADE_STAGES.CLEANUP);
     assert.equal(published, false);
     assert.equal(f.calls.includes('remove-data'), false);
     assert.equal(f.calls.includes('remove-temp'), false);
@@ -208,9 +391,10 @@ test('success receipt is published only after all cleanup stages pass', async ()
     publish: () => { f.calls.push('publish'); } });
   assert.deepEqual(f.calls.slice(-3), ['remove-data', 'remove-temp', 'publish']);
   const calls = [];
-  await assert.rejects(runUpgradeLifecycle({ execute: () => ({ passed: true }),
+  const report = failureReport(await rejected(runUpgradeLifecycle({ execute: () => ({ passed: true }),
     cleanup: () => { calls.push('cleanup'); throw new Error('marker changed'); },
-    publish: () => calls.push('publish') }), /marker changed/);
+    publish: () => calls.push('publish') })));
+  assert.equal(report.diagnostics[0].stage, WINDOWS_UPGRADE_STAGES.CLEANUP);
   assert.deepEqual(calls, ['cleanup']);
 });
 
@@ -246,7 +430,7 @@ test('candidate install waits for baseline exit proof and stops on late or faile
     if (phase !== 'baseline') return;
     await stopObservedWindowsProcess(observedChild(), { killTree: () => {}, timeoutMs: 5 });
   };
-  await assert.rejects(checkUpgradeSequence(f.actions), /did not exit/);
+  await rejectsAt(checkUpgradeSequence(f.actions), WINDOWS_UPGRADE_STAGES.BASELINE_STARTUP);
   assert.equal(f.calls.includes('install:candidate'), false);
   const late = sequence();
   late.actions.launch = async phase => {

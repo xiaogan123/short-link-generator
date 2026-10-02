@@ -33,10 +33,15 @@ test('release validation refuses a version-named branch without an actual tag',(
 test('untrusted PR jobs cannot access release secrets and native checks are explicitly selected',()=>{
  const ci=YAML.parse(readFileSync('.github/workflows/ci.yml','utf8'));
  const release=YAML.parse(readFileSync('.github/workflows/release.yml','utf8'));
- assert.equal(ci.permissions.contents,'read');assert.equal(ci.jobs.native.if,"github.event_name == 'workflow_dispatch'");
+ assert.equal(ci.permissions.contents,'read');assert.equal(ci.jobs.native.if,"github.event_name == 'workflow_dispatch' && inputs.platform != 'windows-baseline'");
  assert.equal(ci.on.workflow_dispatch.inputs.include_source.type,'boolean');
  assert.equal(ci.on.workflow_dispatch.inputs.include_source.default,true);
  assert.equal(ci.jobs.source.if,"github.event_name != 'workflow_dispatch' || inputs.include_source");
+ assert.equal(ci.jobs['windows-baseline'].if,"github.event_name == 'workflow_dispatch' && inputs.platform == 'windows-baseline'");
+ // The short baseline diagnosis must not also start source or candidate jobs.
+ const github={event_name:'workflow_dispatch'},inputs={platform:'windows-baseline',include_source:false};
+ const selected=Object.entries(ci.jobs).filter(([,job])=>Function('github','inputs',`return (${job.if})`)(github,inputs)).map(([name])=>name);
+ assert.deepEqual(selected,['windows-baseline']);
  assert.ok(ci.jobs.native.steps.some(step=>step.run?.startsWith('cargo test ')&&step.run.endsWith(' -- --show-output')));
  assert.equal(ci.jobs.native.needs,undefined);
  assert.ok(!JSON.stringify(ci).includes('secrets.'));assert.ok(!release.on.pull_request);
