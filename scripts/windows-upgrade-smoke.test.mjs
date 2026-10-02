@@ -326,17 +326,32 @@ test('failure creating the second app directory cleans only the first owned dire
   assert.deepEqual(removed, [paths.appData]);
 });
 
-test('NSIS registration and shortcuts must bind to the exact owned install', () => {
+test('NSIS registration and shortcuts must bind to the exact owned install', async () => {
   assert.equal(assertOwnedRegistration(registered(), installPath, ['0.1.5'], true), win32.join(installPath, 'uninstall.exe'));
-  assert.throws(() => assertOwnedRegistration({ ...registered(), registrations: [
-    { ...registered().registrations[0], hive: 'LocalMachine' }, registered().registrations[1],
-  ] }, installPath, ['0.1.5'], true), /owned current-user/);
-  assert.throws(() => assertOwnedRegistration({ ...registered(), registrations: [
-    { ...registered().registrations[0], uninstallString: '"C:\\Other\\uninstall.exe"' }, registered().registrations[1],
-  ] }, installPath, ['0.1.5'], true), /does not belong/);
-  assert.throws(() => assertOwnedRegistration({ ...registered(), shortcuts: [
-    { path: 'product.lnk', target: 'C:\\Other\\app.exe' },
-  ] }, installPath, ['0.1.5'], true), /shortcut target/);
+  const base = registered();
+  const cases = [
+    ['missing-or-invalid-registration', emptyHost(), 'NSIS registration is missing or invalid.'],
+    ['outside-current-user-hive', { ...base, registrations: [{ ...base.registrations[0], hive: 'LocalMachine' }, base.registrations[1]] }, 'NSIS registration is outside the owned current-user hive.'],
+    ['uninstall-location-mismatch', { ...base, registrations: [{ ...base.registrations[0], installLocation: '"C:\\Other"' }, base.registrations[1]] }, 'NSIS uninstall registration does not belong to this run.'],
+    ['uninstaller-path-mismatch', { ...base, registrations: [{ ...base.registrations[0], uninstallString: '"C:\\Other\\uninstall.exe"' }, base.registrations[1]] }, 'NSIS uninstall registration does not belong to this run.'],
+    ['uninstall-version-missing', { ...base, registrations: [{ ...base.registrations[0], displayVersion: '' }, base.registrations[1]] }, 'NSIS uninstall registration does not belong to this run.'],
+    ['uninstall-version-mismatch', registered('9.9.9'), 'NSIS uninstall registration does not belong to this run.'],
+    ['location-value-mismatch', { ...base, registrations: [base.registrations[0], { ...base.registrations[1], defaultValue: 'C:\\Other' }] }, 'NSIS install-location registration does not belong to this run.'],
+    ['unknown-kind', { ...base, registrations: [base.registrations[0], { ...base.registrations[1], kind: 'other' }] }, 'Unknown NSIS registration type.'],
+    ['missing-uninstall', { ...base, registrations: [base.registrations[1]] }, 'NSIS uninstall registration is missing.'],
+    ['shortcut-target-mismatch', { ...base, shortcuts: [{ path: 'product.lnk', target: 'C:\\Other\\app.exe' }] }, 'Product shortcut target does not belong to this run.'],
+  ];
+  for (const [reason, host, legacyMessage] of cases) {
+    assert.throws(() => assertOwnedRegistration(host, installPath, ['0.1.5'], true),
+      error => error.message === legacyMessage);
+    const f = sequence();
+    f.actions.assertRegistration = () => assertOwnedRegistration(host, installPath, ['0.1.5'], true);
+    const report = failureReport(await rejected(checkUpgradeSequence(f.actions)));
+    assert.equal(report.diagnostics[0].stage, WINDOWS_UPGRADE_STAGES.BASELINE_REGISTRATION);
+    assert.equal(report.diagnostics[0].reason, reason);
+    assert.equal(typeof report.diagnostics[0].message, 'string');
+    assert.equal(JSON.stringify(report).includes(installPath), false);
+  }
 });
 
 function cleanupActions(snapshots, { failUninstall = false } = {}) {

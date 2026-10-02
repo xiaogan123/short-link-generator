@@ -55,6 +55,16 @@ const diagnosticMessages = Object.freeze({
   'operation-failed': 'Windows upgrade smoke operation failed.',
   'native-command-failed': 'Native upgrade command failed.',
   'nsis-command-failed': 'Owned NSIS operation did not complete successfully.',
+  'missing-or-invalid-registration': 'NSIS registration is missing or invalid.',
+  'outside-current-user-hive': 'NSIS registration is outside the owned current-user hive.',
+  'uninstall-location-mismatch': 'NSIS uninstall location does not belong to this run.',
+  'uninstaller-path-mismatch': 'NSIS uninstaller path does not belong to this run.',
+  'uninstall-version-missing': 'NSIS uninstall version is missing.',
+  'uninstall-version-mismatch': 'NSIS uninstall version does not match the installed package.',
+  'location-value-mismatch': 'NSIS install-location value does not belong to this run.',
+  'unknown-kind': 'Unknown NSIS registration type.',
+  'missing-uninstall': 'NSIS uninstall registration is missing.',
+  'shortcut-target-mismatch': 'Product shortcut target does not belong to this run.',
 });
 const safeErrorCodes = new Set([
   'EACCES', 'EAGAIN', 'EBUSY', 'ECONNRESET', 'EEXIST', 'EIO', 'EISDIR', 'EMFILE',
@@ -126,6 +136,14 @@ class UpgradeCommandError extends Error {
   }
 }
 
+class UpgradeReasonError extends Error {
+  constructor(reason, message) {
+    super(message);
+    this.name = 'UpgradeReasonError';
+    this.reason = reason;
+  }
+}
+
 class UpgradeStageError extends Error {
   constructor(stage, cause) {
     super('Windows upgrade smoke stage failed.', { cause });
@@ -179,6 +197,10 @@ export function formatWindowsUpgradeFailure(error, { baselineOnly = false } = {}
     }
     if (value instanceof UpgradeCommandError) {
       append(value.reason, context, value.diagnostic);
+      return;
+    }
+    if (value instanceof UpgradeReasonError) {
+      append(value.reason, context);
       return;
     }
     if (value instanceof AggregateError) {
@@ -280,6 +302,10 @@ const unquote = value => {
   if (!match) throw new Error('NSIS registration contains an unexpected path format.');
   return match[1];
 };
+const registeredPathMatches = (value, expected, quoted = false) => {
+  try { return samePath(quoted ? unquote(value) : value, expected); }
+  catch { return false; }
+};
 const nativeHost = () => {
   const data = JSON.parse(run('pwsh.exe', ['-NoLogo', '-NoProfile', '-NonInteractive',
     '-File', hostScript, '-Mode', 'Inspect']));
@@ -358,33 +384,46 @@ export function removeOwnedDataDirectories({ appData, appLocalData, marker, owne
 }
 
 export function assertOwnedRegistration(host, install, allowedVersions, requireVersion = false) {
-  if (!Array.isArray(host.registrations) || !Array.isArray(host.shortcuts)
-      || host.registrations.length === 0) throw new Error('NSIS registration is missing or invalid.');
+  if (!Array.isArray(host?.registrations) || !Array.isArray(host?.shortcuts)
+      || host.registrations.length === 0) {
+    throw new UpgradeReasonError('missing-or-invalid-registration', 'NSIS registration is missing or invalid.');
+  }
   const expectedUninstaller = win32.join(install, 'uninstall.exe');
   const expectedBinary = win32.join(install, 'short-link-generator.exe');
   for (const record of host.registrations) {
+    if (record === null || typeof record !== 'object') {
+      throw new UpgradeReasonError('missing-or-invalid-registration', 'NSIS registration is missing or invalid.');
+    }
     if (record.hive !== 'CurrentUser' || !['Registry64', 'Registry32'].includes(record.view)) {
-      throw new Error('NSIS registration is outside the owned current-user hive.');
+      throw new UpgradeReasonError('outside-current-user-hive', 'NSIS registration is outside the owned current-user hive.');
     }
     if (record.kind === 'uninstall') {
-      if (!samePath(unquote(record.installLocation), install)
-          || !samePath(unquote(record.uninstallString), expectedUninstaller)
-          || (requireVersion && !record.displayVersion)
-          || (record.displayVersion && !allowedVersions.some(version => {
-            try { assertInstalledVersion(record.displayVersion, version); return true; } catch { return false; }
-          }))) throw new Error('NSIS uninstall registration does not belong to this run.');
-    } else if (record.kind === 'location') {
-      if (!samePath(record.defaultValue, install)) {
-        throw new Error('NSIS install-location registration does not belong to this run.');
+      if (!registeredPathMatches(record.installLocation, install, true)) {
+        throw new UpgradeReasonError('uninstall-location-mismatch', 'NSIS uninstall registration does not belong to this run.');
       }
-    } else throw new Error('Unknown NSIS registration type.');
+      if (!registeredPathMatches(record.uninstallString, expectedUninstaller, true)) {
+        throw new UpgradeReasonError('uninstaller-path-mismatch', 'NSIS uninstall registration does not belong to this run.');
+      }
+      if (requireVersion && !record.displayVersion) {
+        throw new UpgradeReasonError('uninstall-version-missing', 'NSIS uninstall registration does not belong to this run.');
+      }
+      if (record.displayVersion && !allowedVersions.some(version => {
+        try { assertInstalledVersion(record.displayVersion, version); return true; } catch { return false; }
+      })) {
+        throw new UpgradeReasonError('uninstall-version-mismatch', 'NSIS uninstall registration does not belong to this run.');
+      }
+    } else if (record.kind === 'location') {
+      if (!registeredPathMatches(record.defaultValue, install)) {
+        throw new UpgradeReasonError('location-value-mismatch', 'NSIS install-location registration does not belong to this run.');
+      }
+    } else throw new UpgradeReasonError('unknown-kind', 'Unknown NSIS registration type.');
   }
   if (requireVersion && !host.registrations.some(record => record.kind === 'uninstall')) {
-    throw new Error('NSIS uninstall registration is missing.');
+    throw new UpgradeReasonError('missing-uninstall', 'NSIS uninstall registration is missing.');
   }
   for (const shortcut of host.shortcuts) {
-    if (!samePath(shortcut.target, expectedBinary)) {
-      throw new Error('Product shortcut target does not belong to this run.');
+    if (!registeredPathMatches(shortcut?.target, expectedBinary)) {
+      throw new UpgradeReasonError('shortcut-target-mismatch', 'Product shortcut target does not belong to this run.');
     }
   }
   return expectedUninstaller;
