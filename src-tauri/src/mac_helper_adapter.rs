@@ -453,7 +453,7 @@ mod tests {
         assert!(credential_migration::migrate(&adapter, "acct").is_ok());
         let calls = adapter.0.calls.borrow();
         assert_eq!(calls.len(), 16);
-        for chunk in calls.chunks_exact(4) {
+        for chunk in calls.as_chunks::<4>().0 {
             assert_eq!(
                 [chunk[0].0, chunk[1].0, chunk[2].0, chunk[3].0],
                 [
