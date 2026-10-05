@@ -1,4 +1,5 @@
-// The public route reads only its own config and link keys. The recovery
+// The public route reads its own config/link keys and, on legacy-name misses,
+// a bounded list of this host's link names. The recovery
 // manifest is intentionally never consulted by this Worker.
 const PREFIX = /^[a-z0-9-]{1,12}$/;
 const SLUG = /^[A-Za-z0-9_-]{1,32}$/;
@@ -20,6 +21,107 @@ const MAX_PROBE_BODY_BYTES = 128 * 1024;
 const MAX_PROBE_TARGETS = 20;
 const encoder = new TextEncoder();
 const caches = new WeakMap();
+const nameCaches = new WeakMap();
+const NAME_TTL_MS = 10 * 60_000;
+const NAME_WINDOW_MS = 60 * 60_000;
+const MAX_NAME_HOSTS = 16;
+const MAX_NAMES = 20_000;
+const MAX_NAME_PAGES = 20;
+const MAX_NAME_SCANS = 6;
+const MAX_NAME_LIST_CALLS = 24;
+
+function namesFor(binding) {
+  let state = nameCaches.get(binding);
+  if (!state) {
+    state = { entries: new Map(), inflight: new Map(), start: Date.now(), scans: 0, calls: 0 };
+    nameCaches.set(binding, state);
+  }
+  return state;
+}
+
+async function scanNames(binding, host, state) {
+  const prefix = `l:${host}:`;
+  const index = new Map();
+  const names = new Set();
+  const cursors = new Set();
+  let cursor;
+  for (let page = 0; page < MAX_NAME_PAGES; page++) {
+    if (state.calls >= MAX_NAME_LIST_CALLS) return null;
+    state.calls++;
+    const result = await binding.list({ prefix, limit: 1000, ...(cursor ? { cursor } : {}) });
+    if (!result || !Array.isArray(result.keys) || result.keys.length > 1000 ||
+        typeof result.list_complete !== 'boolean') return null;
+    for (const key of result.keys) {
+      if (typeof key?.name !== 'string' || !key.name.startsWith(prefix)) continue;
+      const slug = key.name.slice(prefix.length);
+      if (!SLUG.test(slug) || names.has(slug)) continue;
+      names.add(slug);
+      if (names.size > MAX_NAMES) return null;
+      const folded = slug.toLowerCase();
+      index.set(folded, index.has(folded) ? null : slug);
+    }
+    if (result.list_complete) return { index, size: names.size, expires: Date.now() + NAME_TTL_MS };
+    if (typeof result.cursor !== 'string' || !result.cursor || result.cursor.length > 2048 ||
+        cursors.has(result.cursor)) return null;
+    cursors.add(result.cursor);
+    cursor = result.cursor;
+  }
+  return null;
+}
+
+async function legacyName(binding, host, slug, bypassCache) {
+  if (typeof binding.list !== 'function') return null;
+  const state = namesFor(binding);
+  const now = Date.now();
+  if (now - state.start >= NAME_WINDOW_MS || now < state.start) {
+    state.start = now;
+    state.scans = 0;
+    state.calls = 0;
+  }
+  for (const [key, entry] of state.entries) {
+    if (entry.expires <= now) state.entries.delete(key);
+  }
+  if (!bypassCache && state.entries.has(host)) {
+    const entry = state.entries.get(host);
+    state.entries.delete(host);
+    state.entries.set(host, entry);
+    return entry.index.get(slug.toLowerCase()) ?? null;
+  }
+  let pending = state.inflight.get(host);
+  if (!pending) {
+    if (state.scans >= MAX_NAME_SCANS) return null;
+    state.scans++;
+    pending = scanNames(binding, host, state).catch(() => null);
+    state.inflight.set(host, pending);
+  }
+  const entry = await pending;
+  if (state.inflight.get(host) === pending) {
+    state.inflight.delete(host);
+    if (entry) {
+      state.entries.delete(host);
+      state.entries.set(host, entry);
+      while (state.entries.size > MAX_NAME_HOSTS ||
+          [...state.entries.values()].reduce((sum, item) => sum + item.size, 0) > MAX_NAMES) {
+        state.entries.delete(state.entries.keys().next().value);
+      }
+    }
+  }
+  return entry?.index.get(slug.toLowerCase()) ?? null;
+}
+
+async function readLink(binding, host, slug, bypassCache) {
+  const read = name => readKV(binding, `l:${host}:${name}`, MAX_LINK_BYTES,
+    bypassCache, value => validLink(value) || validTemplateLink(value));
+  const exact = await read(slug);
+  if (exact !== null) return exact;
+  const lower = slug.toLowerCase();
+  if (lower !== slug) {
+    const canonical = await read(lower);
+    if (canonical !== null) return canonical;
+  }
+  const original = await legacyName(binding, host, slug, bypassCache);
+  return original ? read(original) : null;
+}
 
 function response(status, body, head, extra = {}) {
   return new Response(head ? null : body, {
@@ -410,8 +512,7 @@ export default {
       const config = await readKV(env.LINKS, `c:${host}`, MAX_CONFIG_BYTES, selftest !== null, validConfig);
       if (config === null) return response(404, 'Not Found', head);
       if (config.prefix !== route[1]) return response(404, 'Not Found', head);
-      const link = await readKV(env.LINKS, `l:${host}:${route[2]}`, MAX_LINK_BYTES,
-        selftest !== null, value => validLink(value) || validTemplateLink(value));
+      const link = await readLink(env.LINKS, host, route[2], selftest !== null);
       if (link === null) return response(404, 'Not Found', head);
       let destination;
       if (validTemplateLink(link)) {

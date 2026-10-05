@@ -475,6 +475,7 @@ export default function App() {
     if (mutationRef.current && kind !== "migrate_credentials") return false;
     if (
       kind !== "migrate_credentials" &&
+      kind !== "dismiss_worker_upgrade" &&
       !requireCurrentCredentials(changeAccountIds(fields), onFailure)
     ) return false;
     const next = await run(
@@ -554,6 +555,9 @@ export default function App() {
           ...(kind === "recover_selftest_resources"
             ? ["本次只找回本机检测配置；完成后，恢复检测密钥仍需另行查看计划并确认。"]
             : []),
+          ...((kind === "upgrade_worker" || kind === "resume_worker_upgrade")
+            ? state.domains.filter((d) => d.accountId === fields.accountId).map((d) => `影响域名：${d.host}/${d.prefix}/`)
+            : []),
         ]);
       setPlan(next);
     }
@@ -588,6 +592,12 @@ export default function App() {
           ? "本机授权已更新，请重试刚才的操作"
           : appliedKind === "recover_selftest_resources"
             ? "本机检测配置已找回。请查看新的修复计划，另行确认恢复检测密钥。"
+          : appliedKind === "dismiss_worker_upgrade"
+            ? "本机升级记录已解除，云端和密钥未修改。请继续核对云端当前状态。"
+          : appliedKind === "resume_worker_upgrade"
+            ? "云端升级已核对，待处理记录已完成。请留意账户中的检测密钥恢复提示。"
+          : appliedKind === "upgrade_worker"
+            ? "云端升级结果已核对。请留意账户中的检测密钥恢复提示。"
           : appliedKind === "add_domain"
             ? "域名已接入。现在可以创建第一条短链接；云端配置可能需要稍等片刻才生效。"
             : appliedKind === "fix_domain_dns"
@@ -739,7 +749,7 @@ export default function App() {
       return;
     }
     if (!originalSlug && state.links.some((link) =>
-      link.domainId === linkDraft.domainId && link.slug === linkDraft.slug
+      link.domainId === linkDraft.domainId && link.slug.toLowerCase() === linkDraft.slug.toLowerCase()
     )) {
       setError("这个名称已被使用，请换一个名称。现有链接不会被覆盖。");
       return;
@@ -1532,7 +1542,7 @@ export default function App() {
         return;
       }
       if (
-        isSelftestRecovery(action.kind) &&
+        (isSelftestRecovery(action.kind) || action.kind === "resume_worker_upgrade") &&
         action.accountId
       ) {
         await prepare(action.kind, { accountId: action.accountId });
@@ -2064,6 +2074,9 @@ export default function App() {
                       {action.kind === "recover_selftest_resources" && (
                         <p>先只读核对云端，找回本机检测配置，已有密钥和待处理记录会保留。完成后，请另行确认恢复检测密钥。</p>
                       )}
+                      {action.kind === "resume_worker_upgrade" && (
+                        <p>先核对云端升级结果，再完成本机记录。若云端被其他程序修改，可解除本机升级记录后处理；解除不会改动云端或密钥。</p>
+                      )}
                     </div>
                     <button
                       className="button secondary"
@@ -2072,13 +2085,15 @@ export default function App() {
                         ((action.kind === "resume_pool_sync" ||
                           action.kind === "delete_pool") &&
                           !action.poolId) ||
-                        ((action.kind === "resume_monitor" || isSelftestRecovery(action.kind)) &&
+                        ((action.kind === "resume_monitor" || action.kind === "resume_worker_upgrade" || isSelftestRecovery(action.kind)) &&
                           !state.accounts.some((account) => account.id === action.accountId))
                       }
                       onClick={() => void resumePending(action)}
                     >
                       {action.kind === "resume_pool_sync"
                         ? "继续同步"
+                        : action.kind === "resume_worker_upgrade"
+                          ? "继续核对升级"
                         : action.kind === "resume_monitor"
                           ? "继续处理监测"
                           : action.kind === "resume_selftest_rotation"
@@ -2089,6 +2104,12 @@ export default function App() {
                               ? "找回本机检测配置"
                           : "继续删除"}
                     </button>
+                    {action.kind === "resume_worker_upgrade" && action.accountId && (
+                      <button className="button secondary" disabled={busy}
+                        onClick={() => void prepare("dismiss_worker_upgrade", { accountId: action.accountId })}>
+                        解除本机升级记录
+                      </button>
+                    )}
                   </div>
                 ))}
               </section>
@@ -2586,7 +2607,7 @@ export default function App() {
               <input
                 ref={slugInput}
                 value={linkDraft.slug}
-                onChange={(e) => updateLinkDraft({ slug: e.target.value })}
+                onChange={(e) => updateLinkDraft({ slug: originalSlug ? e.target.value : e.target.value.toLowerCase() })}
                 placeholder="例如 welcome"
                 maxLength={32}
                 required
@@ -2594,7 +2615,7 @@ export default function App() {
               />
               <small>
                 它是网址最后一段，例如
-                /welcome；可用字母、数字、下划线或连字符。
+                /welcome；可用字母、数字、下划线或连字符。新名称自动转为小写，旧链接名称保持原样。
               </small>
             </label>
             {originalSlug && (
@@ -3518,6 +3539,20 @@ export default function App() {
               </button>
               </div>
             </section>
+            {manageAccount.hasResources && (
+              <section className="manager-section">
+                <div className="manager-section-heading">
+                  <strong>名称大小写兼容</strong>
+                  <p>启用后，这个账户下所有短链接域名都支持名称大小写兼容。旧链接保持原样；已有重名时先匹配原名称，再匹配小写名称。现有密钥和检测设置会保留。</p>
+                </div>
+                <div className="manager-actions">
+                  <button disabled={busy} className="button secondary" onClick={() => {
+                    void prepare("upgrade_worker", { accountId: manageAccount.id });
+                    setManageAccount(null);
+                  }}>启用名称大小写兼容</button>
+                </div>
+              </section>
+            )}
             <div className="danger-zone">
               <strong>危险操作</strong>
               <p>

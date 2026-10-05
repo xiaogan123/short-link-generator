@@ -195,6 +195,31 @@ pub struct PendingSelftestRotation {
     pub status: SelftestRotationStatus,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerUpgradePhase {
+    Prepared,
+    UploadUncertain,
+    VerificationFailed,
+    ManifestUncertain,
+}
+
+/// Only validated, non-secret cloud metadata is stored here. Secret bindings
+/// contain their names and types, never their values.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingWorkerUpgrade {
+    pub account_id: String,
+    pub resources: Resources,
+    pub previous_hash: String,
+    pub target_hash: String,
+    pub manifest: serde_json::Value,
+    pub settings: serde_json::Value,
+    pub schedules: serde_json::Value,
+    pub journal: String,
+    pub phase: WorkerUpgradePhase,
+}
+
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Database {
@@ -212,6 +237,8 @@ pub struct Database {
     pub pending_monitor_changes: Vec<PendingMonitorChange>,
     #[serde(default)]
     pub pending_selftest_rotations: Vec<PendingSelftestRotation>,
+    #[serde(default)]
+    pub pending_worker_upgrades: Vec<PendingWorkerUpgrade>,
     #[serde(default)]
     pub pending_operations: Vec<String>,
 }
@@ -247,6 +274,10 @@ impl Database {
                 .iter()
                 .any(|p| p.account_id == account_id)
             || self.pending_pool_changes.iter().any(pool_mentions)
+            || self
+                .pending_worker_upgrades
+                .iter()
+                .any(|p| p.account_id == account_id)
         {
             return false;
         }
@@ -276,6 +307,10 @@ impl Database {
                     .pending_pool_changes
                     .iter()
                     .any(|p| !pool_mentions(p) && matches_journal(entry, &p.journal))
+                || self
+                    .pending_worker_upgrades
+                    .iter()
+                    .any(|p| p.account_id != account_id && matches_journal(entry, &p.journal))
         })
     }
 }
@@ -388,6 +423,12 @@ impl From<&Database> for State {
                         },
                     }
                 }))
+                .chain(db.pending_worker_upgrades.iter().map(|p| PendingAction {
+                    kind: "resume_worker_upgrade".into(),
+                    pool_id: None,
+                    account_id: Some(p.account_id.clone()),
+                    label: "继续核对名称兼容升级".into(),
+                }))
                 .chain(
                     db.accounts
                         .iter()
@@ -449,6 +490,16 @@ pub struct DomainCheck {
 
 #[derive(Clone)]
 pub enum PlanKind {
+    UpgradeWorker {
+        account_id: String,
+        target_hash: String,
+    },
+    ResumeWorkerUpgrade {
+        account_id: String,
+    },
+    DismissWorkerUpgrade {
+        account_id: String,
+    },
     MigrateCredentials {
         account_id: String,
     },
@@ -471,6 +522,7 @@ pub enum PlanKind {
         domain_id: String,
         slug: String,
         create_only: bool,
+        exact_edit: bool,
         cn_url: String,
         default_url: String,
         pool_id: Option<String>,

@@ -24,6 +24,9 @@ mod selftest_resource_recovery_tests;
 mod windows_configuration;
 #[cfg(all(test, target_os = "windows"))]
 mod windows_credential_native_tests;
+mod worker_upgrade;
+#[cfg(test)]
+mod worker_upgrade_tests;
 
 use chrono::Utc;
 use cloud::{Cloud, CloudError};
@@ -33,8 +36,8 @@ use hmac::{Hmac, Mac};
 use model::{
     Account, Candidate, Database, DnsActionView, Domain, DomainCheck, DomainCheckLevel,
     DomainDnsPreparation, DomainPreparation, Link, PendingMonitorChange, PendingPoolChange,
-    PendingSelftestRotation, Plan, PlanKind, PlanView, Pool, PoolSyncStatus, Resources,
-    SelftestRotationStatus, State, Zone,
+    PendingSelftestRotation, PendingWorkerUpgrade, Plan, PlanKind, PlanView, Pool, PoolSyncStatus,
+    Resources, SelftestRotationStatus, State, WorkerUpgradePhase, Zone,
 };
 use rand::{distributions::Alphanumeric, Rng, RngCore};
 use serde_json::{json, Value};
@@ -825,11 +828,15 @@ impl Backend {
         Ok(())
     }
     fn require_plan_credentials(&self, kind: &PlanKind) -> Result<(), String> {
-        if !cfg!(target_os = "macos") {
-            return Ok(());
-        }
         let ids: Vec<String> = match kind {
             PlanKind::MigrateCredentials { .. } => return Ok(()),
+            PlanKind::UpgradeWorker { account_id, .. }
+            | PlanKind::ResumeWorkerUpgrade { account_id } => {
+                return self.require_credentials(account_id);
+            }
+            PlanKind::DismissWorkerUpgrade { account_id } => {
+                return self.account(account_id).map(|_| ())
+            }
             PlanKind::Domain { account_id, .. }
             | PlanKind::DomainDns { account_id, .. }
             | PlanKind::EnableMonitor { account_id, .. }
@@ -855,6 +862,9 @@ impl Backend {
                 .map(|a| a.id.clone())
                 .collect(),
         };
+        for id in &ids {
+            self.require_no_worker_upgrade(id)?;
+        }
         self.require_many_credentials(ids.iter().map(String::as_str))
     }
     async fn migrate_credentials(&mut self, id: &str) -> Result<(), String> {
@@ -1951,7 +1961,8 @@ impl Backend {
                 };
                 let domain_id = field(payload, "domainId")?.to_owned();
                 let domain = self.domain(&domain_id)?;
-                let slug = field(payload, "slug")?.to_owned();
+                let (slug, existing) =
+                    self.resolve_link_name(&domain_id, field(payload, "slug")?, create_only)?;
                 let (cn_url, default_url, pool_id, code) = if let Some(pool_id) =
                     payload["poolId"].as_str().filter(|s| !s.is_empty())
                 {
@@ -2000,15 +2011,6 @@ impl Backend {
                         None,
                     )
                 };
-                validate_slug(&slug)?;
-                let existing = self
-                    .db
-                    .links
-                    .iter()
-                    .any(|l| l.domain_id == domain_id && l.slug == slug);
-                if create_only && existing {
-                    return Err("此域名下已存在同名链接，请换一个名称；已有链接未修改".into());
-                }
                 (
                     if create_only {
                         "另存为新链接"
@@ -2041,12 +2043,16 @@ impl Backend {
                         domain_id,
                         slug,
                         create_only,
+                        exact_edit: existing,
                         cn_url,
                         default_url,
                         pool_id,
                         code,
                     },
                 )
+            }
+            "upgrade_worker" | "resume_worker_upgrade" | "dismiss_worker_upgrade" => {
+                return self.prepare_worker_upgrade(kind, field(payload, "accountId")?);
             }
             "save_pool" => {
                 let mut pool: Pool = serde_json::from_value(payload["pool"].clone())
@@ -2392,6 +2398,7 @@ impl Backend {
             "remove_account" => {
                 let id = field(payload, "accountId")?;
                 self.account(id)?;
+                self.require_no_worker_upgrade(id)?;
                 if self
                     .db
                     .pending_monitor_changes
@@ -2620,6 +2627,7 @@ impl Backend {
         host: &str,
         snapshot: domain_check::DnsSnapshot,
     ) -> Result<(), String> {
+        self.require_no_worker_upgrade(account_id)?;
         let (token, zone_name) = self.confirmed_zone_token(account_id, zone_id, host).await?;
         let current = self.exact_dns_records(&token, zone_id, host).await?;
         match &snapshot {
@@ -2892,6 +2900,7 @@ impl Backend {
         if !self.db.pending_monitor_changes.is_empty()
             || !self.db.pending_pool_changes.is_empty()
             || !self.db.pending_selftest_rotations.is_empty()
+            || !self.db.pending_worker_upgrades.is_empty()
             || self
                 .db
                 .accounts
@@ -3262,6 +3271,7 @@ impl Backend {
         account_id: &str,
         resources: &Resources,
     ) -> Result<(), String> {
+        self.require_no_worker_upgrade(account_id)?;
         let manifest = self
             .cloud
             .read_value(token, account_id, &resources.namespace, MANIFEST_KEY)
@@ -3290,24 +3300,28 @@ impl Backend {
         let bindings = settings["result"]["bindings"]
             .as_array()
             .ok_or("无法读取 Worker 绑定")?;
-        let expected = (bindings.len() == 2 || bindings.len() == 3)
+        let missing_key_recovery = self.account(account_id)?.needs_selftest_key;
+        let mut names = HashSet::new();
+        let expected = (1..=3).contains(&bindings.len())
             && bindings.iter().any(|b| {
                 b["type"] == "kv_namespace"
                     && b["name"] == "LINKS"
                     && b["namespace_id"] == resources.namespace
             })
-            && bindings
-                .iter()
-                .any(|b| b["type"] == "secret_text" && b["name"] == "SELFTEST_KEY")
-            && (bindings.len() == 2
+            && (missing_key_recovery
                 || bindings
                     .iter()
-                    .any(|b| b["type"] == "secret_text" && b["name"] == "PROBE_KEY"))
+                    .any(|b| b["type"] == "secret_text" && b["name"] == "SELFTEST_KEY"))
             && bindings.iter().all(|b| {
-                matches!(
-                    b["name"].as_str(),
-                    Some("LINKS" | "SELFTEST_KEY" | "PROBE_KEY")
-                )
+                let name = b["name"].as_str().unwrap_or("");
+                names.insert(name)
+                    && match name {
+                        "LINKS" => {
+                            b["type"] == "kv_namespace" && b["namespace_id"] == resources.namespace
+                        }
+                        "SELFTEST_KEY" | "PROBE_KEY" => b["type"] == "secret_text",
+                        _ => false,
+                    }
             });
         if !expected {
             return Err("Worker 绑定已变化，停止操作".into());
@@ -3330,6 +3344,16 @@ impl Backend {
     ) -> Result<(), String> {
         self.require_plan_credentials(&kind)?;
         match kind {
+            PlanKind::UpgradeWorker {
+                account_id,
+                target_hash,
+            } => self.apply_worker_upgrade(&account_id, &target_hash).await,
+            PlanKind::ResumeWorkerUpgrade { account_id } => {
+                self.resume_worker_upgrade(&account_id).await
+            }
+            PlanKind::DismissWorkerUpgrade { account_id } => {
+                self.dismiss_worker_upgrade(&account_id)
+            }
             PlanKind::MigrateCredentials { account_id } => {
                 self.migrate_credentials(&account_id).await
             }
@@ -3369,6 +3393,7 @@ impl Backend {
                 domain_id,
                 slug,
                 create_only,
+                exact_edit,
                 cn_url,
                 default_url,
                 pool_id,
@@ -3377,14 +3402,21 @@ impl Backend {
                 // Copying to a new name must never become an edit if state
                 // changes after preparation. Keep this check before credentials
                 // or any platform/link cloud writes.
-                if create_only
-                    && self
-                        .db
-                        .links
-                        .iter()
-                        .any(|link| link.domain_id == domain_id && link.slug == slug)
+                let exact_exists = self
+                    .db
+                    .links
+                    .iter()
+                    .any(|link| link.domain_id == domain_id && link.slug == slug);
+                if create_only && exact_exists
+                    || !exact_edit
+                        && self.db.links.iter().any(|link| {
+                            link.domain_id == domain_id && link.slug.eq_ignore_ascii_case(&slug)
+                        })
                 {
                     return Err("此域名下已存在同名链接，请换一个名称；已有链接未修改".into());
+                }
+                if exact_edit && !exact_exists {
+                    return Err("原链接已变化，请重新准备保存计划".into());
                 }
                 self.apply_save_link(
                     &domain_id,
@@ -3705,12 +3737,30 @@ impl Backend {
         pool_id: Option<&str>,
         code: Option<&str>,
     ) -> Result<(), String> {
-        validate_slug(slug)?;
+        let (slug, exact_edit) = self.resolve_link_name(domain_id, slug, false)?;
+        let slug = slug.as_str();
         validate_target(cn)?;
         validate_target(default)?;
         let domain = self.domain(domain_id)?.clone();
+        self.require_no_worker_upgrade(&domain.account_id)?;
         let token = keyring_get(&domain.account_id, "token")?;
         let resources = self.ensure_domain_owned(&domain, &token).await?;
+        if !exact_edit {
+            let prefix = format!("l:{}:", domain.host);
+            let keys = self
+                .cloud
+                .list_keys(&token, &domain.account_id, &resources.namespace, &prefix)
+                .await
+                .map_err(problem)?;
+            if keys.iter().any(|key| {
+                key.strip_prefix(&prefix)
+                    .is_some_and(|remote| remote.eq_ignore_ascii_case(slug))
+            }) {
+                return Err(
+                    "云端已存在大小写相同的链接名称，请先找回或换一个名称；已有链接未修改".into(),
+                );
+            }
+        }
         if let (Some(_), Some(code)) = (pool_id, code) {
             if !pools::valid_code(code) {
                 return Err("邀请码无效".into());
@@ -4602,7 +4652,7 @@ impl Backend {
         let has_probe = bindings
             .iter()
             .any(|b| b["type"] == "secret_text" && b["name"] == "PROBE_KEY");
-        if !has_probe && pending.is_none() {
+        if !has_probe && pending.is_none() && !account.needs_monitor_key {
             return Err("Worker 监测密钥已变化，停止删除".into());
         }
         let journal = pending
@@ -5449,6 +5499,7 @@ impl Backend {
     }
 
     fn require_selftest_resource_recovery(&self, account_id: &str) -> Result<(), String> {
+        self.require_no_worker_upgrade(account_id)?;
         self.require_credentials(account_id)?;
         if !self.db.can_recover_selftest_resources(account_id) {
             return Err(
@@ -5480,6 +5531,7 @@ impl Backend {
     }
 
     async fn recover_account(&mut self, account_id: &str) -> Result<(), String> {
+        self.require_no_worker_upgrade(account_id)?;
         self.require_credentials(account_id)?;
         if !self.db.pending_monitor_changes.is_empty()
             || !self.db.pending_pool_changes.is_empty()
@@ -6326,7 +6378,8 @@ mod tests {
     };
 
     fn ok(result: Value) -> ResponseTemplate {
-        ResponseTemplate::new(200).set_body_json(json!({"success":true,"result":result}))
+        ResponseTemplate::new(200)
+            .set_body_json(json!({"success":true,"result":result,"result_info":{"cursor":""}}))
     }
     pub(super) struct FixtureGuard {
         _dir: tempfile::TempDir,
@@ -6381,6 +6434,7 @@ mod tests {
                 pending_pool_changes: vec![],
                 pending_monitor_changes: vec![],
                 pending_selftest_rotations: vec![],
+                pending_worker_upgrades: vec![],
                 pending_operations: vec![],
             },
             path: dir.path().join("state.json"),
@@ -6499,6 +6553,15 @@ mod tests {
         }
     }
     pub(super) async fn mount_owned_domain(server: &MockServer) {
+        Mock::given(method("GET"))
+            .and(path(
+                "/client/v4/accounts/acct1/storage/kv/namespaces/ns1/keys",
+            ))
+            .and(query_param("prefix", "l:example.com:"))
+            .respond_with(ok(json!([])))
+            .with_priority(100)
+            .mount(server)
+            .await;
         Mock::given(method("GET"))
             .and(path("/client/v4/zones/zone1/workers/routes"))
             .respond_with(ok(json!([{"id":"route1","pattern":"example.com/go/*",
@@ -8425,7 +8488,7 @@ mod tests {
             ))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "success":true,"result":[{"name":"l:example.com:short"}],
-                "result_info":{"count":1}
+                "result_info":{"count":1,"cursor":""}
             })))
             .mount(&server)
             .await;
@@ -10016,7 +10079,7 @@ mod tests {
             1
         );
     }
-    async fn mount_recovery_without_pool(server: &MockServer, with_link: bool) {
+    pub(super) async fn mount_recovery_without_pool(server: &MockServer, with_link: bool) {
         mount_resource(server, include_str!("../../edge/worker.mjs")).await;
         mount_owned_domain(server).await;
         mount_zone_owner(server).await;

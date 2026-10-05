@@ -323,6 +323,8 @@ impl Cloud {
     ) -> CloudResult<Vec<String>> {
         let mut all = Vec::new();
         let mut cursor: Option<String> = None;
+        let mut seen_cursors = std::collections::HashSet::new();
+        let mut seen_names = std::collections::HashSet::new();
         for _ in 0..MAX_PAGES {
             let mut url = format!(
                 "accounts/{account}/storage/kv/namespaces/{namespace}/keys?limit=1000&prefix={}",
@@ -336,17 +338,44 @@ impl Cloud {
             let list = value["result"]
                 .as_array()
                 .ok_or_else(|| CloudError::new("键列表格式无效", false))?;
+            if list.len() > 1000 {
+                return Err(CloudError::new("键列表分页大小无效", false));
+            }
             for item in list {
                 let name = item["name"]
                     .as_str()
                     .ok_or_else(|| CloudError::new("键列表格式无效", false))?;
+                if name.is_empty()
+                    || name.len() > 512
+                    || !name.starts_with(prefix)
+                    || name.chars().any(char::is_control)
+                    || !seen_names.insert(name.to_owned())
+                {
+                    return Err(CloudError::new("键列表名称无效、越界或重复", false));
+                }
                 all.push(name.to_string());
             }
-            let next = value["result_info"]["cursor"]
-                .as_str()
-                .filter(|s| !s.is_empty());
-            if let Some(next) = next {
-                if cursor.as_deref() == Some(next) {
+            // REST result_info and its cursor are optional. Omission is a
+            // terminal page; a present value must still follow the schema.
+            let next = match value.get("result_info") {
+                None => "",
+                Some(Value::Object(info)) => {
+                    if info
+                        .get("count")
+                        .is_some_and(|count| count.as_u64().is_none())
+                    {
+                        return Err(CloudError::new("键列表分页计数无效", false));
+                    }
+                    match info.get("cursor") {
+                        None => "",
+                        Some(Value::String(next)) => next.as_str(),
+                        Some(_) => return Err(CloudError::new("键列表分页游标格式无效", false)),
+                    }
+                }
+                Some(_) => return Err(CloudError::new("键列表分页信息格式无效", false)),
+            };
+            if !next.is_empty() {
+                if !seen_cursors.insert(next.to_owned()) {
                     return Err(CloudError::new("云端分页游标重复", false));
                 }
                 cursor = Some(next.to_string());
@@ -515,6 +544,63 @@ impl Cloud {
             return Ok(());
         }
         Err(CloudError::new("请求过于频繁，请稍后再试", false))
+    }
+
+    /// Upgrade existing code without reading or replacing secret values. The
+    /// caller supplies a validated snapshot and persists intent before calling.
+    pub async fn upload_worker_upgrade(
+        &self,
+        token: &str,
+        account: &str,
+        script: &str,
+        namespace: &str,
+        settings: &Value,
+    ) -> CloudResult<()> {
+        let metadata = json!({
+            "main_module": settings["main_module"],
+            "compatibility_date": settings["compatibility_date"],
+            "compatibility_flags": settings["compatibility_flags"],
+            "bindings": [{"type":"kv_namespace","name":"LINKS","namespace_id":namespace}],
+            "keep_bindings": ["secret_text"]
+        });
+        let form = multipart::Form::new()
+            .part(
+                "metadata",
+                multipart::Part::text(metadata.to_string())
+                    .mime_str("application/json")
+                    .map_err(|_| CloudError::new("Worker 元数据无效", false))?,
+            )
+            .part(
+                "worker.mjs",
+                multipart::Part::text(include_str!("../../edge/worker.mjs"))
+                    .file_name("worker.mjs")
+                    .mime_str("application/javascript+module")
+                    .map_err(|_| CloudError::new("Worker 脚本格式无效", false))?,
+            );
+        // This upload is deliberately single-shot, even on 429. Recovery reads
+        // the content hash and never blindly repeats a possibly applied upload.
+        let response = self
+            .client
+            .put(self.url(&format!("accounts/{account}/workers/scripts/{script}"))?)
+            .bearer_auth(token)
+            .multipart(form)
+            .send()
+            .await
+            .map_err(|_| CloudError::new("Worker 上传结果不确定，请从待处理操作核对", true))?;
+        if !response.status().is_success() {
+            return Err(CloudError::new(
+                format!("Worker 上传失败（HTTP {}）", response.status().as_u16()),
+                uncertain_write_status(response.status()),
+            ));
+        }
+        let value: Value = response
+            .json()
+            .await
+            .map_err(|_| CloudError::new("Worker 上传响应无效，请核对待处理记录", true))?;
+        if value["success"] != true {
+            return Err(CloudError::new("Worker 上传被云端拒绝", false));
+        }
+        Ok(())
     }
 
     pub async fn script_settings(

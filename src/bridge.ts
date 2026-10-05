@@ -119,7 +119,12 @@ function previewDispatch(action: Action, payload: Record<string, unknown>): unkn
     const kind = String(payload.kind);
     if (kind === 'save_link') {
       if (payload.createOnly !== undefined && typeof payload.createOnly !== 'boolean') throw new Error('创建方式格式无效。');
-      if (payload.createOnly === true && local.links.some(l => l.domainId === payload.domainId && l.slug === payload.slug)) throw new Error('这个名称已被使用，请换一个名称。现有链接不会被覆盖。');
+      const exact = local.links.some(l => l.domainId === payload.domainId && l.slug === payload.slug);
+      const slug = String(payload.slug);
+      if (!exact || payload.createOnly === true) {
+        if (local.links.some(l => l.domainId === payload.domainId && l.slug.toLowerCase() === slug.toLowerCase())) throw new Error('这个名称已被使用，请换一个名称。现有链接不会被覆盖。');
+        payload = { ...payload, slug: slug.toLowerCase() };
+      }
     }
     if (kind === 'migrate_credentials') {
       const account = local.accounts.find(a => a.id === payload.accountId);
@@ -132,6 +137,12 @@ function previewDispatch(action: Action, payload: Record<string, unknown>): unkn
       const account = local.accounts.find(a => a.id === payload.accountId);
       if (!account || account.hasResources || !local.pendingActions.some(a => a.kind === kind && a.accountId === account.id)) throw new Error('当前账户无需找回检测配置，请重新核对状态。');
       return makePlan('找回检测服务配置', ['只读核对云端唯一的检测服务及其归属', '登记本机检测配置，保留已有密钥与待处理记录', '完成后另行确认恢复检测密钥'], ['本地预览只模拟找回配置，不读取真实凭据或访问云服务。'], kind, {accountId:account.id});
+    }
+    if (kind === 'upgrade_worker' || kind === 'resume_worker_upgrade' || kind === 'dismiss_worker_upgrade') {
+      if (!local.accounts.some(a => a.id === payload.accountId && a.hasResources)) throw new Error('账户尚未部署短链接服务。');
+      return makePlan(kind === 'dismiss_worker_upgrade' ? '解除本机升级记录' : '启用名称大小写兼容',
+        kind === 'dismiss_worker_upgrade' ? ['只解除本机待处理记录，云端与密钥保持原样'] : ['核对云端服务归属', '保留密钥和检测设置，启用名称大小写兼容'],
+        ['本地预览只模拟操作，不连接云端。'], kind, payload);
     }
     const titles: Record<string, string> = { save_link: '保存短链接', delete_link: '删除短链接', save_pool: '保存平台地址', resume_pool_sync:'继续同步平台地址', delete_pool: '删除平台地址', remove_domain: '移除域名', cleanup_account: '清理远端资源', recover_account: '恢复账户资源', rotate_selftest: '轮换检测密钥', recover_selftest_rotation: '恢复检测密钥', resume_selftest_rotation: '继续恢复检测密钥' };
     if (kind === 'delete_pool' && local.links.some(l => l.poolId === payload.poolId)) throw new Error('平台地址仍有链接引用，无法删除。');
@@ -153,7 +164,7 @@ function previewDispatch(action: Action, payload: Record<string, unknown>): unkn
     }
     if (item.action === 'add_domain') local.domains.push({ id: uid(), host: String(p.host), prefix: String(p.prefix), accountId: String(p.accountId), zoneId: String(p.zoneId), routeId: `demo-route-${uid()}` });
     if (item.action === 'save_link') {
-      if (p.createOnly === true && local.links.some(l => l.domainId === p.domainId && l.slug === p.slug)) throw new Error('这个名称已被使用，请换一个名称。现有链接不会被覆盖。');
+      if (p.createOnly === true && local.links.some(l => l.domainId === p.domainId && l.slug.toLowerCase() === String(p.slug).toLowerCase())) throw new Error('这个名称已被使用，请换一个名称。现有链接不会被覆盖。');
       const pool = (local.pools || []).find(pool => pool.id === p.poolId);
       if (p.poolId && !pool) throw new Error('平台地址不存在。');
       const code = String(p.code || '');

@@ -107,7 +107,7 @@ test('country selection uses only mainland CN and never forwards incoming query'
   assert.deepEqual(env.LINKS.reads.map(([key]) => key), [`c:${HOST}`, `l:${HOST}:Offer_1`]);
 });
 
-test('exact host, prefix, case-sensitive slug and raw single-segment paths', async () => {
+test('exact host, prefix and raw single-segment paths; absent list retains legacy exact matching', async () => {
   const env = fixture();
   assert.equal(await location(await worker.fetch(req(`https://GO.EXAMPLE.COM/r/Offer_1`), env)), DEFAULT);
   const invalid = [
