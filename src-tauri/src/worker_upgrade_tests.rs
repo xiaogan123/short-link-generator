@@ -30,6 +30,7 @@ struct Remote {
     change_schedules: bool,
     missing_secrets: bool,
     delay_content_visibility: bool,
+    annotations_after_upload: Option<Value>,
 }
 async fn mount_upgrade(server: &MockServer, state_path: &std::path::Path) -> Arc<StdMutex<Remote>> {
     let remote = Arc::new(StdMutex::new(Remote {
@@ -42,6 +43,7 @@ async fn mount_upgrade(server: &MockServer, state_path: &std::path::Path) -> Arc
         change_schedules: false,
         missing_secrets: false,
         delay_content_visibility: false,
+        annotations_after_upload: None,
     }));
     for suffix in ["/content/v2", "/settings", "/schedules"] {
         let remote = remote.clone();
@@ -82,6 +84,10 @@ async fn mount_upgrade(server: &MockServer, state_path: &std::path::Path) -> Arc
                 db.pending_worker_upgrades[0].phase,
                 WorkerUpgradePhase::Prepared
             );
+            assert!(db.pending_worker_upgrades[0]
+                .settings
+                .get("annotations")
+                .is_none());
             let mut state = state.lock().unwrap();
             if !state.delay_content_visibility {
                 state.source = include_str!("../../edge/worker.mjs").into();
@@ -91,6 +97,9 @@ async fn mount_upgrade(server: &MockServer, state_path: &std::path::Path) -> Arc
                 .as_array_mut()
                 .unwrap()
                 .reverse();
+            if let Some(annotations) = state.annotations_after_upload.clone() {
+                state.settings["annotations"] = annotations;
+            }
             if state.change_schedules {
                 state.schedules = json!({"schedules":[]});
             }
@@ -892,4 +901,280 @@ async fn local_dismiss_removes_known_pending_after_resource_identity_changes() {
         assert!(backend.db.pending_worker_upgrades.is_empty());
         assert!(backend.db.pending_operations.is_empty());
     }
+}
+
+#[tokio::test]
+async fn unsupported_settings_diagnostics_identify_only_fixed_protocol_fields() {
+    for field in [
+        "annotations",
+        "cache_options",
+        "observability",
+        "placement",
+        "usage_model",
+        "limits",
+        "assets",
+        "migration_tag",
+        "migrations",
+        "exports",
+        "exports_reconciliation",
+        "tags",
+        "tail_consumers",
+        "logpush",
+        "cpu_ms",
+    ] {
+        let (server, mut backend, _guard) = fixture().await;
+        let remote = mount_upgrade(&server, &backend.path).await;
+        remote.lock().unwrap().settings[field] = json!("do-not-echo-setting-value");
+        let error = apply_upgrade(&mut backend).await.unwrap_err();
+        assert!(error.contains(&format!("设置字段：{field}")));
+        assert!(!error.contains("do-not-echo-setting-value"));
+        assert!(writes(&server).await.is_empty());
+        assert!(backend.db.pending_worker_upgrades.is_empty());
+        assert!(backend.db.pending_operations.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn unsupported_settings_diagnostics_never_echo_arbitrary_key_or_values() {
+    let (server, mut backend, _guard) = fixture().await;
+    let remote = mount_upgrade(&server, &backend.path).await;
+    remote.lock().unwrap().settings["arbitrary_field_123"] =
+        json!({"host":"example.org","note":"do-not-echo-setting-value"});
+    let error = apply_upgrade(&mut backend).await.unwrap_err();
+    assert!(error.contains("设置字段：未识别字段"));
+    for forbidden in [
+        "arbitrary_field_123",
+        "do-not-echo-setting-value",
+        "example.org",
+    ] {
+        assert!(!error.contains(forbidden));
+    }
+    assert!(writes(&server).await.is_empty());
+    assert!(backend.db.pending_worker_upgrades.is_empty());
+    assert!(backend.db.pending_operations.is_empty());
+}
+
+#[tokio::test]
+async fn upgrade_ignores_only_readonly_annotation_in_preflight_and_readback() {
+    let (server, mut backend, _guard) = fixture().await;
+    let remote = mount_upgrade(&server, &backend.path).await;
+    {
+        let mut state = remote.lock().unwrap();
+        state.settings["annotations"] = json!({
+            "workers/triggered_by":"previous-server-operation",
+            "workers/message":"",
+            "workers/tag":""
+        });
+        state.annotations_after_upload = Some(json!({"workers/triggered_by":"upload"}));
+    }
+    apply_upgrade(&mut backend).await.unwrap();
+    let mutations = writes(&server).await;
+    assert_eq!(mutations.len(), 2);
+    assert_eq!(mutations[0].url.path(), SCRIPT_PATH);
+    assert_eq!(
+        upload_metadata(&mutations[0]).await,
+        json!({
+            "main_module":"worker.mjs",
+            "compatibility_date":"2025-01-01",
+            "compatibility_flags":["nodejs_compat","streams_enable_constructors"],
+            "bindings":[{"type":"kv_namespace","name":"LINKS","namespace_id":"ns1"}],
+            "keep_bindings":["secret_text"]
+        })
+    );
+    assert!(backend.db.pending_worker_upgrades.is_empty());
+    assert_eq!(
+        remote.lock().unwrap().schedules,
+        json!({"schedules":[{"cron":"*/15 * * * *"}]})
+    );
+}
+
+#[tokio::test]
+async fn resume_ignores_readonly_annotation_changes_without_uploading_them() {
+    let (server, mut backend, _guard) = fixture().await;
+    let remote = mount_upgrade(&server, &backend.path).await;
+    {
+        let mut state = remote.lock().unwrap();
+        state.settings["annotations"] =
+            json!({"workers/triggered_by":"private-server-provenance-before"});
+        state.annotations_after_upload = Some(json!({"workers/triggered_by":"upload"}));
+        state.fail_manifest = true;
+    }
+    assert!(apply_upgrade(&mut backend).await.is_err());
+    assert_eq!(backend.db.pending_worker_upgrades.len(), 1);
+    let pending = &backend.db.pending_worker_upgrades[0];
+    assert!(pending.settings.get("annotations").is_none());
+    assert!(!serde_json::to_string(pending)
+        .unwrap()
+        .contains("private-server-provenance-before"));
+    assert_eq!(pending.schedules, json!(["*/15 * * * *"]));
+    let saved: Database = serde_json::from_slice(&fs::read(&backend.path).unwrap()).unwrap();
+    assert_eq!(saved.pending_worker_upgrades[0].settings, pending.settings);
+    {
+        let mut state = remote.lock().unwrap();
+        state.settings["annotations"] = json!({"workers/triggered_by":"another-server-operation"});
+        state.fail_manifest = false;
+    }
+    let before = writes(&server).await.len();
+    resume_upgrade(&mut backend).await.unwrap();
+    let mutations = writes(&server).await;
+    assert_eq!(mutations.len(), before + 1);
+    assert_eq!(mutations[before].url.path(), MANIFEST_PATH);
+    assert_eq!(
+        mutations
+            .iter()
+            .filter(|request| request.url.path() == SCRIPT_PATH)
+            .count(),
+        1
+    );
+    assert!(upload_metadata(&mutations[0])
+        .await
+        .get("annotations")
+        .is_none());
+    assert!(backend.db.pending_worker_upgrades.is_empty());
+}
+
+#[tokio::test]
+async fn mutable_unknown_or_malformed_annotations_reject_before_writes_with_safe_diagnostics() {
+    for (annotations, label) in [
+        (
+            json!({"workers/triggered_by":"upload","workers/message":"do-not-echo-annotation-value"}),
+            "annotations.workers/message",
+        ),
+        (
+            json!({"workers/triggered_by":"upload","workers/tag":"do-not-echo-annotation-value"}),
+            "annotations.workers/tag",
+        ),
+        (
+            json!({"workers/triggered_by":"upload","private-annotation-key":""}),
+            "annotations.未识别字段",
+        ),
+        (
+            json!({"workers/triggered_by":true}),
+            "annotations.workers/triggered_by",
+        ),
+        (
+            json!({"workers/triggered_by":"x".repeat(1025)}),
+            "annotations.workers/triggered_by",
+        ),
+    ] {
+        let (server, mut backend, _guard) = fixture().await;
+        let remote = mount_upgrade(&server, &backend.path).await;
+        remote.lock().unwrap().settings["annotations"] = annotations;
+        let error = apply_upgrade(&mut backend).await.unwrap_err();
+        assert!(error.contains(label));
+        assert!(!error.contains("do-not-echo-annotation-value"));
+        assert!(!error.contains("private-annotation-key"));
+        assert!(writes(&server).await.is_empty());
+        assert!(backend.db.pending_worker_upgrades.is_empty());
+        assert!(backend.db.pending_operations.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn unsupported_setting_diagnostics_aggregate_fixed_labels_and_deduplicate_unknowns() {
+    let (server, mut backend, _guard) = fixture().await;
+    let remote = mount_upgrade(&server, &backend.path).await;
+    {
+        let mut state = remote.lock().unwrap();
+        state.settings["annotations"] = json!({
+            "workers/message":"do-not-echo-setting-value",
+            "workers/tag":"do-not-echo-setting-value",
+            "private-annotation-key":"",
+            "another-private-annotation-key":false
+        });
+        state.settings["cache_options"] = json!({"enabled":true});
+        state.settings["observability"] = json!({"enabled":true});
+        state.settings["private-setting-key"] = json!("do-not-echo-setting-value");
+        state.settings["another-private-setting-key"] = json!("do-not-echo-setting-value");
+    }
+    let error = apply_upgrade(&mut backend).await.unwrap_err();
+    for label in [
+        "annotations.workers/message",
+        "annotations.workers/tag",
+        "annotations.未识别字段",
+        "cache_options",
+        "observability",
+    ] {
+        assert_eq!(error.matches(label).count(), 1);
+    }
+    let labels = error
+        .split("设置字段：")
+        .nth(1)
+        .unwrap()
+        .split('）')
+        .next()
+        .unwrap()
+        .split('、')
+        .collect::<Vec<_>>();
+    assert_eq!(labels.len(), 6);
+    assert_eq!(
+        labels
+            .iter()
+            .filter(|&&label| label == "未识别字段")
+            .count(),
+        1
+    );
+    for forbidden in [
+        "do-not-echo-setting-value",
+        "private-setting-key",
+        "private-annotation-key",
+    ] {
+        assert!(!error.contains(forbidden));
+    }
+    assert!(writes(&server).await.is_empty());
+    assert!(backend.db.pending_worker_upgrades.is_empty());
+    assert!(backend.db.pending_operations.is_empty());
+}
+
+#[tokio::test]
+async fn unsupported_setting_diagnostics_have_at_most_sixteen_fixed_labels() {
+    let (server, mut backend, _guard) = fixture().await;
+    let remote = mount_upgrade(&server, &backend.path).await;
+    {
+        let mut state = remote.lock().unwrap();
+        state.settings["annotations"] = json!({
+            "workers/triggered_by":false,
+            "workers/message":"do-not-echo-setting-value",
+            "workers/tag":"do-not-echo-setting-value",
+            "private-annotation-key":""
+        });
+        for field in [
+            "cache_options",
+            "observability",
+            "placement",
+            "usage_model",
+            "limits",
+            "assets",
+            "migration_tag",
+            "migrations",
+            "exports",
+            "exports_reconciliation",
+            "tags",
+            "tail_consumers",
+            "logpush",
+            "cpu_ms",
+            "private-setting-key",
+        ] {
+            state.settings[field] = json!("do-not-echo-setting-value");
+        }
+    }
+    let error = apply_upgrade(&mut backend).await.unwrap_err();
+    assert_eq!(
+        error
+            .split("设置字段：")
+            .nth(1)
+            .unwrap()
+            .split('）')
+            .next()
+            .unwrap()
+            .split('、')
+            .count(),
+        16
+    );
+    assert!(!error.contains("do-not-echo-setting-value"));
+    assert!(!error.contains("private-setting-key"));
+    assert!(!error.contains("private-annotation-key"));
+    assert!(writes(&server).await.is_empty());
+    assert!(backend.db.pending_worker_upgrades.is_empty());
+    assert!(backend.db.pending_operations.is_empty());
 }

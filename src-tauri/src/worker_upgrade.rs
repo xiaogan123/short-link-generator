@@ -10,11 +10,38 @@ fn empty_default(value: &Value) -> bool {
         || value.as_object().is_some_and(Map::is_empty)
 }
 
+fn unsupported_annotation_fields(value: &Value) -> Vec<&'static str> {
+    if value.is_null() {
+        return vec![];
+    }
+    let Some(annotations) = value.as_object() else {
+        return vec!["annotations"];
+    };
+    annotations
+        .iter()
+        .filter_map(|(key, value)| match key.as_str() {
+            // Cloudflare documents this as server-set, read-only provenance.
+            // Validate its shape, but never journal or upload its value.
+            "workers/triggered_by" if value.as_str().is_some_and(|s| s.len() <= 1024) => None,
+            "workers/triggered_by" => Some("annotations.workers/triggered_by"),
+            "workers/message" | "workers/tag" if value == "" => None,
+            "workers/message" => Some("annotations.workers/message"),
+            "workers/tag" => Some("annotations.workers/tag"),
+            _ => Some("annotations.未识别字段"),
+        })
+        .collect()
+}
+
 /// Normalize only safe settings. Values of secret bindings are never accepted,
 /// copied into a journal, or included in upload metadata.
 fn normalized_settings(raw: &Value, namespace: &str) -> Result<Value, String> {
     let object = raw.as_object().ok_or("Worker 设置格式无效")?;
+    let mut unsupported = Vec::new();
     for (key, value) in object {
+        if key == "annotations" {
+            unsupported.extend(unsupported_annotation_fields(value));
+            continue;
+        }
         let safe = match key.as_str() {
             "bindings" | "compatibility_date" | "compatibility_flags" | "main_module" => true,
             "created_on" | "modified_on" | "etag" | "id" | "last_deployed_from" | "has_modules"
@@ -29,8 +56,37 @@ fn normalized_settings(raw: &Value, namespace: &str) -> Result<Value, String> {
             _ => empty_default(value),
         };
         if !safe {
-            return Err("Worker 含有本版本不能安全保留的非默认设置，停止升级".into());
+            // Error text contains only fixed public protocol names. Unknown
+            // keys and all setting values may contain user data, so never echo
+            // either while diagnosing a failed preflight.
+            let field = match key.as_str() {
+                "cache_options" => "cache_options",
+                "observability" => "observability",
+                "placement" => "placement",
+                "usage_model" => "usage_model",
+                "limits" => "limits",
+                "assets" => "assets",
+                "migration_tag" => "migration_tag",
+                "migrations" => "migrations",
+                "exports" => "exports",
+                "exports_reconciliation" => "exports_reconciliation",
+                "tags" => "tags",
+                "tail_consumers" => "tail_consumers",
+                "logpush" => "logpush",
+                "cpu_ms" => "cpu_ms",
+                _ => "未识别字段",
+            };
+            unsupported.push(field);
         }
+    }
+    unsupported.sort_unstable();
+    unsupported.dedup();
+    unsupported.truncate(16);
+    if !unsupported.is_empty() {
+        return Err(format!(
+            "Worker 含有本版本不能安全保留的非默认设置（设置字段：{}），停止升级",
+            unsupported.join("、")
+        ));
     }
     let date = raw["compatibility_date"]
         .as_str()
