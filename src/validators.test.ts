@@ -44,8 +44,22 @@ describe('link inputs', () => {
     expect(splitInvitationLink('https://example.com/register?lang=zh&ref=CODE_3&utm=sample')).toEqual({prefix:'https://example.com/register?lang=zh&ref=',code:'CODE_3',suffix:'&utm=sample'});
     expect(splitInvitationLink('https://EXAMPLE.com/register?lang=%2F&ref=CODE_4&utm=%2B')).toEqual({prefix:'https://EXAMPLE.com/register?lang=%2F&ref=',code:'CODE_4',suffix:'&utm=%2B'});
   });
+  it.each(['join','register'])('preserves referral codes and exact extra parameters in /%s query links',path=>{
+    expect(splitInvitationLink(`https://example.com/${path}?ref=DEMO_Code-1`)).toEqual({prefix:`https://example.com/${path}?ref=`,code:'DEMO_Code-1',suffix:''});
+    const input=`https://EXAMPLE.com/${path}?lang=%2F&ref=DEMO_Code-1&utm=%2B&lang=zh`;
+    const parts=splitInvitationLink(input);
+    expect(parts).toEqual({prefix:`https://EXAMPLE.com/${path}?lang=%2F&ref=`,code:'DEMO_Code-1',suffix:'&utm=%2B&lang=zh'});
+    expect(parts.prefix+parts.code+parts.suffix).toBe(input);
+    expect(splitInvitationLink(`https://example.com/${path}?ref=${'a'.repeat(128)}`).code).toHaveLength(128);
+  });
+  it.each(['join','register'])('rejects ambiguous or invalid referrals in /%s query links',path=>{
+    for(const query of ['ref=ONE&ref=TWO','ref=ONE&%72ef=TWO'])expect(()=>splitInvitationLink(`https://example.com/${path}?${query}`)).toThrow(/多个 ref/);
+    for(const code of ['', 'ONE+TWO', '%41', 'a'.repeat(129)])expect(()=>splitInvitationLink(`https://example.com/${path}?ref=${code}`)).toThrow(/有效邀请码/);
+    expect(()=>splitInvitationLink(`https://example.com/${path}?source=sample`)).toThrow(/暂不识别/);
+  });
   it('rejects unknown invitation forms instead of guessing where the code begins',()=>{
     expect(()=>splitInvitationLink('https://example.com/ref/CODE_1')).toThrow(/暂不识别/);
+    expect(()=>splitInvitationLink('https://example.com/other?ref=CODE_1')).toThrow(/暂不识别/);
     expect(()=>splitInvitationLink('https://example.com/register?ref=ONE&ref=TWO')).toThrow(/多个 ref/);
     expect(()=>splitInvitationLink('https://example.com/register?ref=ONE&%72ef=TWO')).toThrow(/多个 ref/);
     expect(()=>splitInvitationLink('https://example.com/join/ONE?ref=TWO')).toThrow(/位置不明确/);

@@ -41,7 +41,7 @@ export function splitInvitationLink(value:string):InvitationParts {
   if(new URL(input).searchParams.getAll('ref').length>1)throw new Error('邀请码位置不明确：链接中有多个 ref 参数，请手动填写地址。');
   const path=input.match(/^(https:\/\/[^/?#]+\/(?:join|zh\/share)\/)([A-Za-z0-9_-]{1,128})(\?[^#]*)?$/);
   if(path){if(new URL(input).searchParams.has('ref'))throw new Error('邀请码位置不明确，请手动填写地址。');return {prefix:path[1],code:path[2],suffix:path[3]||''};}
-  const query=input.match(/^(https:\/\/[^/?#]+\/register\?)([^#]+)$/);
+  const query=input.match(/^(https:\/\/[^/?#]+\/(?:register|join)\?)([^#]+)$/);
   if(query){
     const fields=query[2].split('&');
     const at=fields.findIndex(field=>field.startsWith('ref='));
@@ -52,5 +52,5 @@ export function splitInvitationLink(value:string):InvitationParts {
       return {prefix:query[1]+fields.slice(0,at).concat('ref=').join('&'),code,suffix:fields.slice(at+1).length?`&${fields.slice(at+1).join('&')}`:''};
     }
   }
-  throw new Error('暂不识别这种链接。请使用 /join/邀请码、/zh/share/邀请码，或 /register?ref=邀请码。');
+  throw new Error('暂不识别这种链接。支持 /join?ref=邀请码、/register?ref=邀请码、/join/邀请码，或 /zh/share/邀请码；也可在下方手动填写地址。');
 }

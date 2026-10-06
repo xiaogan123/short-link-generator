@@ -302,6 +302,31 @@ describe('desktop primary flows in explicit preview', () => {
     expect((within(editor).getAllByPlaceholderText('例如 ?lang=zh')[0] as HTMLInputElement).value).toBe('&utm=sample');
     expect(within(editor).getByRole('button', { name: '下一步，核对内容' })).toBeTruthy();
   });
+  it('recognizes join query invitations for official and mainland addresses before saving', async () => {
+    render(<App />);
+    await screen.findByRole('heading', { name: '短链接' });
+    fireEvent.click(screen.getByRole('button', { name: /^平台地址$/ }));
+    fireEvent.click(screen.getByRole('button', { name: '添加平台地址' }));
+    const editor = screen.getByRole('dialog', { name: '添加平台地址' });
+    fireEvent.change(within(editor).getByPlaceholderText('例如：常用平台 A'), {target:{value:'示例平台'}});
+    fireEvent.change(within(editor).getByRole('textbox', {name:'官网链接 完整邀请链接'}), {target:{value:'https://example.com/join?lang=%2F&ref=DEMO_Code-1&utm=%2B'}});
+    fireEvent.click(within(editor).getAllByRole('button', {name:'识别'})[0]);
+    expect(within(editor).getByText('DEMO_Code-1')).toBeTruthy();
+    fireEvent.click(within(editor).getByRole('button', {name:'填入链接地址'}));
+    expect((within(editor).getByPlaceholderText('https://example.com/join/') as HTMLInputElement).value).toBe('https://example.com/join?lang=%2F&ref=');
+    expect((within(editor).getAllByPlaceholderText('例如 ?lang=zh')[0] as HTMLInputElement).value).toBe('&utm=%2B');
+    fireEvent.change(within(editor).getByRole('textbox', {name:'大陆访问地址（首选） 完整邀请链接'}), {target:{value:'https://example.org/join?ref=DEMO_Mainland'}});
+    fireEvent.click(within(editor).getAllByRole('button', {name:'识别'})[1]);
+    expect(within(editor).getByText('DEMO_Mainland')).toBeTruthy();
+    fireEvent.click(within(editor).getAllByRole('button', {name:'填入链接地址'})[1]);
+    expect((within(editor).getByPlaceholderText('https://example.org/join/') as HTMLInputElement).value).toBe('https://example.org/join?ref=');
+    fireEvent.click(within(editor).getByRole('button', {name:'下一步，核对内容'}));
+    const plan=await screen.findByRole('dialog', {name:'保存平台地址'});
+    expect(plan.textContent).toContain('官网链接：https://example.com/join?lang=%2F&ref=邀请码&utm=%2B');
+    expect(plan.textContent).toContain('https://example.org/join?ref=邀请码');
+    expect(plan.textContent).not.toContain('DEMO_Code-1');
+    expect(plan.textContent).not.toContain('DEMO_Mainland');
+  });
   it('lets valid manual addresses proceed when the optional paste helper contains incomplete text', async () => {
     render(<App />);
     await screen.findByRole('heading', { name: '短链接' });
