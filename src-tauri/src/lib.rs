@@ -88,6 +88,7 @@ async fn lock_backend<'a>(
             | "import_token"
             | "remove_account"
             | "import_config"
+            | "install_update"
     ) {
         state.0.try_lock().map_err(|_| {
             "上一个操作仍在进行，请稍候；若有系统授权窗口，请先完成或取消，无需重复点击".to_string()
@@ -102,7 +103,6 @@ struct Backend {
     path: PathBuf,
     plans: Vec<Plan>,
     cloud: Cloud,
-    app: Option<tauri::AppHandle>,
     #[cfg(target_os = "macos")]
     _credential_lease: Option<mac_credentials::ConfigurationLease>,
     #[cfg(target_os = "windows")]
@@ -730,7 +730,7 @@ fn route_conflict(pattern: &str, host: &str, prefix: &str) -> bool {
 }
 
 impl Backend {
-    fn load(path: PathBuf, app: tauri::AppHandle) -> Result<Self, String> {
+    fn load(path: PathBuf) -> Result<Self, String> {
         #[cfg(target_os = "macos")]
         let lease =
             mac_credentials::ConfigurationLease::acquire(path.parent().ok_or("配置目录无效")?)?;
@@ -763,7 +763,6 @@ impl Backend {
             path,
             plans: Vec::new(),
             cloud: Cloud::new()?,
-            app: Some(app),
             #[cfg(test)]
             persist_count: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
@@ -2627,8 +2626,6 @@ impl Backend {
             "selftest_link" => Err("自检调用路径无效".into()),
             "export_config" => self.export_config(),
             "import_config" => self.import_config(field(payload, "json")?).await,
-            "check_update" => self.check_update(false).await,
-            "install_update" => self.check_update(true).await,
             _ => Err("不支持此操作".into()),
         }
     }
@@ -2856,59 +2853,6 @@ impl Backend {
             .map_err(|_| "导出配置失败".into())
     }
 
-    async fn check_update(&self, install: bool) -> Result<Value, String> {
-        let (Some(pubkey), Some(endpoint)) = (
-            option_env!("SLG_UPDATER_PUBLIC_KEY"),
-            option_env!("SLG_UPDATER_ENDPOINT"),
-        ) else {
-            return Ok(
-                json!({"status":"unavailable","currentVersion":env!("CARGO_PKG_VERSION"),"message":"此版本未配置更新通道"}),
-            );
-        };
-        if pubkey.is_empty() {
-            return Ok(
-                json!({"status":"unavailable","currentVersion":env!("CARGO_PKG_VERSION"),"message":"此版本未配置更新通道"}),
-            );
-        }
-        let url = url::Url::parse(endpoint).map_err(|_| "更新地址配置无效".to_string())?;
-        if url.scheme() != "https" {
-            return Err("更新地址必须使用 HTTPS".into());
-        }
-        let updater = self
-            .app
-            .as_ref()
-            .ok_or("更新服务不可用")?
-            .updater_builder()
-            .endpoints(vec![url])
-            .map_err(|_| "更新通道配置无效".to_string())?
-            .timeout(Duration::from_secs(30))
-            .build()
-            .map_err(|_| "更新服务不可用".to_string())?;
-        let available = updater
-            .check()
-            .await
-            .map_err(|_| "无法检查更新，请稍后再试".to_string())?;
-        let Some(update) = available else {
-            return Ok(
-                json!({"status":"up_to_date","currentVersion":env!("CARGO_PKG_VERSION"),"message":"当前已是最新版本"}),
-            );
-        };
-        if !install {
-            return Ok(
-                json!({"status":"available","currentVersion":env!("CARGO_PKG_VERSION"),"version":update.version,
-                "notes":update.body,"message":"发现新版本"}),
-            );
-        }
-        update
-            .download_and_install(|_, _| {}, || {})
-            .await
-            .map_err(|_| "更新下载或安装失败".to_string())?;
-        Ok(
-            json!({"status":"installed","currentVersion":env!("CARGO_PKG_VERSION"),"version":update.version,
-            "message":"更新已安装，请重新启动应用"}),
-        )
-    }
-
     async fn import_config(&mut self, json_text: &str) -> Result<Value, String> {
         if !self.db.pending_monitor_changes.is_empty()
             || !self.db.pending_pool_changes.is_empty()
@@ -3038,11 +2982,16 @@ impl Backend {
                 .iter()
                 .find(|d| d.host == host)
                 .map(|d| {
-                    if d.account_id == account_id {
-                        Ok(d.id.clone())
-                    } else {
-                        Err("同一主机名已有另一账号的本机配置".to_string())
+                    if d.account_id != account_id {
+                        return Err("同一主机名已有另一账号的本机配置".to_string());
                     }
+                    if d.prefix != prefix || d.zone_id != zone.id || d.route_id != route_id {
+                        return Err(
+                            "本机已有该域名的不同前缀或路由；请先处理本机配置冲突，再导入备份"
+                                .to_string(),
+                        );
+                    }
+                    Ok(d.id.clone())
                 })
                 .transpose()?
                 .unwrap_or_else(random_id);
@@ -3159,8 +3108,9 @@ impl Backend {
                 }
             }
         }
+        let mut staged_db = self.db.clone();
         for pool in recovered_pools {
-            if let Some(existing) = self.db.pools.iter_mut().find(|p| p.id == pool.id) {
+            if let Some(existing) = staged_db.pools.iter_mut().find(|p| p.id == pool.id) {
                 for id in &pool.account_ids {
                     if !existing.account_ids.contains(id) {
                         existing.account_ids.push(id.clone());
@@ -3173,32 +3123,35 @@ impl Backend {
                     existing.sync_status.push(status);
                 }
             } else {
-                self.db.pools.push(pool);
+                staged_db.pools.push(pool);
             }
         }
         for domain in recovered_domains {
-            if !self.db.domains.iter().any(|d| d.host == domain.host) {
-                self.db.domains.push(domain);
+            if !staged_db.domains.iter().any(|d| d.host == domain.host) {
+                staged_db.domains.push(domain);
             }
         }
         for link in recovered_links {
-            if let Some(domain) = self.db.domains.iter().find(|d| d.id == link.domain_id) {
-                if !self
-                    .db
+            if let Some(domain) = staged_db.domains.iter().find(|d| d.id == link.domain_id) {
+                if !staged_db
                     .links
                     .iter()
                     .any(|l| l.domain_id == domain.id && l.slug == link.slug)
                 {
-                    self.db.links.push(link);
+                    staged_db.links.push(link);
                 }
             }
         }
         for (id, label) in labels {
-            if let Some(account) = self.db.accounts.iter_mut().find(|a| a.id == id) {
+            if let Some(account) = staged_db.accounts.iter_mut().find(|a| a.id == id) {
                 account.label = label;
             }
         }
-        self.persist()?;
+        let previous_db = std::mem::replace(&mut self.db, staged_db);
+        if let Err(error) = self.persist() {
+            self.db = previous_db;
+            return Err(error);
+        }
         Ok(self.state())
     }
 
@@ -6256,10 +6209,86 @@ fn requested_dns_mode(payload: &Value) -> Result<local_check::DnsMode, String> {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum UpdateAction {
+    Check,
+    Install,
+}
+
+fn update_action(action: &str) -> Option<UpdateAction> {
+    match action {
+        "check_update" => Some(UpdateAction::Check),
+        "install_update" => Some(UpdateAction::Install),
+        _ => None,
+    }
+}
+
+async fn check_update(app: &tauri::AppHandle, install: bool) -> Result<Value, String> {
+    let (Some(pubkey), Some(endpoint)) = (
+        option_env!("SLG_UPDATER_PUBLIC_KEY"),
+        option_env!("SLG_UPDATER_ENDPOINT"),
+    ) else {
+        return Ok(
+            json!({"status":"unavailable","currentVersion":env!("CARGO_PKG_VERSION"),"message":"此版本未配置更新通道"}),
+        );
+    };
+    if pubkey.is_empty() {
+        return Ok(
+            json!({"status":"unavailable","currentVersion":env!("CARGO_PKG_VERSION"),"message":"此版本未配置更新通道"}),
+        );
+    }
+    let url = url::Url::parse(endpoint).map_err(|_| "更新地址配置无效".to_string())?;
+    if url.scheme() != "https" {
+        return Err("更新地址必须使用 HTTPS".into());
+    }
+    let updater = app
+        .updater_builder()
+        .endpoints(vec![url])
+        .map_err(|_| "更新通道配置无效".to_string())?
+        .timeout(Duration::from_secs(30))
+        .build()
+        .map_err(|_| "更新服务不可用".to_string())?;
+    let available = updater
+        .check()
+        .await
+        .map_err(|_| "无法检查更新，请稍后再试".to_string())?;
+    let Some(update) = available else {
+        return Ok(
+            json!({"status":"up_to_date","currentVersion":env!("CARGO_PKG_VERSION"),"message":"当前已是最新版本"}),
+        );
+    };
+    if !install {
+        return Ok(
+            json!({"status":"available","currentVersion":env!("CARGO_PKG_VERSION"),"version":update.version,
+            "notes":update.body,"message":"发现新版本"}),
+        );
+    }
+    update
+        .download_and_install(|_, _| {}, || {})
+        .await
+        .map_err(|_| "更新下载或安装失败".to_string())?;
+    Ok(
+        json!({"status":"installed","currentVersion":env!("CARGO_PKG_VERSION"),"version":update.version,
+        "message":"更新已安装，请重新启动应用"}),
+    )
+}
+
 #[tauri::command]
-async fn dispatch(request: Value, state: tauri::State<'_, AppState>) -> Result<Value, String> {
+async fn dispatch(
+    request: Value,
+    state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle,
+) -> Result<Value, String> {
     let action = field(&request, "action")?.to_string();
     let payload = request.get("payload").cloned().unwrap_or_else(|| json!({}));
+    match update_action(&action) {
+        Some(UpdateAction::Check) => return check_update(&app, false).await,
+        Some(UpdateAction::Install) => {
+            let _backend_guard = lock_backend(&state, &action).await?;
+            return check_update(&app, true).await;
+        }
+        None => {}
+    }
     if action == "check_pool_health" {
         let snapshot = {
             let backend = lock_backend(&state, &action).await?;
@@ -6342,8 +6371,7 @@ pub fn run() {
                 }
             }
             let dir = app.path().app_data_dir()?;
-            let backend = Backend::load(dir.join("state.json"), app.handle().clone())
-                .map_err(std::io::Error::other)?;
+            let backend = Backend::load(dir.join("state.json")).map_err(std::io::Error::other)?;
             app.manage(AppState(Mutex::new(backend)));
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
@@ -6401,6 +6429,105 @@ mod tests {
         matchers::{header_regex, method, path, path_regex, query_param, query_param_is_missing},
         Mock, MockServer, ResponseTemplate,
     };
+
+    #[tokio::test]
+    async fn updater_actions_have_distinct_lock_routes() {
+        assert_eq!(update_action("check_update"), Some(UpdateAction::Check));
+        assert_eq!(update_action("install_update"), Some(UpdateAction::Install));
+        assert_eq!(update_action("refresh_accounts"), None);
+
+        let (_server, mut backend, _guard) = fixture().await;
+        for action in ["check_update", "install_update"] {
+            assert_eq!(
+                backend.dispatch(action, &json!({})).await,
+                Err("不支持此操作".to_string())
+            );
+        }
+
+        let state = AppState(Mutex::new(backend));
+        let busy_guard = state.0.lock().await;
+        let install_lock = tokio::time::timeout(
+            Duration::from_millis(100),
+            lock_backend(&state, "install_update"),
+        )
+        .await;
+        assert!(matches!(install_lock, Ok(Err(_))));
+        drop(busy_guard);
+        assert!(lock_backend(&state, "install_update").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn import_rejects_existing_domain_with_different_verified_route() {
+        let (server, mut backend, _guard) = fixture().await;
+        backend.db.domains.push(domain());
+        let before = backend.database_snapshot();
+        Mock::given(method("GET"))
+            .and(path("/client/v4/zones/zone1/workers/routes"))
+            .respond_with(ok(json!([{"id":"new-route","pattern":"example.com/new/*",
+                "script":"edge-one"}])))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/client/v4/accounts/acct1/storage/kv/namespaces/ns1/values/c%3Aexample.com",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"prefix":"new"}"#))
+            .mount(&server)
+            .await;
+        let backup = json!({"schema":SCHEMA,"accounts":[{"id":"acct1","label":"Example"}],
+            "domains":[{"accountId":"acct1","host":"example.com","prefix":"new"}],
+            "links":[{"host":"example.com","slug":"guide","cnUrl":"https://example.org/cn",
+                "defaultUrl":"https://example.org/default"}]});
+
+        let error = backend
+            .import_config(&backup.to_string())
+            .await
+            .unwrap_err();
+        assert!(error.contains("本机已有该域名的不同前缀或路由"));
+        assert_eq!(backend.database_snapshot(), before);
+        assert!(server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .all(|request| request.method.as_str() == "GET"));
+    }
+
+    #[tokio::test]
+    async fn failed_import_persist_does_not_commit_staged_database_later() {
+        let (_server, mut backend, _guard) = fixture().await;
+        let before = backend.database_snapshot();
+        let original_label = backend.db.accounts[0].label.clone();
+        backend
+            .fail_persist_at
+            .store(1, std::sync::atomic::Ordering::SeqCst);
+        let backup = json!({"schema":SCHEMA,"accounts":[{"id":"acct1","label":"Changed"}],
+            "domains":[],"links":[]});
+
+        let error = backend
+            .import_config(&backup.to_string())
+            .await
+            .unwrap_err();
+        assert!(error.contains("本机配置保存失败"));
+        assert_eq!(backend.database_snapshot(), before);
+        backend.persist().unwrap();
+        let persisted: Database =
+            serde_json::from_slice(&fs::read(&backend.path).unwrap()).unwrap();
+        assert_eq!(persisted.accounts[0].label, original_label);
+    }
+
+    #[tokio::test]
+    async fn successful_import_commits_staged_database() {
+        let (_server, mut backend, _guard) = fixture().await;
+        let backup = json!({"schema":SCHEMA,"accounts":[{"id":"acct1","label":"Changed"}],
+            "domains":[],"links":[]});
+
+        backend.import_config(&backup.to_string()).await.unwrap();
+        assert_eq!(backend.db.accounts[0].label, "Changed");
+        let persisted: Database =
+            serde_json::from_slice(&fs::read(&backend.path).unwrap()).unwrap();
+        assert_eq!(persisted.accounts[0].label, "Changed");
+    }
 
     fn ok(result: Value) -> ResponseTemplate {
         ResponseTemplate::new(200)
@@ -6465,7 +6592,6 @@ mod tests {
             path: dir.path().join("state.json"),
             plans: vec![],
             cloud: Cloud::for_test(&format!("{}/client/v4/", server.uri())),
-            app: None,
             #[cfg(target_os = "macos")]
             _credential_lease: None,
             #[cfg(target_os = "windows")]

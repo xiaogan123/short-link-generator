@@ -1,9 +1,22 @@
 import {cleanup,render,screen,within} from '@testing-library/react';
-import {afterEach,expect,it} from 'vitest';
+import {afterEach,expect,it,vi} from 'vitest';
 import Pools from './Pools';
 import type {Pool,PoolHealth} from './types';
 
-afterEach(()=>cleanup());
+afterEach(()=>{cleanup();vi.useRealTimers();});
+
+it.each(['healthy','unhealthy'] as const)('immediately displays a fresh %s result between clock ticks',status=>{
+  vi.useFakeTimers();vi.setSystemTime(new Date('2026-10-15T00:00:00Z'));
+  const pool:Pool={id:'p',name:'示例平台',official:{prefix:'https://example.com/join/',suffix:''},candidates:[{id:'c',prefix:'https://example.org/join/',suffix:'',enabled:true}],updated:'',accountIds:['a']};
+  const props={pools:[pool],accounts:[{id:'a',label:'示例账户',zoneCount:1,checkedAt:null,hasResources:true,needsSelftestKey:false}],linkCount:()=>1,onSave:async()=>true,onDelete:()=>{},busy:false,health:{},onCheckHealth:()=>{},planOpen:false,savedRevision:0};
+  const view=render(<Pools {...props}/>);
+  vi.setSystemTime(new Date('2026-10-15T00:00:10Z'));
+  const checkedAt=new Date().toISOString();
+  const report:PoolHealth={poolId:'p',accounts:[{accountId:'a',source:'mainland_provider',checkedAt,status,candidates:[{id:'c',status,checkedAt,message:'刚刚检测'}]}]};
+  view.rerender(<Pools {...props} health={{p:report}}/>);
+  expect(screen.getByText(status==='healthy'?'各账户检测通过':'检测失败')).toBeTruthy();
+  expect(screen.queryByText('状态未知')).toBeNull();
+});
 
 it('does not keep an expired target green when the account check itself is recent',()=>{
   const pool:Pool={id:'p',name:'示例地址池',official:{prefix:'https://example.com/path/',suffix:''},candidates:[{id:'c',prefix:'https://example.org/path/',suffix:'',enabled:true}],updated:new Date().toISOString(),accountIds:['a']};

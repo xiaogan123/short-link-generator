@@ -249,7 +249,9 @@ function previewDispatch(action: Action, payload: Record<string, unknown>): unkn
   if (action === 'resume_monitor') return makePlan('继续处理检测服务',['复核待处理的检测配置并继续'],['本地预览不会连接云服务。'],'resume_monitor',{accountId:payload.accountId});
   if (action === 'export_config') return JSON.stringify({ version: 1, domains: local.domains.map(d => ({ host: d.host, prefix: d.prefix })), links: local.links }, null, 2);
   if (action === 'import_config') throw new Error('本地预览无法验证远端归属，请在桌面应用中导入备份。');
-  if (action === 'check_update') return { status: 'unavailable', currentVersion: local.appVersion };
+  if (action === 'check_update') return new URLSearchParams(window.location.search).get('updatePreview') === '1'
+    ? { status: 'available', currentVersion: local.appVersion, version: '0.0.1-preview', notes: '更新提醒效果预览。这里只使用示例数据，不会下载或安装软件。' }
+    : { status: 'unavailable', currentVersion: local.appVersion };
   if (action === 'install_update') throw new Error('本地预览无法安装更新。');
   throw new Error('未知操作。');
 }

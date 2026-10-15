@@ -13,6 +13,7 @@ export type LinkDetection = {
 };
 
 type Props = {
+  busy?: boolean;
   groups: LinkGroup[];
   pools: Pool[];
   getDetection: (link: Link) => LinkDetection;
@@ -108,7 +109,7 @@ function Targets({ link, pool }: { link: Link; pool: Pool | undefined }) {
   );
 }
 
-function LinkGroupSection({ domain, links, pools, getDetection, onCopy, onCheck, onStats, onEdit, onDelete, onCreate }: Props & LinkGroup) {
+function LinkGroupSection({ domain, links, pools, getDetection, onCopy, onCheck, onStats, onEdit, onDelete, onCreate, busy = false }: Props & LinkGroup) {
   const detailPrefix = useId();
   const [pageSize, setPageSize] = useState<(typeof pageSizes)[number]>(25);
   const [pageState, setPageState] = useState({ linkKey: "", page: 1 });
@@ -201,7 +202,7 @@ function LinkGroupSection({ domain, links, pools, getDetection, onCopy, onCheck,
                             {detection.detail && <p className="slg-check-detail">{detection.detail}</p>}
                             <div className="slg-detail-actions">
                               {!link.poolId && pools.length > 0 && <button type="button" aria-label={`将 ${link.slug} 改为平台地址`} onClick={() => onEdit(link, true)}>改为平台地址</button>}
-                              <button className="slg-delete" type="button" aria-label={`删除 ${link.slug}`} onClick={() => onDelete(link, domain)}><Trash size={15} aria-hidden="true" />删除链接</button>
+                              <button className="slg-delete" type="button" aria-label={`删除 ${link.slug}`} disabled={busy} onClick={() => onDelete(link, domain)}><Trash size={15} aria-hidden="true" />删除链接</button>
                             </div>
                           </div>
                         </td>

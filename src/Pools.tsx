@@ -23,12 +23,12 @@ function AddressPaste({label,onApply}:{label:string;onApply:(parts:InvitationPar
 }
 export default function Pools({pools,accounts,linkCount,onSave,onDelete,busy,health,onCheckHealth,planOpen,savedRevision,serverError="",onDraftChange,errorAction,dismissDisabled=false}:{pools:Pool[];accounts:Account[];linkCount:(id:string)=>number;onSave:(pool:Pool,shouldAccept?:()=>boolean)=>Promise<boolean>;onDelete:(id:string)=>void;busy:boolean;health:Record<string,PoolHealth>;onCheckHealth:(id:string)=>void;planOpen:boolean;savedRevision:number;serverError?:string;onDraftChange?:()=>void;errorAction?:ReactNode;dismissDisabled?:boolean}){
  const [draft,setDraft]=useState<Pool|null>(null);const [error,setError]=useState('');
- const [clock,setClock]=useState(Date.now());
+ const [,setClock]=useState(Date.now());
  const draftGeneration=useRef(0);
  useEffect(()=>{replaceDraft(null);},[savedRevision]);
  useEffect(()=>{const timer=window.setInterval(()=>setClock(Date.now()),60000);return()=>window.clearInterval(timer);},[]);
  function replaceDraft(next:Pool|null){draftGeneration.current+=1;setDraft(next);setError('');onDraftChange?.();}
- function fresh(timestamp:string|null){const time=timestamp?Date.parse(timestamp):NaN;return Number.isFinite(time)&&time<=clock&&clock-time<3600000;}
+ function fresh(timestamp:string|null){const time=timestamp?Date.parse(timestamp):NaN;const now=Date.now();return Number.isFinite(time)&&time<=now&&now-time<3600000;}
  function observedStatus(status:'healthy'|'unhealthy'|'unknown',checkedAt:string|null){return fresh(checkedAt)?status:'unknown';}
  function candidateStatus(pool:Pool,c:PoolCandidate){if(!c.enabled)return 'disabled';const reports=health[pool.id]?.accounts||[];const matching=reports.filter(a=>a.source==='mainland_provider'&&fresh(a.checkedAt)).map(a=>({accountId:a.accountId,status:a.candidates.find(x=>x.id===c.id)}));if(matching.some(a=>a.status&&observedStatus(a.status.status,a.status.checkedAt)==='unhealthy'))return 'unhealthy';if(pool.accountIds.length>0&&pool.accountIds.every(id=>matching.some(a=>a.accountId===id&&a.status&&observedStatus(a.status.status,a.status.checkedAt)==='healthy')))return 'healthy';return 'unknown';}
  function accountHealthLabel(pool:Pool,a:PoolHealth['accounts'][number]){if(a.source!=='mainland_provider'||!fresh(a.checkedAt))return '状态未知或已过期';const statuses=pool.candidates.filter(c=>c.enabled).map(c=>a.candidates.find(x=>x.id===c.id)).map(c=>c?observedStatus(c.status,c.checkedAt):'unknown');if(statuses.includes('unhealthy'))return '有失败目标';if(statuses.length>0&&statuses.every(s=>s==='healthy'))return '全部目标检测通过';return '状态未知或已过期';}

@@ -57,6 +57,7 @@ import Pools from "./Pools";
 import LinkGroups from "./LinkGroups";
 import ClickStatsDialog from "./ClickStats";
 import StatsCenter from "./StatsCenter";
+import { useUpdateCheck } from "./useUpdateCheck";
 
 type Page = "links" | "stats" | "pools" | "domains" | "accounts";
 type LinkDraft = {
@@ -200,6 +201,7 @@ export default function App() {
   const [mutation, setMutation] = useState<string | null>(null);
   const mutationRef = useRef<string | null>(null);
   const pendingPrepareRef = useRef(false);
+  const changePrepareInFlight = useRef(false);
   const busy = working || mutation !== null;
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
@@ -279,6 +281,10 @@ export default function App() {
   const [testingLink, setTestingLink] = useState("");
   const [testingAutomaticDns, setTestingAutomaticDns] = useState(false);
   const [updateStatus, setUpdateStatus] = useState<UpdateStatus | null>(null);
+  const [updateError, setUpdateError] = useState("");
+  const [installedUpdate, setInstalledUpdate] = useState<UpdateStatus | null>(null);
+  const [dismissedUpdate, setDismissedUpdate] = useState<string | null>(null);
+  const updates = useUpdateCheck(!loading && !loadFailed && !!state.appVersion && !busy && !updateStatus && !installedUpdate);
   const [manageAccount, setManageAccount] = useState<Account | null>(null);
   const [statsTarget, setStatsTarget] = useState<{link: Link; domain: Domain} | null>(null);
   const [statsRevision, setStatsRevision] = useState(0);
@@ -483,12 +489,15 @@ export default function App() {
     shouldAccept: () => boolean = () => true,
     onFailure?: (message: string) => void,
   ) {
+    if (changePrepareInFlight.current) return false;
     if (mutationRef.current && kind !== "migrate_credentials" && !(mutationRef.current === "prepare_click_stats" && (kind === "enable_click_stats" || kind === "disable_click_stats"))) return false;
     if (
       kind !== "migrate_credentials" &&
       kind !== "dismiss_worker_upgrade" &&
       !requireCurrentCredentials(changeAccountIds(fields), onFailure)
     ) return false;
+    changePrepareInFlight.current = true;
+    try {
     const next = await run(
       () => dispatch<Plan>("prepare_change", { kind, ...fields }),
       undefined,
@@ -573,6 +582,9 @@ export default function App() {
       setPlan(next);
     }
     return Boolean(next && shouldAccept());
+    } finally {
+      changePrepareInFlight.current = false;
+    }
   }
   function closeStats() {
     statsPrepareSequence.current++;
@@ -1461,22 +1473,40 @@ export default function App() {
     });
   }
   async function checkUpdate() {
-    const result = await run(() => dispatch<UpdateStatus>("check_update"));
-    if (result)
+    setUpdateError("");
+    setError("");
+    try {
+      const result = await updates.check();
       setUpdateStatus({
         ...result,
         currentVersion: result.currentVersion || stateRef.current.appVersion,
       });
+    } catch (e) {
+      setError(errorMessage(e));
+    }
+  }
+  function openUpdate() {
+    setUpdateError("");
+    setError("");
+    if (installedUpdate || updates.available) {
+      setUpdateStatus(installedUpdate || updates.available);
+    } else {
+      void checkUpdate();
+    }
   }
   async function installUpdate() {
     await withMutation("update", async () => {
-      const result = await run(async () => {
-        await dispatch<unknown>("install_update");
-        return true;
-      });
-      if (result) {
-        setUpdateStatus(null);
-        setNotice("更新已安装，请退出并重新打开软件。");
+      setUpdateError("");
+      try {
+        const result = await dispatch<UpdateStatus>("install_update");
+        if (!result || !["installed", "up_to_date", "unavailable"].includes(result.status)) {
+          throw new Error("未能确认更新是否安装完成，请重新检查更新。");
+        }
+        updates.accept(result);
+        setUpdateStatus(result);
+        if (result.status === "installed") setInstalledUpdate(result);
+      } catch (e) {
+        setUpdateError(errorMessage(e));
       }
     });
   }
@@ -1960,12 +1990,13 @@ export default function App() {
             </div>
           </div>
           <button
-            className="sidebar-update"
-            onClick={() => void checkUpdate()}
-            disabled={busy}
+            className={`sidebar-update ${updates.available ? "has-update" : ""}`}
+            onClick={openUpdate}
+            disabled={busy || updates.checking}
           >
-            <ArrowClockwise size={15} />
-            检查更新
+            {updates.available ? <WarningCircle size={18} weight="fill" aria-hidden="true" /> : <ArrowClockwise size={15} aria-hidden="true" />}
+            <span>{updates.checking ? "正在检查更新…" : installedUpdate ? "更新已安装" : updates.available ? "发现新版本" : "检查更新"}</span>
+            {updates.available && <small>查看更新</small>}
           </button>
         </div>
       </aside>
@@ -1998,6 +2029,20 @@ export default function App() {
           </div>
         </div>
         <div className="content">
+          {updates.available && dismissedUpdate !== updates.available.version && (
+            <section className="update-banner" aria-label="新版本提醒">
+              <WarningCircle size={22} weight="fill" aria-hidden="true" />
+              <div role="status"><strong>新版本 {updates.available.version} 已可用</strong><p>查看更新内容，选择方便的时候安装。</p></div>
+              <button className="button primary" onClick={openUpdate} disabled={busy}>查看更新</button>
+              <button className="icon-button" aria-label="暂时收起更新提醒" onClick={() => setDismissedUpdate(updates.available?.version || null)}><X size={18} /></button>
+            </section>
+          )}
+          {installedUpdate && (
+            <section className="update-banner installed" aria-label="更新已安装" role="status">
+              <CheckCircle size={22} weight="fill" aria-hidden="true" />
+              <div><strong>更新 {installedUpdate.version} 已安装</strong><p>退出并重新打开软件，即可使用新版本。</p></div>
+            </section>
+          )}
           <section className="hero">
             <div>
               <h1>{title}</h1>
@@ -2317,6 +2362,7 @@ export default function App() {
                 ) : (
                   <LinkGroups
                     groups={groups}
+                    busy={busy}
                     pools={state.pools || []}
                     getDetection={(link) => {
                       const record = detections[detectionKey(link)];
@@ -3845,7 +3891,7 @@ export default function App() {
           title="应用更新"
           dismissDisabled={mutation === "update"}
           eyebrow="DESKTOP UPDATE"
-          error={error}
+          error={updateError}
           onClose={() => setUpdateStatus(null)}
           footer={
             <>
@@ -3869,7 +3915,9 @@ export default function App() {
           }
         >
           <div className="update-result">
-            {updateStatus.status === "unavailable" ? (
+            {updateStatus.status === "installed" ? (
+              <p>更新 <strong>{updateStatus.version}</strong> 已安装。请退出并重新打开软件，即可使用新版本。</p>
+            ) : updateStatus.status === "unavailable" ? (
               <p>
                 当前版本：<strong>{currentVersion || "未提供"}</strong>
                 。更新渠道尚未启用，请使用正式发行渠道获取新版本。
