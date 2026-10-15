@@ -30,19 +30,32 @@ struct Remote {
     change_schedules: bool,
     missing_secrets: bool,
     delay_content_visibility: bool,
+    delay_settings_visibility: bool,
     annotations_after_upload: Option<Value>,
 }
 async fn mount_upgrade(server: &MockServer, state_path: &std::path::Path) -> Arc<StdMutex<Remote>> {
+    mount_upgrade_namespace(server, state_path, "ns1").await
+}
+async fn mount_upgrade_namespace(
+    server: &MockServer,
+    state_path: &std::path::Path,
+    namespace: &str,
+) -> Arc<StdMutex<Remote>> {
+    let mut initial_settings = settings();
+    initial_settings["bindings"][0]["namespace_id"] = json!(namespace);
+    let manifest_path =
+        format!("/client/v4/accounts/acct1/storage/kv/namespaces/{namespace}/values/m%3Aconfig");
     let remote = Arc::new(StdMutex::new(Remote {
         source: OLD_SOURCE.into(),
-        manifest: json!({"schema":SCHEMA,"accountId":"acct1","script":"edge-one","namespace":"ns1","sourceHash":hex::encode(Sha256::digest(OLD_SOURCE))}),
-        settings: settings(),
+        manifest: json!({"schema":SCHEMA,"accountId":"acct1","script":"edge-one","namespace":namespace,"sourceHash":hex::encode(Sha256::digest(OLD_SOURCE))}),
+        settings: initial_settings,
         schedules: json!({"schedules":[{"cron":"*/15 * * * *"}]}),
         upload_status: 200,
         fail_manifest: false,
         change_schedules: false,
         missing_secrets: false,
         delay_content_visibility: false,
+        delay_settings_visibility: false,
         annotations_after_upload: None,
     }));
     for suffix in ["/content/v2", "/settings", "/schedules"] {
@@ -63,7 +76,7 @@ async fn mount_upgrade(server: &MockServer, state_path: &std::path::Path) -> Arc
     }
     let state = remote.clone();
     Mock::given(method("GET"))
-        .and(path(MANIFEST_PATH))
+        .and(path(manifest_path.clone()))
         .respond_with(move |_: &wiremock::Request| {
             ResponseTemplate::new(200).set_body_string(state.lock().unwrap().manifest.to_string())
         })
@@ -73,7 +86,7 @@ async fn mount_upgrade(server: &MockServer, state_path: &std::path::Path) -> Arc
     let state_path = state_path.to_owned();
     Mock::given(method("PUT"))
         .and(path(SCRIPT_PATH))
-        .respond_with(move |_: &wiremock::Request| {
+        .respond_with(move |request: &wiremock::Request| {
             let db: Database = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
             assert_eq!(
                 db.pending_worker_upgrades.len(),
@@ -89,8 +102,22 @@ async fn mount_upgrade(server: &MockServer, state_path: &std::path::Path) -> Arc
                 .get("annotations")
                 .is_none());
             let mut state = state.lock().unwrap();
+            let (metadata, uploaded_source) = sync_upload_parts(request);
             if !state.delay_content_visibility {
-                state.source = include_str!("../../edge/worker.mjs").into();
+                state.source = uploaded_source;
+            }
+            if !state.delay_settings_visibility {
+                let secrets: Vec<_> = state.settings["bindings"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|b| b["type"] == "secret_text")
+                    .cloned()
+                    .collect();
+                let mut bindings = metadata["bindings"].as_array().unwrap().clone();
+                assert_eq!(metadata["keep_bindings"], json!(["secret_text"]));
+                bindings.extend(secrets);
+                state.settings["bindings"] = json!(bindings);
             }
             state.settings["bindings"].as_array_mut().unwrap().reverse();
             state.settings["compatibility_flags"]
@@ -119,7 +146,7 @@ async fn mount_upgrade(server: &MockServer, state_path: &std::path::Path) -> Arc
         .await;
     let state = remote.clone();
     Mock::given(method("PUT"))
-        .and(path(MANIFEST_PATH))
+        .and(path(manifest_path))
         .respond_with(move |request: &wiremock::Request| {
             let mut state = state.lock().unwrap();
             if state.fail_manifest {
@@ -144,6 +171,35 @@ async fn resume_upgrade(backend: &mut Backend) -> Result<Value, String> {
     backend
         .dispatch("apply_plan", &json!({"planId":plan["id"]}))
         .await
+}
+// The mock applies the actual uploaded metadata and source, independently of
+// the local journal. The async multipart parser below also checks assertions.
+fn sync_upload_parts(request: &wiremock::Request) -> (Value, String) {
+    let boundary = multer::parse_boundary(
+        request
+            .headers
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+    )
+    .unwrap();
+    let body = std::str::from_utf8(&request.body).unwrap();
+    let mut metadata = None;
+    let mut source = None;
+    for part in body.split(&format!("--{boundary}")) {
+        let Some((headers, content)) = part.split_once("\r\n\r\n") else {
+            continue;
+        };
+        let content = content.strip_suffix("\r\n").unwrap();
+        if headers.contains("name=\"metadata\"") {
+            metadata = Some(serde_json::from_str(content).unwrap());
+        }
+        if headers.contains("name=\"worker.mjs\"") {
+            source = Some(content.to_owned());
+        }
+    }
+    (metadata.unwrap(), source.unwrap())
 }
 async fn writes(server: &MockServer) -> Vec<wiremock::Request> {
     server
@@ -1177,4 +1233,240 @@ async fn unsupported_setting_diagnostics_have_at_most_sixteen_fixed_labels() {
     assert!(writes(&server).await.is_empty());
     assert!(backend.db.pending_worker_upgrades.is_empty());
     assert!(backend.db.pending_operations.is_empty());
+}
+
+const ANALYTICS_NAMESPACE: &str = "0123456789abcdef0123456789abcdef";
+const ANALYTICS_PATH: &str = "/client/v4/accounts/acct1/analytics_engine/sql";
+async fn click_stats_remote(server: &MockServer, backend: &mut Backend) -> Arc<StdMutex<Remote>> {
+    backend.db.accounts[0].resources.as_mut().unwrap().namespace = ANALYTICS_NAMESPACE.into();
+    backend.db.domains.push(domain());
+    mount_upgrade_namespace(server, &backend.path, ANALYTICS_NAMESPACE).await
+}
+async fn analytics_permission(server: &MockServer, status: u16) {
+    Mock::given(method("POST"))
+        .and(path(ANALYTICS_PATH))
+        .respond_with(
+            ResponseTemplate::new(status)
+                .set_body_json(json!({"data":[{"message":"ok"}],"rows":1})),
+        )
+        .mount(server)
+        .await;
+}
+async fn apply_click_stats(backend: &mut Backend, enabled: bool) -> Result<Value, String> {
+    let plan = backend.prepare_change(&json!({"kind":if enabled {"enable_click_stats"} else {"disable_click_stats"},"accountId":"acct1"}))?;
+    backend
+        .dispatch("apply_plan", &json!({"planId":plan["id"]}))
+        .await
+}
+async fn script_uploads(server: &MockServer) -> Vec<wiremock::Request> {
+    server
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.method == "PUT" && r.url.path() == SCRIPT_PATH)
+        .collect()
+}
+
+#[tokio::test]
+async fn enable_click_stats_same_source_still_uploads_binding_after_explicit_plan() {
+    let (server, mut backend, _guard) = fixture().await;
+    let remote = click_stats_remote(&server, &mut backend).await;
+    {
+        let mut state = remote.lock().unwrap();
+        state.source = include_str!("../../edge/worker.mjs").into();
+        state.manifest["sourceHash"] = json!(bundled_source_hash());
+    }
+    analytics_permission(&server, 200).await;
+    let plan = backend
+        .prepare_change(&json!({"kind":"enable_click_stats","accountId":"acct1"}))
+        .unwrap();
+    assert!(plan.to_string().contains("example.com"));
+    assert!(server.received_requests().await.unwrap().is_empty());
+    assert!(mock_key_reads().lock().unwrap().is_empty());
+    backend
+        .dispatch("apply_plan", &json!({"planId":plan["id"]}))
+        .await
+        .unwrap();
+    assert!(backend
+        .dispatch("apply_plan", &json!({"planId":plan["id"]}))
+        .await
+        .is_err());
+    let uploads = script_uploads(&server).await;
+    assert_eq!(uploads.len(), 1);
+    let metadata = upload_metadata(&uploads[0]).await;
+    assert!(metadata["bindings"]
+        .as_array()
+        .unwrap()
+        .contains(&click_stats::binding(ANALYTICS_NAMESPACE).unwrap()));
+    assert_eq!(metadata["keep_bindings"], json!(["secret_text"]));
+    assert!(!metadata.to_string().contains("text\":"));
+    assert!(backend.db.pending_worker_upgrades.is_empty());
+    assert!(mock_key_mutations().lock().unwrap().is_empty());
+    assert!(mock_key_reads()
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|r| r == "token:acct1"));
+    backend
+        .verify_resource_source(
+            "test-token-value",
+            "acct1",
+            backend.db.accounts[0].resources.as_ref().unwrap(),
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn same_hash_delayed_settings_retains_journal_until_target_readback_without_reupload() {
+    let (server, mut backend, _guard) = fixture().await;
+    let remote = click_stats_remote(&server, &mut backend).await;
+    {
+        let mut state = remote.lock().unwrap();
+        state.source = include_str!("../../edge/worker.mjs").into();
+        state.manifest["sourceHash"] = json!(bundled_source_hash());
+        state.delay_settings_visibility = true;
+    }
+    analytics_permission(&server, 200).await;
+    assert!(apply_click_stats(&mut backend, true).await.is_err());
+    assert_eq!(backend.db.pending_worker_upgrades.len(), 1);
+    let saved: Database = serde_json::from_slice(&fs::read(&backend.path).unwrap()).unwrap();
+    let pending = &saved.pending_worker_upgrades[0];
+    assert_eq!(pending.previous_hash, pending.target_hash);
+    assert_ne!(pending.settings, pending.target_settings.clone().unwrap());
+    assert!(resume_upgrade(&mut backend).await.is_err());
+    remote.lock().unwrap().settings = pending.target_settings.clone().unwrap();
+    resume_upgrade(&mut backend).await.unwrap();
+    assert_eq!(script_uploads(&server).await.len(), 1);
+    assert!(backend.db.pending_worker_upgrades.is_empty());
+}
+
+#[tokio::test]
+async fn uncertain_click_stats_upload_resumes_after_restart_without_second_upload() {
+    let (server, mut backend, _guard) = fixture().await;
+    let remote = click_stats_remote(&server, &mut backend).await;
+    remote.lock().unwrap().upload_status = 503;
+    analytics_permission(&server, 200).await;
+    assert!(apply_click_stats(&mut backend, true).await.is_err());
+    assert_eq!(
+        backend.db.pending_worker_upgrades[0].phase,
+        WorkerUpgradePhase::UploadUncertain
+    );
+    backend.db = serde_json::from_slice(&fs::read(&backend.path).unwrap()).unwrap();
+    resume_upgrade(&mut backend).await.unwrap();
+    assert_eq!(script_uploads(&server).await.len(), 1);
+    assert!(backend.db.pending_worker_upgrades.is_empty());
+}
+
+#[tokio::test]
+async fn disable_click_stats_removes_only_binding_and_preserves_existing_source_and_history() {
+    let (server, mut backend, _guard) = fixture().await;
+    let remote = click_stats_remote(&server, &mut backend).await;
+    remote.lock().unwrap().settings["bindings"]
+        .as_array_mut()
+        .unwrap()
+        .push(click_stats::binding(ANALYTICS_NAMESPACE).unwrap());
+    apply_click_stats(&mut backend, false).await.unwrap();
+    let uploads = script_uploads(&server).await;
+    assert_eq!(uploads.len(), 1);
+    let (metadata, source) = sync_upload_parts(&uploads[0]);
+    assert_eq!(source, OLD_SOURCE);
+    assert!(metadata["bindings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|b| b["name"] != "CLICK_EVENTS"));
+    assert_eq!(remote.lock().unwrap().source, OLD_SOURCE);
+    assert!(backend.db.pending_worker_upgrades.is_empty());
+    assert!(server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .all(|r| r.method == "GET" || r.method == "PUT" && r.url.path() == SCRIPT_PATH));
+}
+
+#[tokio::test]
+async fn ordinary_upgrade_preserves_enabled_click_stats_binding() {
+    let (server, mut backend, _guard) = fixture().await;
+    let remote = click_stats_remote(&server, &mut backend).await;
+    remote.lock().unwrap().settings["bindings"]
+        .as_array_mut()
+        .unwrap()
+        .push(click_stats::binding(ANALYTICS_NAMESPACE).unwrap());
+    apply_upgrade(&mut backend).await.unwrap();
+    let uploads = script_uploads(&server).await;
+    assert_eq!(uploads.len(), 1);
+    assert!(upload_metadata(&uploads[0]).await["bindings"]
+        .as_array()
+        .unwrap()
+        .contains(&click_stats::binding(ANALYTICS_NAMESPACE).unwrap()));
+    assert!(backend.db.pending_worker_upgrades.is_empty());
+}
+
+#[tokio::test]
+async fn old_worker_upgrade_journal_without_target_settings_still_resumes() {
+    let (server, mut backend, _guard) = fixture().await;
+    let remote = mount_upgrade(&server, &backend.path).await;
+    remote.lock().unwrap().fail_manifest = true;
+    assert!(apply_upgrade(&mut backend).await.is_err());
+    let mut old = serde_json::to_value(&backend.db).unwrap();
+    old["pendingWorkerUpgrades"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("targetSettings");
+    backend.db = serde_json::from_value(old).unwrap();
+    assert!(backend.db.pending_worker_upgrades[0]
+        .target_settings
+        .is_none());
+    remote.lock().unwrap().fail_manifest = false;
+    resume_upgrade(&mut backend).await.unwrap();
+    assert_eq!(script_uploads(&server).await.len(), 1);
+}
+
+#[tokio::test]
+async fn click_stats_conflicting_or_unknown_bindings_block_before_any_write() {
+    for bad in [
+        json!({"name":"CLICK_EVENTS","type":"analytics_engine","dataset":"other_dataset"}),
+        json!({"name":"CLICK_EVENTS","type":"analytics_engine","dataset":format!("slg_clicks_{ANALYTICS_NAMESPACE}"),"unknown":"private-value"}),
+        json!({"name":"CLICK_EVENTS","type":"plain_text","text":"private-value"}),
+        json!({"name":"OTHER_EVENTS","type":"analytics_engine","dataset":format!("slg_clicks_{ANALYTICS_NAMESPACE}")}),
+    ] {
+        let (server, mut backend, _guard) = fixture().await;
+        let remote = click_stats_remote(&server, &mut backend).await;
+        remote.lock().unwrap().settings["bindings"]
+            .as_array_mut()
+            .unwrap()
+            .push(bad);
+        let error = apply_click_stats(&mut backend, true).await.unwrap_err();
+        assert!(!error.contains("private-value"));
+        assert!(writes(&server).await.is_empty());
+        assert!(backend.db.pending_worker_upgrades.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn enable_click_stats_read_permission_preflight_failure_leaves_no_journal_or_cloud_write() {
+    for status in [401, 403, 500] {
+        let (server, mut backend, _guard) = fixture().await;
+        click_stats_remote(&server, &mut backend).await;
+        analytics_permission(&server, status).await;
+        let error = apply_click_stats(&mut backend, true).await.unwrap_err();
+        if [401, 403].contains(&status) {
+            assert!(error.contains("Cloudflare 拒绝统计读取"));
+            assert!(error.contains("账户分析 · 读取"));
+            assert!(error.contains("启用 Analytics Engine"));
+            assert!(!error.contains("增加"));
+        }
+        assert!(backend.db.pending_worker_upgrades.is_empty());
+        assert!(backend.db.pending_operations.is_empty());
+        assert!(script_uploads(&server).await.is_empty());
+        assert!(server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .all(|r| r.method == "GET" || r.url.path() == ANALYTICS_PATH));
+    }
 }

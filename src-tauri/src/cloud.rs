@@ -74,6 +74,21 @@ impl CloudError {
 
 pub type CloudResult<T> = Result<T, CloudError>;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AnalyticsError {
+    PermissionDenied,
+    Unavailable,
+}
+
+impl AnalyticsError {
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::PermissionDenied => "无法读取点击统计。Cloudflare 拒绝统计读取；请核对原 API Token 的“账户 · 账户分析 · 读取”权限，并确认该账户已在 Cloudflare 启用 Analytics Engine",
+            Self::Unavailable => "暂时无法确认点击统计，请稍后重试；未返回的统计不能视为零次访问",
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct ProbeError {
     pub message: String,
@@ -106,6 +121,106 @@ pub struct Cloud {
 }
 
 impl Cloud {
+    /// Read-only SQL requests use a separate bounded response path. Neither SQL
+    /// text nor provider response/error bodies are exposed to the UI or logs.
+    pub async fn analytics_sql(
+        &self,
+        token: &str,
+        account: &str,
+        sql: &str,
+    ) -> Result<Value, AnalyticsError> {
+        self.analytics_sql_with_limit(token, account, sql, 64 * 1024)
+            .await
+    }
+
+    /// A full statistics-center page can contain 25 links times 11 valid event
+    /// groups. Long but valid hosts make that response larger than the single-
+    /// link budget, while this dedicated path remains strictly bounded.
+    pub async fn analytics_sql_center_page(
+        &self,
+        token: &str,
+        account: &str,
+        sql: &str,
+    ) -> Result<Value, AnalyticsError> {
+        self.analytics_sql_with_limit(token, account, sql, 256 * 1024)
+            .await
+    }
+
+    async fn analytics_sql_with_limit(
+        &self,
+        token: &str,
+        account: &str,
+        sql: &str,
+        max_response_bytes: usize,
+    ) -> Result<Value, AnalyticsError> {
+        let url = self
+            .url(&format!(
+                "accounts/{}/analytics_engine/sql",
+                encode(account)
+            ))
+            .map_err(|_| AnalyticsError::Unavailable)?;
+        let mut response = self
+            .client
+            .post(url)
+            .bearer_auth(token)
+            .header(reqwest::header::CONTENT_TYPE, "text/plain; charset=utf-8")
+            .body(sql.to_owned())
+            .send()
+            .await
+            .map_err(|_| AnalyticsError::Unavailable)?;
+        if matches!(
+            response.status(),
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+        ) {
+            return Err(AnalyticsError::PermissionDenied);
+        }
+        if !response.status().is_success()
+            || response
+                .content_length()
+                .is_some_and(|n| n > max_response_bytes as u64)
+        {
+            return Err(AnalyticsError::Unavailable);
+        }
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|_| AnalyticsError::Unavailable)?
+        {
+            if chunk.len() > max_response_bytes.saturating_sub(bytes.len()) {
+                return Err(AnalyticsError::Unavailable);
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        let value: Value =
+            serde_json::from_slice(&bytes).map_err(|_| AnalyticsError::Unavailable)?;
+        if !value.is_object()
+            || value.get("error").is_some()
+            || value.get("exception").is_some()
+            || value
+                .get("errors")
+                .is_some_and(|v| v.as_array().is_none_or(|a| !a.is_empty()))
+            || value.get("success").is_some_and(|v| v != true)
+        {
+            return Err(AnalyticsError::Unavailable);
+        }
+        Ok(value)
+    }
+
+    pub async fn analytics_read_preflight(
+        &self,
+        token: &str,
+        account: &str,
+    ) -> Result<(), AnalyticsError> {
+        let value = self
+            .analytics_sql(token, account, "SELECT 'ok' AS message FORMAT JSON")
+            .await?;
+        if value["data"] != json!([{"message":"ok"}]) || value["rows"] != 1 {
+            return Err(AnalyticsError::Unavailable);
+        }
+        Ok(())
+    }
+
     pub async fn schedules(&self, token: &str, account: &str, script: &str) -> CloudResult<Value> {
         self.get(
             token,
@@ -555,12 +670,26 @@ impl Cloud {
         script: &str,
         namespace: &str,
         settings: &Value,
+        source: &[u8],
     ) -> CloudResult<()> {
+        let bindings: Vec<_> = settings["bindings"]
+            .as_array()
+            .ok_or_else(|| CloudError::new("Worker 绑定快照无效", false))?
+            .iter()
+            .filter(|b| b["type"] != "secret_text")
+            .cloned()
+            .collect();
+        if !bindings
+            .iter()
+            .any(|b| b["name"] == "LINKS" && b["namespace_id"] == namespace)
+        {
+            return Err(CloudError::new("Worker 绑定快照无效", false));
+        }
         let metadata = json!({
             "main_module": settings["main_module"],
             "compatibility_date": settings["compatibility_date"],
             "compatibility_flags": settings["compatibility_flags"],
-            "bindings": [{"type":"kv_namespace","name":"LINKS","namespace_id":namespace}],
+            "bindings": bindings,
             "keep_bindings": ["secret_text"]
         });
         let form = multipart::Form::new()
@@ -572,7 +701,7 @@ impl Cloud {
             )
             .part(
                 "worker.mjs",
-                multipart::Part::text(include_str!("../../edge/worker.mjs"))
+                multipart::Part::bytes(source.to_owned())
                     .file_name("worker.mjs")
                     .mime_str("application/javascript+module")
                     .map_err(|_| CloudError::new("Worker 脚本格式无效", false))?,

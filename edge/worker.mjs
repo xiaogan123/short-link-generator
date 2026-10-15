@@ -29,6 +29,10 @@ const MAX_NAMES = 20_000;
 const MAX_NAME_PAGES = 20;
 const MAX_NAME_SCANS = 6;
 const MAX_NAME_LIST_CALLS = 24;
+const PREVIEW_USER_AGENT = /(?:facebookexternalhit|facebot|twitterbot|slackbot(?:-linkexpanding)?|discordbot|telegrambot|whatsapp|linkedinbot|pinterestbot|skypeuripreview|vkshare)/i;
+const AUTOMATION_USER_AGENT = /(?:headlesschrome|phantomjs|selenium|puppeteer|playwright|curl\/|wget\/|python-(?:requests|urllib)|aiohttp|scrapy|go-http-client|okhttp|apache-httpclient|postmanruntime|node-fetch|undici)/i;
+const BOT_USER_AGENT = /(?:bot|crawler|spider|slurp)(?:[\/\s;,+)]|$)/i;
+const BROWSER_USER_AGENT = /(?:firefox|fxios|edg|edga|edgios|opr|chrome|crios)\/\d+|version\/\d+(?:\.\d+)*[^\r\n]*safari\/\d+/i;
 
 function namesFor(binding) {
   let state = nameCaches.get(binding);
@@ -113,14 +117,83 @@ async function readLink(binding, host, slug, bypassCache) {
   const read = name => readKV(binding, `l:${host}:${name}`, MAX_LINK_BYTES,
     bypassCache, value => validLink(value) || validTemplateLink(value));
   const exact = await read(slug);
-  if (exact !== null) return exact;
+  if (exact !== null) return { link: exact, slug };
   const lower = slug.toLowerCase();
   if (lower !== slug) {
     const canonical = await read(lower);
-    if (canonical !== null) return canonical;
+    if (canonical !== null) return { link: canonical, slug: lower };
   }
   const original = await legacyName(binding, host, slug, bypassCache);
-  return original ? read(original) : null;
+  if (!original) return null;
+  const link = await read(original);
+  return link === null ? null : { link, slug: original };
+}
+
+function headerValue(request, name) {
+  return request.headers.get(name)?.trim() ?? '';
+}
+
+function classifyTraffic(request) {
+  const userAgent = headerValue(request, 'User-Agent');
+  if (PREVIEW_USER_AGENT.test(userAgent)) {
+    return { classification: 'likely_bot', trafficKind: 'preview', reason: 'ua_preview' };
+  }
+  if (['Purpose', 'Sec-Purpose'].some(name => headerValue(request, name).split(';')
+    .some(token => token.trim().toLowerCase() === 'prefetch'))) {
+    return { classification: 'unknown', trafficKind: 'prefetch', reason: 'prefetch_header' };
+  }
+
+  const botManagement = request.cf?.botManagement;
+  if (botManagement?.verifiedBot === true) {
+    return { classification: 'likely_bot', trafficKind: 'click', reason: 'cf_verified_bot' };
+  }
+  if (typeof request.cf?.verifiedBotCategory === 'string' &&
+      request.cf.verifiedBotCategory.trim() !== '') {
+    return { classification: 'likely_bot', trafficKind: 'click', reason: 'cf_verified_bot_category' };
+  }
+  const score = botManagement?.score;
+  const validScore = Number.isInteger(score) && score >= 1 && score <= 99;
+  if (validScore && score <= 29) {
+    return { classification: 'likely_bot', trafficKind: 'click', reason: 'cf_score_low' };
+  }
+  if (AUTOMATION_USER_AGENT.test(userAgent)) {
+    return { classification: 'likely_bot', trafficKind: 'click', reason: 'ua_automation' };
+  }
+  if (BOT_USER_AGENT.test(userAgent)) {
+    return { classification: 'likely_bot', trafficKind: 'click', reason: 'ua_bot' };
+  }
+  if (validScore && score >= 80) {
+    return { classification: 'likely_human', trafficKind: 'click', reason: 'cf_score_high' };
+  }
+  if (BROWSER_USER_AGENT.test(userAgent) &&
+      headerValue(request, 'Sec-Fetch-Mode').toLowerCase() === 'navigate' &&
+      headerValue(request, 'Sec-Fetch-Dest').toLowerCase() === 'document' &&
+      headerValue(request, 'Sec-Fetch-User') === '?1') {
+    return { classification: 'likely_human', trafficKind: 'click', reason: 'browser_navigation' };
+  }
+  return {
+    classification: 'unknown',
+    trafficKind: 'click',
+    reason: userAgent === '' ? 'missing_user_agent' : 'insufficient_signals',
+  };
+}
+
+function recordClick(env, request, host, prefix, canonicalSlug) {
+  try {
+    const binding = env.CLICK_EVENTS;
+    if (!binding || typeof binding.writeDataPoint !== 'function') return;
+    const { classification, trafficKind, reason } = classifyTraffic(request);
+    const pending = binding.writeDataPoint({
+      indexes: [host.slice(0, 96)],
+      blobs: ['v1', host, prefix, canonicalSlug, classification, trafficKind, reason],
+      doubles: [1],
+    });
+    // Analytics must stay off the redirect's critical path. Analytics Engine
+    // sampling is accounted for when querying with SUM(_sample_interval).
+    Promise.resolve(pending).catch(() => {});
+  } catch {
+    // Missing, malformed or failing analytics bindings never change redirects.
+  }
 }
 
 function response(status, body, head, extra = {}) {
@@ -512,8 +585,9 @@ export default {
       const config = await readKV(env.LINKS, `c:${host}`, MAX_CONFIG_BYTES, selftest !== null, validConfig);
       if (config === null) return response(404, 'Not Found', head);
       if (config.prefix !== route[1]) return response(404, 'Not Found', head);
-      const link = await readLink(env.LINKS, host, route[2], selftest !== null);
-      if (link === null) return response(404, 'Not Found', head);
+      const resolved = await readLink(env.LINKS, host, route[2], selftest !== null);
+      if (resolved === null) return response(404, 'Not Found', head);
+      const { link, slug: canonicalSlug } = resolved;
       let destination;
       if (validTemplateLink(link)) {
         const pool = await readKV(env.LINKS, `p:${link.poolId}`, MAX_POOL_BYTES,
@@ -533,7 +607,9 @@ export default {
       }
       // Serialize validated HTTPS URLs before constructing a header: Unicode
       // hostnames need punycode and path/query characters need percent encoding.
-      return response(302, null, head, { Location: new URL(destination).href });
+      const redirect = response(302, null, head, { Location: new URL(destination).href });
+      if (!head && selftest === null) recordClick(env, request, host, config.prefix, canonicalSlug);
+      return redirect;
     } catch {
       return response(503, 'Service Unavailable', head);
     }

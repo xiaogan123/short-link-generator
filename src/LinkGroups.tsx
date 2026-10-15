@@ -1,5 +1,5 @@
 import { Fragment, useId, useRef, useState } from "react";
-import { CaretDown, CaretLeft, CaretRight, Copy, Globe, PencilSimple, Plus, ShieldCheck, Trash } from "@phosphor-icons/react";
+import { ChartBar, CaretDown, CaretLeft, CaretRight, Copy, Globe, PencilSimple, Plus, ShieldCheck, Trash } from "@phosphor-icons/react";
 import { shortUrl } from "./validators";
 import type { Domain, Link, Pool } from "./types";
 import "./LinkGroups.css";
@@ -18,6 +18,7 @@ type Props = {
   getDetection: (link: Link) => LinkDetection;
   onCopy: (url: string) => void;
   onCheck: (link: Link, domain: Domain) => void;
+  onStats?: (link: Link, domain: Domain) => void;
   onEdit: (link: Link, usePlatform?: boolean) => void;
   onDelete: (link: Link, domain: Domain) => void;
   onCreate: (domainId: string) => void;
@@ -107,7 +108,7 @@ function Targets({ link, pool }: { link: Link; pool: Pool | undefined }) {
   );
 }
 
-function LinkGroupSection({ domain, links, pools, getDetection, onCopy, onCheck, onEdit, onDelete, onCreate }: Props & LinkGroup) {
+function LinkGroupSection({ domain, links, pools, getDetection, onCopy, onCheck, onStats, onEdit, onDelete, onCreate }: Props & LinkGroup) {
   const detailPrefix = useId();
   const [pageSize, setPageSize] = useState<(typeof pageSizes)[number]>(25);
   const [pageState, setPageState] = useState({ linkKey: "", page: 1 });
@@ -186,6 +187,7 @@ function LinkGroupSection({ domain, links, pools, getDetection, onCopy, onCheck,
                         <div className="slg-actions">
                           <button className="slg-copy" type="button" aria-label={`复制 ${link.slug}`} title="复制链接" onClick={() => onCopy(url)}><Copy size={15} aria-hidden="true" /><span>复制</span></button>
                           <button type="button" aria-label={`检测 ${link.slug}`} title="检测链接" onClick={() => onCheck(link, domain)}><ShieldCheck size={15} aria-hidden="true" /><span>检测</span></button>
+                          {onStats && <button type="button" aria-label={`点击统计 ${link.slug}`} title="查看点击统计" onClick={() => onStats(link, domain)}><ChartBar size={15} aria-hidden="true" /><span>统计</span></button>}
                           <button type="button" aria-label={`编辑 ${link.slug}`} title="编辑链接" onClick={() => onEdit(link)}><PencilSimple size={15} aria-hidden="true" /><span>编辑</span></button>
                           <button className="slg-details-toggle" type="button" aria-label={`详情 ${link.slug}`} aria-expanded={open} aria-controls={open ? detailId : undefined} onClick={() => toggleDetails(link.slug)}><CaretDown size={15} aria-hidden="true" /><span>详情</span></button>
                         </div>

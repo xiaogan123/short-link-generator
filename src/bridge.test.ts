@@ -3,6 +3,55 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 beforeEach(() => { vi.resetModules(); window.history.replaceState({}, '', '/?preview=1'); });
 
 describe('explicit preview bridge', () => {
+  it('returns one explicitly selected statistics-center scope with fixed pagination',async()=>{
+    window.history.replaceState({}, '', '/?preview=1&clickStats=1&manyLinks=1');
+    const {dispatch}=await import('./bridge');
+    const report=await dispatch<import('./types').StatsCenterReport>('get_stats_center',{accountId:'demo-a',days:7,page:2,pageSize:25});
+    expect(report).toMatchObject({status:'ready',accountId:'demo-a',domainId:null,days:7,page:2,pageSize:25,totalLinks:100,estimated:true});
+    expect(report.rows).toHaveLength(25);
+    expect(report.rows?.every(row=>['demo-d1','demo-d2'].includes(row.domainId))).toBe(true);
+    expect(report.totals?.total).toBe(report.totals!.likelyHuman+report.totals!.likelyBot+report.totals!.unknown);
+    const domain=await dispatch<import('./types').StatsCenterReport>('get_stats_center',{accountId:'demo-a',domainId:'demo-d1',days:1,page:1,pageSize:25});
+    expect(domain.domainId).toBe('demo-d1');
+    expect(domain.rows?.every(row=>row.domainId==='demo-d1')).toBe(true);
+    expect(domain.totalLinks).toBe(50);
+  });
+  it('keeps disabled and no-local-link center states explicit without fabricated totals',async()=>{
+    const {dispatch}=await import('./bridge');
+    const disabled=await dispatch<import('./types').StatsCenterReport>('get_stats_center',{accountId:'demo-a',days:7,page:1,pageSize:25});
+    expect(disabled.status).toBe('disabled');expect(disabled.totals).toBeUndefined();expect(disabled.rows).toBeUndefined();
+    const empty=await dispatch<import('./types').StatsCenterReport>('get_stats_center',{accountId:'demo-b',days:7,page:1,pageSize:25});
+    expect(empty.status).toBe('no_data');expect(empty.rows).toEqual([]);expect(empty.totals).toBeUndefined();
+    expect(empty.message).toContain('不代表历史统计为零');
+    for(const fields of [
+      {accountId:'missing',days:7,page:1,pageSize:25},
+      {accountId:'demo-a',domainId:'demo-zone-3',days:7,page:1,pageSize:25},
+      {accountId:'demo-a',days:3,page:1,pageSize:25},
+      {accountId:'demo-a',days:7,page:0,pageSize:25},
+      {accountId:'demo-a',days:7,page:1,pageSize:10},
+    ]) await expect(dispatch('get_stats_center',fields)).rejects.toThrow();
+  });
+  it('keeps click collection disabled until a confirmed account plan and preserves every existing link',async()=>{
+    const {dispatch}=await import('./bridge');
+    const state=await dispatch<import('./types').State>('get_state');
+    const link=state.links[0];const fields={domainId:link.domainId,slug:link.slug,days:7};
+    expect(await dispatch('get_link_stats',fields)).toMatchObject({status:'disabled',estimated:true});
+    const plan=await dispatch<{id:string}>('prepare_change',{kind:'enable_click_stats',accountId:'demo-a'});
+    expect(await dispatch('get_link_stats',fields)).toMatchObject({status:'disabled'});
+    await dispatch('apply_plan',{planId:plan.id});
+    expect(await dispatch('get_link_stats',fields)).toMatchObject({status:'ready',totals:{total:128,likelyHuman:84,likelyBot:17,unknown:27,previews:12,prefetches:8}});
+    expect((await dispatch<import('./types').State>('get_state')).links).toEqual(state.links);
+    const disable=await dispatch<{id:string}>('prepare_change',{kind:'disable_click_stats',accountId:'demo-a'});
+    await dispatch('apply_plan',{planId:disable.id});
+    const report=await dispatch<import('./types').ClickStats>('get_link_stats',fields);
+    expect(report.status).toBe('disabled');expect(report.totals).toBeUndefined();
+  });
+  it('rejects invalid statistics identities or ranges instead of returning zero',async()=>{
+    const {dispatch}=await import('./bridge');
+    for(const fields of [{domainId:'missing',slug:'welcome',days:7},{domainId:'demo-d1',slug:'WELCOME',days:7},{domainId:'demo-d1',slug:'welcome',days:'7'},{domainId:'demo-d1',slug:'welcome',days:3}]){
+      await expect(dispatch('get_link_stats',fields)).rejects.toThrow();
+    }
+  });
   it('creates a new name without changing the old link and rejects an occupied name', async () => {
     const {dispatch}=await import('./bridge');
     const before=await dispatch<import('./types').State>('get_state');

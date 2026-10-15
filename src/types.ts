@@ -11,7 +11,36 @@ export type DomainPreparation = { host: string; prefix: string; dnsMode?: 'syste
 export type DomainDnsPreparation = { host: string; candidates: { accountId: string; label: string; zoneId: string; status: string }[]; checks: DomainCheck[]; dnsStatus: 'ready'|'missing'|'dnsOnly'|'unsupported'|'conflict'|'readFailed'; actions: { kind: 'createPlaceholder'|'enableProxy'; recordType: string; name: string }[]; canApply: boolean; plan?: Plan };
 export type Selftest = { status: 'passed' | 'pending' | 'failed' | 'key_missing'; message: string; checks: (Check & {reason?: string})[] };
 export type UpdateStatus = { status: 'unavailable' | 'up_to_date' | 'available'; currentVersion?: string; version?: string; notes?: string };
-export type Action = 'get_state' | 'token_template' | 'import_token' | 'rename_account' | 'remove_account' | 'refresh_accounts' | 'refresh_domains' | 'prepare_domain' | 'prepare_domain_dns' | 'prepare_change' | 'apply_plan' | 'selftest_link' | 'export_config' | 'import_config' | 'check_update' | 'install_update' | 'prepare_monitor' | 'disable_monitor' | 'resume_monitor' | 'check_link_targets' | 'check_pool_health';
+export type Action = 'get_state' | 'token_template' | 'import_token' | 'rename_account' | 'remove_account' | 'refresh_accounts' | 'refresh_domains' | 'prepare_domain' | 'prepare_domain_dns' | 'prepare_change' | 'apply_plan' | 'selftest_link' | 'export_config' | 'import_config' | 'check_update' | 'install_update' | 'prepare_monitor' | 'disable_monitor' | 'resume_monitor' | 'check_link_targets' | 'check_pool_health' | 'get_link_stats' | 'get_stats_center';
+
+export type ClickStatsDays = 1 | 7 | 30;
+export type ClickStatsStatus = 'ready' | 'disabled' | 'no_data' | 'permission_denied' | 'unavailable';
+export type ClickStatsTotals = {total: number; likelyHuman: number; likelyBot: number; unknown: number; previews: number; prefetches: number};
+export type ClickStats = {
+  status: ClickStatsStatus;
+  message: string;
+  domainId: string;
+  slug: string;
+  days: ClickStatsDays;
+  queriedAt: string;
+  estimated: true;
+  totals?: ClickStatsTotals;
+};
+export type StatsCenterRow = {domainId: string; slug: string; totals: ClickStatsTotals};
+export type StatsCenterReport = {
+  status: ClickStatsStatus;
+  message: string;
+  accountId: string;
+  domainId: string | null;
+  days: ClickStatsDays;
+  page: number;
+  pageSize: 25;
+  totalLinks: number;
+  queriedAt: string;
+  estimated: true;
+  totals?: ClickStatsTotals;
+  rows?: StatsCenterRow[];
+};
 
 export type TargetTemplate = {prefix:string;suffix:string};
 export type PoolCandidate = TargetTemplate & {id:string;enabled:boolean};

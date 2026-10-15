@@ -141,6 +141,11 @@ fn normalized_settings(raw: &Value, namespace: &str) -> Result<Value, String> {
             {
                 normalized.push(json!({"name":name,"type":"secret_text"}));
             }
+            ("CLICK_EVENTS", Some("analytics_engine"))
+                if click_stats::valid_binding(binding, namespace) =>
+            {
+                normalized.push(binding.clone());
+            }
             _ => return Err("Worker 绑定无法安全保留，停止升级".into()),
         }
     }
@@ -295,6 +300,20 @@ impl Backend {
             .map(|d| format!("{} /{}/", d.host, d.prefix))
             .collect();
         let (title, plan_kind, steps, warnings) = match kind {
+            "enable_click_stats" | "disable_click_stats" => {
+                self.require_upgrade_start(account_id)?;
+                let enabled = kind == "enable_click_stats";
+                click_stats::dataset_name(&resources.namespace)?;
+                (if enabled { "启用点击统计" } else { "关闭点击统计" },
+                    PlanKind::SetClickStats { account_id: account_id.into(), target_hash: bundled_source_hash(), enabled },
+                    vec![format!("{}此账户全部已导入域名的点击统计：{}", if enabled { "启用" } else { "关闭" }, if domains.is_empty() { "无".into() } else { domains.join("、") }),
+                        if enabled { "核对云端归属及分析读取权限后部署本版本转发程序，并启用 Analytics Engine 统计绑定".into() } else { "保留当前转发程序，仅移除统计绑定；之后不再向该数据集写入点击事件".into() },
+                        "保留链接、检测密钥、兼容设置和计划任务；上传未确认时保留恢复记录，不重复上传".into()],
+                    if enabled { vec!["分类是被动估计，不能确认真人或去重访客；预览与预取单独统计，不改变跳转体验".into(),
+                        "Cloudflare 可能采样，统计有延迟；Analytics Engine 的用量、收费和保留期遵循账户的服务方案".into(),
+                        "事件包含短链主机、目录、名称及固定分类，不记录 IP、原始 UA、来源、查询参数、跳转目标或邀请码".into()] }
+                    else { vec!["关闭不会删除已存历史事件；历史数据按 Cloudflare 的保留策略到期。此应用关闭后不再查询统计".into()] })
+            }
             "upgrade_worker" => {
                 self.require_upgrade_start(account_id)?;
                 ("启用名称大小写兼容", PlanKind::UpgradeWorker { account_id: account_id.into(), target_hash: bundled_source_hash() },
@@ -305,7 +324,7 @@ impl Backend {
             }
             "resume_worker_upgrade" => {
                 self.worker_upgrade_pending(account_id)?;
-                ("核对名称兼容升级", PlanKind::ResumeWorkerUpgrade { account_id: account_id.into() },
+                ("核对 Worker 变更", PlanKind::ResumeWorkerUpgrade { account_id: account_id.into() },
                         vec!["只回读 Worker 内容、设置与计划任务；目标版本验证通过时仅修复资源清单".into(),
                             "仍读到原版本时保留待处理记录，稍后再次核对；结束记录需单独确认本机解除计划".into()],
                         vec!["不会重新上传脚本、读取或轮换密钥；未知源码停止写入，请人工核对后解除本机升级记录".into()])
@@ -419,6 +438,7 @@ impl Backend {
         &mut self,
         account_id: &str,
         target_hash: &str,
+        click_stats_enabled: Option<bool>,
     ) -> Result<(), String> {
         self.require_upgrade_start(account_id)?;
         if target_hash != bundled_source_hash() {
@@ -438,6 +458,17 @@ impl Backend {
         let settings = self
             .read_upgrade_settings(&token, account_id, &resources)
             .await?;
+        let mut target_settings = settings.clone();
+        if let Some(enabled) = click_stats_enabled {
+            let bindings = target_settings["bindings"]
+                .as_array_mut()
+                .ok_or("Worker 绑定格式无效")?;
+            bindings.retain(|b| b["name"] != "CLICK_EVENTS");
+            if enabled {
+                bindings.push(click_stats::binding(&resources.namespace)?);
+            }
+            bindings.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+        }
         let schedules = self
             .read_upgrade_schedules(&token, account_id, &resources)
             .await?;
@@ -446,12 +477,24 @@ impl Backend {
             .script_content(&token, account_id, &resources.script)
             .await
             .map_err(problem)?;
-        let previous_hash = hex::encode(Sha256::digest(source));
+        let previous_hash = hex::encode(Sha256::digest(&source));
         if manifest["sourceHash"] != previous_hash {
             return Err("Worker 与清单已变化，停止升级".into());
         }
-        if previous_hash == target_hash {
+        // Disabling collection changes only bindings, never the user's code.
+        let effective_target_hash = if click_stats_enabled == Some(false) {
+            previous_hash.clone()
+        } else {
+            target_hash.to_owned()
+        };
+        if previous_hash == effective_target_hash && settings == target_settings {
             return Ok(());
+        }
+        if click_stats_enabled == Some(true) {
+            self.cloud
+                .analytics_read_preflight(&token, account_id)
+                .await
+                .map_err(|error| error.message().to_owned())?;
         }
         // Re-read the complete preflight immediately before creating durable
         // intent. This detects changes between independent discovery requests.
@@ -485,9 +528,10 @@ impl Backend {
                 account_id: account_id.into(),
                 resources: resources.clone(),
                 previous_hash,
-                target_hash: target_hash.into(),
+                target_hash: effective_target_hash,
                 manifest,
                 settings: settings.clone(),
+                target_settings: Some(target_settings.clone()),
                 schedules,
                 journal,
                 phase: WorkerUpgradePhase::Prepared,
@@ -501,7 +545,12 @@ impl Backend {
                 account_id,
                 &resources.script,
                 &resources.namespace,
-                &settings,
+                &target_settings,
+                if click_stats_enabled == Some(false) {
+                    &source
+                } else {
+                    include_bytes!("../../edge/worker.mjs")
+                },
             )
             .await
         {
@@ -556,7 +605,7 @@ impl Backend {
         if hash != p.previous_hash && hash != p.target_hash {
             return Err("Worker 为未知外部版本，禁止任何云端写入；请人工核对后使用解除本机升级记录，再按现有流程找回或重建".into());
         }
-        if hash == p.previous_hash {
+        if hash == p.previous_hash && hash != p.target_hash {
             // A stale content read, including after a crash or a confirmed
             // resume, cannot prove an upload never took effect. Only a separate
             // explicit local dismissal may abandon this recovery record.
@@ -571,6 +620,12 @@ impl Backend {
         let schedules = self
             .read_upgrade_schedules(token, &p.account_id, &p.resources)
             .await?;
+        let target_settings = p.target_settings.as_ref().unwrap_or(&p.settings);
+        // Old journals never intended a settings-only change. Keep their old
+        // stale-content rule; new settings-only changes require target readback.
+        if hash == p.previous_hash && p.target_settings.is_none() {
+            return Err("当前仍读取到旧版本；保留升级记录，请稍后核对".into());
+        }
         if schedules != p.schedules {
             return Err("Worker 计划任务已变化，停止修复清单".into());
         }
@@ -582,11 +637,11 @@ impl Backend {
         // Missing secret bindings have an explicit safe terminal state. No
         // secret is read or recreated here; existing repair flows handle them.
         let mut without_bindings = settings.clone();
-        without_bindings["bindings"] = p.settings["bindings"].clone();
-        if without_bindings != p.settings {
+        without_bindings["bindings"] = target_settings["bindings"].clone();
+        if without_bindings != *target_settings {
             return Err("Worker 非秘密设置已变化，停止修复清单".into());
         }
-        let original = p.settings["bindings"]
+        let original = target_settings["bindings"]
             .as_array()
             .ok_or("升级绑定快照无效")?;
         let actual = settings["bindings"].as_array().ok_or("升级绑定快照无效")?;

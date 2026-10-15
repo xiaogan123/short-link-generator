@@ -1,6 +1,6 @@
 import { invoke } from '@tauri-apps/api/core';
 import { normalizeHost } from './validators';
-import type { Action, DomainPreparation, Link, Plan, Pool, PoolHealth, Selftest, State, TargetReport } from './types';
+import type { Action, ClickStats, ClickStatsDays, ClickStatsTotals, DomainPreparation, Link, Plan, Pool, PoolHealth, Selftest, State, StatsCenterReport, StatsCenterRow, TargetReport } from './types';
 
 export const preview = new URLSearchParams(window.location.search).get('preview') === '1';
 const now = () => new Date().toISOString();
@@ -25,6 +25,8 @@ const demoState: State = {
   pools: [],
 };
 let local: State = structuredClone(demoState);
+const previewStatsAccounts = new Set<string>();
+if (preview && new URLSearchParams(window.location.search).get('clickStats') === '1') previewStatsAccounts.add('demo-a');
 // Optional, isolated examples for checking the desktop layout without cloud access.
 if (preview && new URLSearchParams(window.location.search).get('visualReview') === '1') {
   local.domains.push({id:'demo-d3',accountId:'demo-b',zoneId:'demo-zone-3',host:'new.example.net',prefix:'go',routeId:'demo-route-3'});
@@ -57,6 +59,49 @@ function makePlan(title: string, steps: string[], warnings: string[], action: st
 }
 function previewDispatch(action: Action, payload: Record<string, unknown>): unknown {
   if (action === 'get_state') return clone();
+  if (action === 'get_stats_center') {
+    const accountId = typeof payload.accountId === 'string' ? payload.accountId : '';
+    const account = local.accounts.find((item) => item.id === accountId);
+    if (!account) throw new Error('请选择有效的 Cloudflare 账户。');
+    if (![1,7,30].includes(Number(payload.days)) || typeof payload.days !== 'number') throw new Error('请选择 1、7 或 30 天的统计范围。');
+    if (!Number.isSafeInteger(payload.page) || Number(payload.page) < 1) throw new Error('统计页码无效，请重新读取。');
+    if (payload.pageSize !== 25) throw new Error('统计中心每页固定显示 25 条短链接。');
+    const requestedDomainId = payload.domainId === undefined || payload.domainId === null ? null : payload.domainId;
+    if (requestedDomainId !== null && (typeof requestedDomainId !== 'string' || !local.domains.some((item) => item.id === requestedDomainId && item.accountId === accountId))) {
+      throw new Error('所选域名不属于当前账户，请重新选择。');
+    }
+    const days = payload.days as ClickStatsDays;
+    const page = Number(payload.page);
+    const domainIds = new Set(local.domains.filter((item) => item.accountId === accountId && (!requestedDomainId || item.id === requestedDomainId)).map((item) => item.id));
+    const matchingLinks = local.links
+      .filter((item) => domainIds.has(item.domainId))
+      .sort((left, right) => left.domainId.localeCompare(right.domainId) || left.slug.localeCompare(right.slug));
+    const base = {accountId,domainId:requestedDomainId,days,page,pageSize:25 as const,totalLinks:matchingLinks.length,queriedAt:now(),estimated:true as const};
+    if (matchingLinks.length === 0) return {status:'no_data',message:'当前账户尚无本机短链接。此状态不代表历史统计为零。',...base,rows:[]} satisfies StatsCenterReport;
+    if (!previewStatsAccounts.has(accountId)) return {status:'disabled',message:'本地预览：此示例账户尚未启用统计。',...base} satisfies StatsCenterReport;
+    const sampleTotals = (item: Link, index: number): ClickStatsTotals => {
+      const seed = [...`${item.domainId}:${item.slug}`].reduce((sum, character) => sum + character.charCodeAt(0), 0) + index;
+      const multiplier = days === 1 ? 1 : days === 7 ? 4 : 12;
+      const likelyHuman = (18 + seed % 23) * multiplier;
+      const likelyBot = (3 + seed % 7) * multiplier;
+      const unknown = (2 + seed % 5) * multiplier;
+      return {total:likelyHuman+likelyBot+unknown,likelyHuman,likelyBot,unknown,previews:(seed%6)*multiplier,prefetches:(seed%4)*multiplier};
+    };
+    const allRows: StatsCenterRow[] = matchingLinks.map((item,index)=>({domainId:item.domainId,slug:item.slug,totals:sampleTotals(item,index)}));
+    if (new URLSearchParams(window.location.search).get('statsNoData') === '1') {
+      const rows = allRows.slice((page-1)*25,page*25).map((row)=>({...row,totals:{total:0,likelyHuman:0,likelyBot:0,unknown:0,previews:0,prefetches:0}}));
+      return {status:'no_data',message:'所选时间范围暂时没有可显示的估算记录。',...base,rows} satisfies StatsCenterReport;
+    }
+    const totals = allRows.reduce<ClickStatsTotals>((sum,row)=>({total:sum.total+row.totals.total,likelyHuman:sum.likelyHuman+row.totals.likelyHuman,likelyBot:sum.likelyBot+row.totals.likelyBot,unknown:sum.unknown+row.totals.unknown,previews:sum.previews+row.totals.previews,prefetches:sum.prefetches+row.totals.prefetches}),{total:0,likelyHuman:0,likelyBot:0,unknown:0,previews:0,prefetches:0});
+    return {status:'ready',message:'本地预览：以下为示例统计，未查询真实点击。',...base,totals,rows:allRows.slice((page-1)*25,page*25)} satisfies StatsCenterReport;
+  }
+  if (action === 'get_link_stats') {
+    if (![1,7,30].includes(Number(payload.days)) || typeof payload.days !== 'number') throw new Error('请选择 1、7 或 30 天的统计范围。');
+    const domain = local.domains.find((item) => item.id === payload.domainId);
+    if (!domain || !local.links.some((link) => link.domainId === domain.id && link.slug === payload.slug)) throw new Error('短链接不存在，请刷新列表。');
+    const ready = previewStatsAccounts.has(domain.accountId);
+    return {status:ready?'ready':'disabled',message:ready?'本地预览：以下为示例统计，未查询真实点击。':'本地预览：此示例账户尚未启用统计。',domainId:domain.id,slug:String(payload.slug),days:payload.days as ClickStatsDays,queriedAt:now(),estimated:true,...(ready?{totals:{total:128,likelyHuman:84,likelyBot:17,unknown:27,previews:12,prefetches:8}}:{})} satisfies ClickStats;
+  }
   if (action === 'token_template') return 'https://dash.cloudflare.com/profile/api-tokens';
   if (action === 'refresh_accounts') { const accountId=typeof payload.accountId==='string' ? payload.accountId : ''; local.accounts = local.accounts.map(a => !accountId || a.id === accountId ? ({ ...a, checkedAt: now() }) : a); return clone(); }
   if (action === 'refresh_domains') {
@@ -117,6 +162,14 @@ function previewDispatch(action: Action, payload: Record<string, unknown>): unkn
   }
   if (action === 'prepare_change') {
     const kind = String(payload.kind);
+    if (kind === 'enable_click_stats' || kind === 'disable_click_stats') {
+      const account = local.accounts.find((item) => item.id === payload.accountId);
+      if (!account?.hasResources) throw new Error('请先为此账户接入短链接域名。');
+      return makePlan(kind === 'enable_click_stats' ? '启用点击统计' : '停用点击统计', [
+        `范围：${account.label} 的全部已接入域名`,
+        kind === 'enable_click_stats' ? '后台记录链接和请求分类；访客保持直接跳转，不做访问验证' : '停止之后的统计记录，不改变链接跳转',
+      ], ['本地预览只演示流程，不会修改云端。', '统计是估算访问次数，不是去重人数，也不能保证准确识别每个真人。'], kind, {accountId:account.id});
+    }
     if (kind === 'save_link') {
       if (payload.createOnly !== undefined && typeof payload.createOnly !== 'boolean') throw new Error('创建方式格式无效。');
       const exact = local.links.some(l => l.domainId === payload.domainId && l.slug === payload.slug);
@@ -156,6 +209,8 @@ function previewDispatch(action: Action, payload: Record<string, unknown>): unkn
     if (item.action === 'migrate_credentials' && payload.acknowledgeCredentialMigration !== true) throw new Error('请先确认更新本机授权。');
     plans.delete(item.plan.id);
     if (item.action === 'migrate_credentials') local.accounts = local.accounts.map(a => a.id === p.accountId ? {...a, needsCredentialMigration:false} : a);
+    if (item.action === 'enable_click_stats') previewStatsAccounts.add(String(p.accountId));
+    if (item.action === 'disable_click_stats') previewStatsAccounts.delete(String(p.accountId));
     if (item.action === 'recover_selftest_resources') {
       const account = local.accounts.find(a => a.id === p.accountId);
       if (!account || account.hasResources || !local.pendingActions.some(a => a.kind === item.action && a.accountId === account.id)) throw new Error('计划已失效，请重新核对状态。');

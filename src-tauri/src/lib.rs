@@ -1,3 +1,6 @@
+mod click_stats;
+#[cfg(test)]
+mod click_stats_tests;
 mod cloud;
 #[cfg(test)]
 mod credential_cleanup_tests;
@@ -76,6 +79,8 @@ async fn lock_backend<'a>(
             | "prepare_change"
             | "apply_plan"
             | "check_pool_health"
+            | "get_link_stats"
+            | "get_stats_center"
             | "selftest_link"
             | "prepare_monitor"
             | "disable_monitor"
@@ -831,6 +836,7 @@ impl Backend {
         let ids: Vec<String> = match kind {
             PlanKind::MigrateCredentials { .. } => return Ok(()),
             PlanKind::UpgradeWorker { account_id, .. }
+            | PlanKind::SetClickStats { account_id, .. }
             | PlanKind::ResumeWorkerUpgrade { account_id } => {
                 return self.require_credentials(account_id);
             }
@@ -1919,7 +1925,8 @@ impl Backend {
             {"key":"workers_routes","type":"edit"},
             {"key":"zone","type":"read"},
             {"key":"dns","type":"edit"},
-            {"key":"account_settings","type":"read"}
+            {"key":"account_settings","type":"read"},
+            {"key":"account_analytics","type":"read"}
         ]);
         format!(
             "https://dash.cloudflare.com/profile/api-tokens?permissionGroupKeys={}&accountId=*&zoneId=all&name={}",
@@ -2051,7 +2058,11 @@ impl Backend {
                     },
                 )
             }
-            "upgrade_worker" | "resume_worker_upgrade" | "dismiss_worker_upgrade" => {
+            "upgrade_worker"
+            | "resume_worker_upgrade"
+            | "dismiss_worker_upgrade"
+            | "enable_click_stats"
+            | "disable_click_stats" => {
                 return self.prepare_worker_upgrade(kind, field(payload, "accountId")?);
             }
             "save_pool" => {
@@ -2366,6 +2377,8 @@ impl Backend {
     async fn dispatch(&mut self, action: &str, payload: &Value) -> Result<Value, String> {
         match action {
             "get_state" => Ok(self.state()),
+            "get_link_stats" => self.get_link_stats(payload).await,
+            "get_stats_center" => self.get_stats_center(payload).await,
             "token_template" => Ok(Value::String(Self::token_template())),
             "import_token" => {
                 let expected_account_id = match payload.get("expectedAccountId") {
@@ -3302,7 +3315,7 @@ impl Backend {
             .ok_or("无法读取 Worker 绑定")?;
         let missing_key_recovery = self.account(account_id)?.needs_selftest_key;
         let mut names = HashSet::new();
-        let expected = (1..=3).contains(&bindings.len())
+        let expected = (1..=4).contains(&bindings.len())
             && bindings.iter().any(|b| {
                 b["type"] == "kv_namespace"
                     && b["name"] == "LINKS"
@@ -3320,6 +3333,7 @@ impl Backend {
                             b["type"] == "kv_namespace" && b["namespace_id"] == resources.namespace
                         }
                         "SELFTEST_KEY" | "PROBE_KEY" => b["type"] == "secret_text",
+                        "CLICK_EVENTS" => click_stats::valid_binding(b, &resources.namespace),
                         _ => false,
                     }
             });
@@ -3347,7 +3361,18 @@ impl Backend {
             PlanKind::UpgradeWorker {
                 account_id,
                 target_hash,
-            } => self.apply_worker_upgrade(&account_id, &target_hash).await,
+            } => {
+                self.apply_worker_upgrade(&account_id, &target_hash, None)
+                    .await
+            }
+            PlanKind::SetClickStats {
+                account_id,
+                target_hash,
+                enabled,
+            } => {
+                self.apply_worker_upgrade(&account_id, &target_hash, Some(enabled))
+                    .await
+            }
             PlanKind::ResumeWorkerUpgrade { account_id } => {
                 self.resume_worker_upgrade(&account_id).await
             }
@@ -6736,7 +6761,12 @@ mod tests {
         assert_eq!(query.get("zoneId").map(String::as_str), Some("all"));
         let permissions: Value =
             serde_json::from_str(query.get("permissionGroupKeys").unwrap()).unwrap();
-        assert_eq!(permissions.as_array().unwrap().len(), 6);
+        assert_eq!(permissions.as_array().unwrap().len(), 7);
+        assert!(permissions
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p["key"] == "account_analytics" && p["type"] == "read"));
         assert!(permissions
             .as_array()
             .unwrap()

@@ -215,6 +215,9 @@ pub struct PendingWorkerUpgrade {
     pub target_hash: String,
     pub manifest: serde_json::Value,
     pub settings: serde_json::Value,
+    /// Missing on journals from older app versions, whose settings never changed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_settings: Option<serde_json::Value>,
     pub schedules: serde_json::Value,
     pub journal: String,
     pub phase: WorkerUpgradePhase,
@@ -427,7 +430,7 @@ impl From<&Database> for State {
                     kind: "resume_worker_upgrade".into(),
                     pool_id: None,
                     account_id: Some(p.account_id.clone()),
-                    label: "继续核对名称兼容升级".into(),
+                    label: "继续核对 Worker 变更".into(),
                 }))
                 .chain(
                     db.accounts
@@ -490,6 +493,11 @@ pub struct DomainCheck {
 
 #[derive(Clone)]
 pub enum PlanKind {
+    SetClickStats {
+        account_id: String,
+        target_hash: String,
+        enabled: bool,
+    },
     UpgradeWorker {
         account_id: String,
         target_hash: String,

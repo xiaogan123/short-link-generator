@@ -10,6 +10,7 @@ import {
   ArrowClockwise,
   ArrowSquareOut,
   CaretDown,
+  ChartBar,
   CheckCircle,
   Clipboard,
   CloudArrowDown,
@@ -54,8 +55,10 @@ import "./styles.css";
 import Dialog from "./Dialog";
 import Pools from "./Pools";
 import LinkGroups from "./LinkGroups";
+import ClickStatsDialog from "./ClickStats";
+import StatsCenter from "./StatsCenter";
 
-type Page = "links" | "pools" | "domains" | "accounts";
+type Page = "links" | "stats" | "pools" | "domains" | "accounts";
 type LinkDraft = {
   domainId: string;
   slug: string;
@@ -79,6 +82,7 @@ const emptyState: State = {
 };
 const nav: { key: Page; label: string; icon: typeof LinkSimple }[] = [
   { key: "links", label: "短链接", icon: LinkSimple },
+  { key: "stats", label: "统计中心", icon: ChartBar },
   { key: "pools", label: "平台地址", icon: Stack },
   { key: "domains", label: "域名管理", icon: Globe },
   { key: "accounts", label: "Cloudflare 账户", icon: Key },
@@ -276,6 +280,13 @@ export default function App() {
   const [testingAutomaticDns, setTestingAutomaticDns] = useState(false);
   const [updateStatus, setUpdateStatus] = useState<UpdateStatus | null>(null);
   const [manageAccount, setManageAccount] = useState<Account | null>(null);
+  const [statsTarget, setStatsTarget] = useState<{link: Link; domain: Domain} | null>(null);
+  const [statsRevision, setStatsRevision] = useState(0);
+  const [statsConfigurationError, setStatsConfigurationError] = useState<{accountId: string; message: string} | null>(null);
+  const [statsPlanAccountId, setStatsPlanAccountId] = useState("");
+  const statsPrepareSequence = useRef(0);
+  const statsTargetRef = useRef(statsTarget);
+  statsTargetRef.current = statsTarget;
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const mainRef = useRef<HTMLElement>(null);
   const [clock, setClock] = useState(Date.now());
@@ -472,7 +483,7 @@ export default function App() {
     shouldAccept: () => boolean = () => true,
     onFailure?: (message: string) => void,
   ) {
-    if (mutationRef.current && kind !== "migrate_credentials") return false;
+    if (mutationRef.current && kind !== "migrate_credentials" && !(mutationRef.current === "prepare_click_stats" && (kind === "enable_click_stats" || kind === "disable_click_stats"))) return false;
     if (
       kind !== "migrate_credentials" &&
       kind !== "dismiss_worker_upgrade" &&
@@ -555,13 +566,40 @@ export default function App() {
           ...(kind === "recover_selftest_resources"
             ? ["本次只找回本机检测配置；完成后，恢复检测密钥仍需另行查看计划并确认。"]
             : []),
-          ...((kind === "upgrade_worker" || kind === "resume_worker_upgrade")
+          ...((kind === "upgrade_worker" || kind === "resume_worker_upgrade" || kind === "enable_click_stats" || kind === "disable_click_stats")
             ? state.domains.filter((d) => d.accountId === fields.accountId).map((d) => `影响域名：${d.host}/${d.prefix}/`)
             : []),
         ]);
       setPlan(next);
     }
     return Boolean(next && shouldAccept());
+  }
+  function closeStats() {
+    statsPrepareSequence.current++;
+    setStatsTarget(null);
+    statsTargetRef.current = null;
+  }
+  useEffect(() => {
+    if (statsTarget && (!state.accounts.some((account) => account.id === statsTarget.domain.accountId)
+      || !state.domains.some((domain) => domain.id === statsTarget.domain.id && domain.accountId === statsTarget.domain.accountId && domain.host === statsTarget.domain.host && domain.prefix === statsTarget.domain.prefix)
+      || !state.links.some((link) => link.domainId === statsTarget.domain.id && link.slug === statsTarget.link.slug))) closeStats();
+  }, [state, statsTarget]);
+  async function configureClickStats(accountId: string, enabled: boolean, target?: {link: Link; domain: Domain}) {
+    if (mutationRef.current || !stateRef.current.accounts.some((account) => account.id === accountId)) return;
+    const sequence = ++statsPrepareSequence.current;
+    const accepts = () => statsPrepareSequence.current === sequence
+      && stateRef.current.accounts.some((account) => account.id === accountId)
+      && (!target || statsTargetRef.current === target);
+    setStatsConfigurationError(null);
+    await withMutation("prepare_click_stats", async () => {
+      const prepared = await prepare(enabled ? "enable_click_stats" : "disable_click_stats", {
+        accountId,
+      }, accepts, (message) => {
+        setStatsConfigurationError({accountId, message});
+        setError("");
+      });
+      if (prepared && accepts()) setStatsPlanAccountId(accountId);
+    });
   }
   async function apply() {
     if (plan && isDomainPlan && !isCurrentPlan(plan)) {
@@ -598,17 +636,31 @@ export default function App() {
             ? "云端升级已核对，待处理记录已完成。请留意账户中的检测密钥恢复提示。"
           : appliedKind === "upgrade_worker"
             ? "云端升级结果已核对。请留意账户中的检测密钥恢复提示。"
+          : appliedKind === "enable_click_stats"
+            ? "点击统计已启用。之后的访问会逐步显示在统计中，访客仍然直接跳转。"
+          : appliedKind === "disable_click_stats"
+            ? "点击统计已停用。跳转保持不变，已有统计按服务保留期处理。"
           : appliedKind === "add_domain"
             ? "域名已接入。现在可以创建第一条短链接；云端配置可能需要稍等片刻才生效。"
             : appliedKind === "fix_domain_dns"
               ? "解析设置已提交，正在继续检查域名。"
               : "已提交修改。云端更新可能需要一点时间生效。",
         undefined,
-        appliedKind === "save_pool" || (appliedKind === "migrate_credentials" && page === "pools") ? setPoolError : undefined,
+        appliedKind === "enable_click_stats" || appliedKind === "disable_click_stats"
+          ? (message) => {
+              if (statsPlanAccountId) setStatsConfigurationError({accountId: statsPlanAccountId, message});
+              setError("");
+            }
+          : appliedKind === "save_pool" || (appliedKind === "migrate_credentials" && page === "pools") ? setPoolError : undefined,
       );
       if (next) {
         stateRef.current = next;
         setState(next);
+        if (["enable_click_stats", "disable_click_stats", "resume_worker_upgrade"].includes(appliedKind)) {
+          setStatsRevision((n) => n + 1);
+          setStatsConfigurationError(null);
+          setStatsPlanAccountId("");
+        }
         if (appliedKind === "add_domain") {
           setDomainSuccessId(next.domains.find((domain) => domain.host === addedHost)?.id || "");
         }
@@ -1823,6 +1875,8 @@ export default function App() {
   const title =
     page === "links"
       ? "短链接"
+      : page === "stats"
+        ? "统计中心"
       : page === "pools"
         ? "平台地址"
         : page === "domains"
@@ -1831,6 +1885,8 @@ export default function App() {
   const subtitle =
     page === "links"
       ? "查看、检测和编辑不同地区的跳转地址。"
+      : page === "stats"
+        ? "按账户和域名范围集中查看估算访问次数。"
       : page === "pools"
         ? "集中维护地址；关联链接各自保留邀请码。"
         : page === "domains"
@@ -2145,6 +2201,23 @@ export default function App() {
                 }
               />
             </section>
+          ) : page === "stats" ? (
+            <StatsCenter
+              accounts={state.accounts}
+              domains={state.domains}
+              links={state.links}
+              revision={statsRevision}
+              busy={busy}
+              configurationError={statsConfigurationError}
+              onConfigure={(account, enabled) => void configureClickStats(account.id, enabled)}
+              onScopeInvalidate={() => {
+                statsPrepareSequence.current++;
+              }}
+              onOpenLinkStats={(link, domain) => {
+                statsPrepareSequence.current++;
+                setStatsTarget({link, domain});
+              }}
+            />
           ) : page === "links" ? (
             <>
               <div className="metric-row">
@@ -2256,6 +2329,11 @@ export default function App() {
                     }}
                     onCopy={(url) => void copy(url)}
                     onCheck={(link, domain) => void selftest(link, domain)}
+                    onStats={(link, domain) => {
+                      statsPrepareSequence.current++;
+                      setStatsConfigurationError(null);
+                      setStatsTarget({link, domain});
+                    }}
                     onEdit={openLink}
                     onDelete={(link, domain) => void prepare("delete_link", {
                       domainId: domain.id,
@@ -3093,6 +3171,19 @@ export default function App() {
           </form>
         </Dialog>
       )}
+      {statsTarget && !plan && (
+        <ClickStatsDialog
+          key={`${statsTarget.domain.id}:${statsTarget.link.slug}`}
+          link={statsTarget.link}
+          domain={statsTarget.domain}
+          account={state.accounts.find((account) => account.id === statsTarget.domain.accountId)}
+          onClose={closeStats}
+          onConfigure={(enabled) => void configureClickStats(statsTarget.domain.accountId, enabled, statsTarget)}
+          revision={statsRevision}
+          busy={busy}
+          configurationError={statsConfigurationError?.accountId === statsTarget.domain.accountId ? statsConfigurationError.message : undefined}
+        />
+      )}
       {plan && (
         <Dialog
           title={plan.title}
@@ -3231,6 +3322,7 @@ export default function App() {
                 <div className="token-step-content">
                   <strong>在 Cloudflare 准备令牌</strong>
                   <p className="form-note">先在浏览器登录要连接的 Cloudflare 账户，再创建 API 令牌。</p>
+                  <p className="form-note">模板已包含统计中心需要的“账户分析 → 读取”权限；访问统计仍由你选择是否启用。</p>
                   <button
                     className="button bordered opener"
                     type="button"

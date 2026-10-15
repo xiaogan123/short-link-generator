@@ -1,0 +1,49 @@
+.cstats-shell { display: grid; gap: 17px; }
+.cstats-preview { border: 1px solid #e7d7a9; background: #fbf4df; color: #725e27; border-radius: 7px; padding: 9px 11px; font-size: 11px; line-height: 1.5; }
+.cstats-preview strong { display: inline-block; margin-right: 7px; font-size: 9px; letter-spacing: .12em; text-transform: uppercase; }
+.cstats-toolbar { display: flex; align-items: flex-end; justify-content: space-between; gap: 18px; }
+.cstats-identity { min-width: 0; display: grid; gap: 5px; }
+.cstats-identity strong { color: #22382c; font-size: 12px; overflow-wrap: anywhere; }
+.cstats-identity span { color: #89978d; font-size: 10px; }
+.cstats-controls { display: flex; align-items: flex-end; gap: 8px; flex: 0 0 auto; }
+.cstats-controls label { display: grid; gap: 5px; color: #64766b; font-size: 9px; font-weight: 750; }
+.cstats-controls select { height: 37px; min-width: 116px; border: 1px solid #d7ded5; border-radius: 7px; background: #fff; color: #314b3b; padding: 0 28px 0 10px; font-size: 11px; }
+.cstats-controls .button { height: 37px; min-height: 37px; }
+.cstats-loading { display: grid; place-items: center; min-height: 184px; border: 1px dashed #d8dfd6; border-radius: 10px; background: #fafbf7; color: #718078; font-size: 12px; }
+.cstats-notice { border: 1px solid #dfe5dc; background: #f7f9f5; color: #566b5d; border-radius: 9px; padding: 16px 17px; font-size: 11px; line-height: 1.65; }
+.cstats-notice > strong { display: block; color: #2e4838; font-size: 12px; margin-bottom: 5px; }
+.cstats-notice p { margin: 0 0 7px; }
+.cstats-notice p:last-child { margin-bottom: 0; }
+.cstats-notice-warning { border-color: #eadab7; background: #fbf5e8; color: #7a6335; }
+.cstats-notice-warning > strong { color: #765822; }
+.cstats-notice-error { border-color: #e9cbc4; background: #faece8; color: #873a30; }
+.cstats-notice-error > strong { color: #7b3028; }
+.cstats-token-button { margin-top: 5px; background: #fffefb; }
+.cstats-total { border-radius: 11px; border: 1px solid #d8e3d8; background: linear-gradient(135deg, #f1f7ef, #fbfcf7); min-height: 133px; padding: 20px 22px; display: grid; align-content: center; }
+.cstats-total > span { color: #557062; font-size: 11px; font-weight: 750; }
+.cstats-total > strong { color: #153c2e; font: 700 38px/1.1 Georgia, "Songti SC", serif; margin-top: 10px; }
+.cstats-total > small { color: #8a9a90; font-size: 10px; margin-top: 5px; }
+.cstats-breakdown { display: grid; grid-template-columns: repeat(3, 1fr); border: 1px solid #e0e5dd; border-radius: 9px; background: #fff; overflow: hidden; }
+.cstats-breakdown > div { padding: 15px 16px; display: grid; gap: 8px; border-left: 1px solid #e8ebe5; }
+.cstats-breakdown > div:first-child { border-left: 0; }
+.cstats-breakdown span { color: #6d7e73; font-size: 10px; }
+.cstats-breakdown strong { color: #263e30; font: 700 21px/1.1 Georgia, "Songti SC", serif; }
+.cstats-secondary { display: flex; align-items: center; gap: 17px; border-radius: 7px; background: #f4f6f1; padding: 10px 12px; color: #6c7c72; font-size: 10px; }
+.cstats-secondary strong { color: #40594a; }
+.cstats-secondary small { margin-left: auto; color: #929e95; }
+.cstats-message, .cstats-updated, .cstats-scope { margin: 0; color: #7e8e84; font-size: 10px; line-height: 1.55; }
+.cstats-updated { text-align: right; margin-top: -8px; }
+.cstats-scope { border-left: 3px solid #90b29d; background: #f2f6f0; padding: 9px 11px; color: #526b5b; }
+.cstats-config-error { border: 1px solid #e9c9c2; background: #f9e9e5; color: #8b3428; border-radius: 6px; padding: 10px 11px; font-size: 11px; line-height: 1.5; }
+.cstats-explainer { border-top: 1px solid #e9ede6; padding-top: 14px; color: #829087; }
+.cstats-explainer strong { display: block; margin-bottom: 5px; color: #536a5b; font-size: 10px; }
+.cstats-explainer p { margin: 0; font-size: 10px; line-height: 1.65; }
+@media (max-width: 620px) {
+  .cstats-toolbar { align-items: stretch; flex-direction: column; }
+  .cstats-controls { justify-content: space-between; }
+  .cstats-controls label { flex: 1; }
+  .cstats-controls select { width: 100%; }
+  .cstats-breakdown > div { padding-inline: 11px; }
+  .cstats-secondary { align-items: flex-start; flex-wrap: wrap; }
+  .cstats-secondary small { flex-basis: 100%; margin-left: 0; }
+}
