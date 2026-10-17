@@ -47,6 +47,38 @@
 .scenter-distribution-list small { color: #87958c; font-size: 10px; text-align: right; }
 .scenter-dot { width: 7px; height: 7px; border-radius: 2px; }
 
+.scenter-overview-status { display: flex; justify-content: space-between; gap: 10px; color: #526b5b; font-size: 11px; font-weight: 700; }
+.scenter-overview-status span { color: #87958c; font-weight: 500; }
+.scenter-overview-summary { display: grid; grid-template-columns: minmax(170px, .75fr) minmax(0, 1.7fr); overflow: hidden; border: 1px solid #dfe5dd; border-radius: 9px; background: #fff; }
+.scenter-overview-grand { display: grid; gap: 4px; align-content: center; padding: 16px 18px; background: #f4f8f1; }
+.scenter-overview-grand span { color: #597064; font-size: 11px; font-weight: 700; }
+.scenter-overview-grand strong { color: #153c2e; font: 700 29px/1.1 Georgia, "Songti SC", serif; }
+.scenter-overview-grand small { color: #87968c; font-size: 10px; }
+.scenter-overview-summary dl { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); align-items: center; gap: 5px; margin: 0; padding: 12px; }
+.scenter-overview-summary dl > div { display: grid; gap: 5px; min-width: 0; padding: 7px; }
+.scenter-overview-summary dt { color: #74877a; font-size: 10px; }
+.scenter-overview-summary dd { overflow: hidden; margin: 0; color: #2b4335; font-size: 14px; font-weight: 700; text-overflow: ellipsis; }
+.scenter-overview-note { margin: 0; color: #788b7d; font-size: 10px; line-height: 1.6; }
+.scenter-overview-table { width: 100%; min-width: 940px; border-collapse: collapse; background: #fff; }
+.scenter-overview-table thead { display: table-header-group; }
+.scenter-overview-table tbody { display: table-row-group; }
+.scenter-overview-table tbody tr { display: table-row; padding: 0; }
+.scenter-overview-table th, .scenter-overview-table td { padding: 9px 7px; border-bottom: 1px solid #edf0e9; color: #63776a; font-size: 10px; text-align: right; vertical-align: top; }
+.scenter-overview-table th, .scenter-overview-table td { display: table-cell; grid-column: auto; grid-row: auto; }
+.scenter-overview-table th { background: #fafbf8; color: #718279; font-weight: 700; white-space: nowrap; }
+.scenter-overview-table th:nth-child(1) { width: 17%; }
+.scenter-overview-table th:nth-child(2) { width: 10%; }
+.scenter-overview-table th:nth-child(3), .scenter-overview-table th:nth-child(4), .scenter-overview-table th:nth-child(5) { width: 9%; }
+.scenter-overview-table th:nth-child(6) { width: 12%; }
+.scenter-overview-table th:nth-child(7) { width: 25%; }
+.scenter-overview-table th:nth-child(8) { width: 9%; }
+.scenter-overview-table th:first-child, .scenter-overview-table td:first-child, .scenter-overview-table th:nth-child(7), .scenter-overview-table td:nth-child(7) { text-align: left; }
+.scenter-overview-table td:first-child strong { display: block; color: #304c3a; overflow-wrap: anywhere; }
+.scenter-overview-table td:nth-child(7) small { display: block; margin-top: 3px; color: #87958d; line-height: 1.4; overflow-wrap: anywhere; }
+.scenter-overview-table .button { min-height: 26px; padding: 3px 6px; white-space: nowrap; }
+.scenter-account-status { color: #946b30; font-weight: 700; white-space: nowrap; }
+.scenter-account-status.is-ready { color: #22845c; }
+
 .scenter-context { overflow: hidden; border: 1px solid #e2e7df; border-radius: 8px; background: #fbfcf9; }
 .scenter-context summary { display: grid; grid-template-columns: max-content minmax(0, 1fr) auto; align-items: center; gap: 10px; min-height: 38px; padding: 8px 11px; color: #52685b; font-size: 11px; font-weight: 700; list-style: none; cursor: pointer; }
 .scenter-context summary::-webkit-details-marker { display: none; }
@@ -103,6 +135,8 @@
 @media (max-width: 720px) {
   .scenter-overview { grid-template-columns: 1fr; }
   .scenter-total { min-height: 108px; border-right: 0; border-bottom: 1px solid #e6ebe4; }
+  .scenter-overview-summary { grid-template-columns: 1fr; }
+  .scenter-overview-summary dl { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 }
 @media (max-width: 620px) {
   .scenter-head, .scenter-controls, .scenter-body { padding-inline: 14px; }

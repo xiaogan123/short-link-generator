@@ -24,6 +24,12 @@ type ViewState =
   | { kind: "report"; report: StatsCenterReport }
   | { kind: "error"; message: string };
 
+type OverviewEntry =
+  | { kind: "report"; report: StatsCenterReport }
+  | { kind: "migration" }
+  | { kind: "error"; message: string };
+type OverviewState = { kind: "idle" | "loading" | "complete"; entries: Record<string, OverviewEntry>; completed: number; identity?: string };
+
 type Props = {
   accounts: Account[];
   domains: Domain[];
@@ -42,6 +48,35 @@ function validTotals(totals: unknown): totals is ClickStatsTotals {
   const numbers = [value.total, value.likelyHuman, value.likelyBot, value.unknown, value.previews, value.prefetches];
   return numbers.every((number) => Number.isSafeInteger(number) && number >= 0)
     && value.total === value.likelyHuman + value.likelyBot + value.unknown;
+}
+
+function addTotals(values: ClickStatsTotals[]): ClickStatsTotals | null {
+  const result: ClickStatsTotals = { total: 0, likelyHuman: 0, likelyBot: 0, unknown: 0, previews: 0, prefetches: 0 };
+  for (const value of values) {
+    for (const key of Object.keys(result) as (keyof ClickStatsTotals)[]) {
+      const next = result[key] + value[key];
+      if (!Number.isSafeInteger(next)) return null;
+      result[key] = next;
+    }
+  }
+  return validTotals(result) ? result : null;
+}
+
+function validOverviewScope(accounts: Account[], domains: Domain[], links: Link[]) {
+  const accountIds = new Set(accounts.map((account) => account.id));
+  if (accountIds.size !== accounts.length || accounts.some((account) => !account.id)) return false;
+  const domainIds = new Set<string>();
+  for (const domain of domains) {
+    if (!domain.id || !accountIds.has(domain.accountId) || domainIds.has(domain.id)) return false;
+    domainIds.add(domain.id);
+  }
+  const linkKeys = new Set<string>();
+  for (const link of links) {
+    const key = `${link.domainId}\u0000${link.slug}`;
+    if (!domainIds.has(link.domainId) || !link.slug || linkKeys.has(key)) return false;
+    linkKeys.add(key);
+  }
+  return true;
 }
 
 function validReport(
@@ -146,6 +181,7 @@ export default function StatsCenter({
   const [days, setDays] = useState<ClickStatsDays>(7);
   const [page, setPage] = useState(1);
   const [view, setView] = useState<ViewState>({ kind: "idle" });
+  const [overview, setOverview] = useState<OverviewState>({ kind: "idle", entries: {}, completed: 0 });
   const [knownTotalLinks, setKnownTotalLinks] = useState<number | null>(null);
   const [openerError, setOpenerError] = useState("");
   const requestSequence = useRef(0);
@@ -163,7 +199,7 @@ export default function StatsCenter({
   const effectiveDomainId = currentDomain?.id || "";
   const dataIdentity = useMemo(() => JSON.stringify([
     revision,
-    accounts.map((account) => [account.id, Boolean(account.needsCredentialMigration)]),
+    accounts.map((account) => [account.id, account.label, Boolean(account.needsCredentialMigration)]),
     domains.map((domain) => [domain.id, domain.accountId, domain.host, domain.prefix]),
     links.map((link) => [link.domainId, link.slug]),
   ]), [accounts, domains, links, revision]);
@@ -173,6 +209,7 @@ export default function StatsCenter({
   function invalidate(clearCount = true) {
     requestSequence.current += 1;
     setView({ kind: "idle" });
+    setOverview({ kind: "idle", entries: {}, completed: 0 });
     setOpenerError("");
     if (clearCount) setKnownTotalLinks(null);
   }
@@ -189,6 +226,7 @@ export default function StatsCenter({
   useEffect(() => {
     requestSequence.current += 1;
     setView({ kind: "idle" });
+    setOverview({ kind: "idle", entries: {}, completed: 0 });
     setKnownTotalLinks(null);
     setPage(1);
     if (accountId && !accounts.some((account) => account.id === accountId)) {
@@ -200,11 +238,17 @@ export default function StatsCenter({
   }, [dataIdentity]);
 
   const chooseAccount = (nextAccountId: string) => {
+    const cached = !currentAccount && overview.identity === dataIdentity
+      ? overview.entries[nextAccountId] : undefined;
     onScopeInvalidate?.();
     invalidate();
     setAccountId(nextAccountId);
     setDomainId("");
     setPage(1);
+    if (cached?.kind === "report" && cached.report.domainId === null && cached.report.days === days && cached.report.page === 1) {
+      setKnownTotalLinks(cached.report.totalLinks);
+      setView({ kind: "report", report: cached.report });
+    }
   };
   const chooseDomain = (nextDomainId: string) => {
     onScopeInvalidate?.();
@@ -253,6 +297,44 @@ export default function StatsCenter({
       setKnownTotalLinks(null);
       setView({ kind: "error", message: errorMessage(error) });
     }
+  };
+
+  const loadAll = async () => {
+    const sequence = ++requestSequence.current;
+    const requestDataIdentity = dataIdentity;
+    const current = () => mounted.current && sequence === requestSequence.current
+      && requestDataIdentity === latestDataIdentity.current;
+    setOverview({ kind: "loading", entries: {}, completed: 0, identity: requestDataIdentity });
+    setOpenerError("");
+    if (!validOverviewScope(accounts, domains, links)) {
+      setOverview({ kind: "complete", entries: { "": { kind: "error", message: "本机账户、域名或链接身份重复或归属不明，已停止读取。" } }, completed: 0, identity: requestDataIdentity });
+      return;
+    }
+    const entries: Record<string, OverviewEntry> = {};
+    for (const account of accounts) {
+      if (!current()) return;
+      let entry: OverviewEntry;
+      if (account.needsCredentialMigration) {
+        entry = { kind: "migration" };
+      } else {
+        const expected = { accountId: account.id, domainId: null, days, page: 1 };
+        try {
+          const report = await dispatch<StatsCenterReport>("get_stats_center", {
+            accountId: account.id, days, page: 1, pageSize: PAGE_SIZE,
+          });
+          if (!current()) return;
+          entry = validReport(report, expected, domains, links)
+            ? { kind: "report", report }
+            : { kind: "error", message: "返回的统计结果与当前账户或范围不一致。" };
+        } catch (error) {
+          if (!current()) return;
+          entry = { kind: "error", message: errorMessage(error) };
+        }
+      }
+      entries[account.id] = entry;
+      setOverview({ kind: "loading", entries: { ...entries }, completed: Object.keys(entries).length, identity: requestDataIdentity });
+    }
+    if (current()) setOverview({ kind: "complete", entries: { ...entries }, completed: accounts.length, identity: requestDataIdentity });
   };
 
   const openTokenSettings = async () => {
@@ -318,17 +400,17 @@ export default function StatsCenter({
 
   const body = (() => {
     if (accounts.length === 0) return <Notice title="还没有可查询的账户" tone="warning">请先导入一个 Cloudflare 账户，再从这里读取访问统计。</Notice>;
-    if (!currentAccount) return <Notice title="先选择一个账户">统计中心不会自动读取所有账户。选择账户、域名范围和时间后，再点击“读取统计”。</Notice>;
+    if (!currentAccount) return <AccountsOverview accounts={accounts} domains={domains} links={links} days={days} overview={overview} onSelect={chooseAccount} />;
     if (currentAccount.needsCredentialMigration) return <Notice title="需要先更新本机授权" tone="warning">请先到“Cloudflare 账户”完成此账户的本机授权迁移，再读取或配置访问统计。</Notice>;
     if (view.kind === "loading") return <div className="scenter-loading" role="status">正在读取所选账户的第 {page} 页统计…</div>;
     if (view.kind === "error") return <Notice title="统计读取失败" tone="error">{view.message || "操作未完成，请重试。"}</Notice>;
     if (!report) return <Notice title="等待读取">筛选变化会隐藏上一范围的数据。确认范围后点击“读取统计”，不会自动查询其他账户。</Notice>;
     if (report.status === "disabled") return (
-      <Notice title="此账户尚未启用访问统计" tone="warning">
-        <p>{report.message || "启用后才能读取访问统计。"}</p>
-        <p>启用后开始记录，没有历史回填；访客仍会直接跳转。</p>
-        <p>首次启用前，请确认原有 API 令牌包含“账户 → 账户分析 → 读取”（AccountAnalyticsRead）权限。</p>
-        <p>首次使用还需在 Cloudflare 对应账户开通 Analytics Engine；本应用不会自动开通账户服务。</p>
+      <Notice title="此账户的统计采集尚未开启" tone="warning">
+        <p>统计采集尚未开启，添加读取权限不会自动启用采集。</p>
+        {report.message && <p>{report.message}</p>}
+        <p>首次启用需要：原令牌有“账户 → 账户分析 → 读取”（AccountAnalyticsRead）权限；Cloudflare Analytics Engine 已开通。已有配置无需重复操作。</p>
+        <p>启用后开始记录，没有历史回填；访客仍会直接跳转。本应用不会自动开通账户服务。</p>
         <div className="scenter-notice-actions">
           <button type="button" className="button bordered" onClick={() => void openTokenSettings()}><ArrowSquareOut size={14} aria-hidden="true" />打开 API 令牌管理</button>
           <button type="button" className="button bordered" onClick={() => void openAnalyticsEngineSettings()}><ArrowSquareOut size={14} aria-hidden="true" />打开 Analytics Engine</button>
@@ -402,14 +484,14 @@ export default function StatsCenter({
       <div className="scenter-head">
         <div>
           <h2>访问统计</h2>
-          <p>按一个账户读取估算请求次数；不会增加访客验证。</p>
+          <p>按账户读取估算请求次数；不会增加访客验证。</p>
         </div>
         {preview && <span className="scenter-preview">本地示例</span>}
       </div>
       <div className="scenter-controls">
         <label>账户
           <select aria-label="统计账户" value={currentAccount?.id || ""} onChange={(event) => chooseAccount(event.target.value)}>
-            <option value="">请选择账户</option>
+            <option value="">全部账户</option>
             {accounts.map((account) => <option key={account.id} value={account.id}>{account.label}</option>)}
           </select>
         </label>
@@ -424,8 +506,8 @@ export default function StatsCenter({
             {ranges.map((range) => <option key={range.value} value={range.value}>{range.label}</option>)}
           </select>
         </label>
-        <button type="button" className="button primary scenter-read" disabled={!currentAccount || Boolean(currentAccount.needsCredentialMigration) || view.kind === "loading"} onClick={() => void load(1)}>
-          <ArrowClockwise size={15} aria-hidden="true" />{view.kind === "loading" ? "正在读取…" : report ? "刷新统计" : "读取统计"}
+        <button type="button" className="button primary scenter-read" disabled={accounts.length === 0 || Boolean(currentAccount?.needsCredentialMigration) || (currentAccount ? view.kind === "loading" : overview.kind === "loading")} onClick={() => void (currentAccount ? load(1) : loadAll())}>
+          <ArrowClockwise size={15} aria-hidden="true" />{(currentAccount ? view.kind === "loading" : overview.kind === "loading") ? "正在读取…" : (currentAccount ? Boolean(report) : overview.kind === "complete") ? "刷新统计" : "读取统计"}
         </button>
       </div>
       {visibleConfigurationError && (
@@ -484,6 +566,65 @@ export default function StatsCenter({
       )}
     </section>
   );
+}
+
+function AccountsOverview({ accounts, domains, links, days, overview, onSelect }: {
+  accounts: Account[];
+  domains: Domain[];
+  links: Link[];
+  days: ClickStatsDays;
+  overview: OverviewState;
+  onSelect: (accountId: string) => void;
+}) {
+  if (overview.kind === "idle") return <Notice title="全部账户">选择时间范围后点击“读取统计”，将依次读取各账户汇总。可选择账户查看链接明细。</Notice>;
+  if (overview.entries[""]?.kind === "error") return <Notice title="无法读取总览" tone="error">{overview.entries[""].message}</Notice>;
+  const ready = accounts.flatMap((account) => {
+    const entry = overview.entries[account.id];
+    return entry?.kind === "report" && entry.report.status === "ready" && entry.report.totals ? [entry.report.totals] : [];
+  });
+  const aggregate = addTotals(ready);
+  const range = ranges.find((item) => item.value === days)?.label;
+  return <>
+    <div className="scenter-overview-status" role="status">
+      已处理 {overview.completed} / {accounts.length} 个账户 · 可汇总 {ready.length} 个
+      {overview.kind === "loading" && <span>正在依次读取…</span>}
+    </div>
+    {ready.length > 0 && aggregate && <section className="scenter-overview-summary" aria-label="全部账户估算汇总">
+      <div className="scenter-overview-grand"><span>估算总访问</span><strong>{number(aggregate.total)}</strong><small>{range} · 仅已读且可汇总账户</small></div>
+      <dl>
+        <div><dt>疑似真人</dt><dd>{number(aggregate.likelyHuman)}</dd></div>
+        <div><dt>疑似机器人</dt><dd>{number(aggregate.likelyBot)}</dd></div>
+        <div><dt>未知</dt><dd>{number(aggregate.unknown)}</dd></div>
+        <div><dt>预览</dt><dd>{number(aggregate.previews)}</dd></div>
+        <div><dt>预加载</dt><dd>{number(aggregate.prefetches)}</dd></div>
+      </dl>
+    </section>}
+    {ready.length > 0 && !aggregate && <Notice title="汇总数值超出安全范围" tone="error">已停止显示跨账户汇总；各账户结果仍可查看。</Notice>}
+    <p className="scenter-overview-note">只汇总状态为“可汇总”的已读账户；其他状态及尚未读取的账户不按零计算。汇总覆盖各账户已导入域名的历史事件，包括已删除链接；链接数量仅为当前本机数据。</p>
+    <div className="scenter-table-scroll"><table className="scenter-overview-table" aria-label="账户统计总览">
+      <thead><tr><th>账户</th><th>总访问</th><th>疑似真人</th><th>疑似机器人</th><th>未知</th><th>本机域名 / 链接</th><th>状态</th><th>操作</th></tr></thead>
+      <tbody>{accounts.map((account) => {
+        const entry = overview.entries[account.id];
+        const status = entry?.kind === "migration" ? "需迁移授权"
+          : entry?.kind === "error" ? "读取失败"
+            : entry?.kind === "report" ? ({ ready: "可汇总", disabled: "未启用", no_data: "无可汇总数据", permission_denied: "权限不足", unavailable: "暂不可用" }[entry.report.status])
+              : "未读取";
+        const totals = entry?.kind === "report" && entry.report.status === "ready" ? entry.report.totals : undefined;
+        const domainIds = new Set(domains.filter((domain) => domain.accountId === account.id).map((domain) => domain.id));
+        const linkCount = links.filter((link) => domainIds.has(link.domainId)).length;
+        return <tr key={account.id}>
+          <td><strong>{account.label}</strong></td>
+          <td>{totals ? number(totals.total) : "—"}</td>
+          <td>{totals ? number(totals.likelyHuman) : "—"}</td>
+          <td>{totals ? number(totals.likelyBot) : "—"}</td>
+          <td>{totals ? number(totals.unknown) : "—"}</td>
+          <td>{number(domainIds.size)} / {number(linkCount)}</td>
+          <td><span className={`scenter-account-status ${totals ? "is-ready" : ""}`}>{status}</span>{entry?.kind === "error" && <small>{entry.message}</small>}{entry?.kind === "report" && entry.report.status !== "ready" && entry.report.message && <small>{entry.report.message}</small>}</td>
+          <td><button type="button" className="button ghost" onClick={() => onSelect(account.id)}>查看链接</button></td>
+        </tr>;
+      })}</tbody>
+    </table></div>
+  </>;
 }
 
 function StatsTable({ report, domains, links, onOpenLinkStats }: {
