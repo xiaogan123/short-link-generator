@@ -25,7 +25,7 @@ it('keeps banner language aligned with unresolved rows and does not imply an ale
 it('shows the schedule and network limit, and keeps manual run gated',()=>{
   const onEnabled=vi.fn(),onRun=vi.fn();
   const {rerender}=render(<RedirectMonitor enabled={false} active={false} online={true} progress={{done:0,total:0}} lastCompletion={null} onEnabled={onEnabled} onRun={onRun} disabled={false}/>);
-  expect(screen.getByText(/每 30 分钟/)).toBeTruthy();
+  expect(screen.getByText(/每 48 小时/)).toBeTruthy();
   expect(screen.getByText(/不代表大陆网络或目标网站可达/)).toBeTruthy();
   expect(screen.getByRole('button',{name:/立即巡检/}).hasAttribute('disabled')).toBe(true);
   fireEvent.click(screen.getByRole('checkbox'));

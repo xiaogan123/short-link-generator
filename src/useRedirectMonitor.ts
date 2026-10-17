@@ -2,11 +2,12 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { dispatch, preview } from './bridge';
 import type { Link, RedirectCheck, State } from './types';
 
-export const MONITOR_INTERVAL_MS = 30 * 60_000;
+export const MONITOR_INTERVAL_MS = 48 * 60 * 60_000;
 export const CONFIRM_DELAY_MS = 60_000;
-export const STALE_AFTER_MS = 65 * 60_000;
+export const STALE_AFTER_MS = MONITOR_INTERVAL_MS + 5 * 60_000;
 const SPACING_MS = 250;
 const preferenceKey = preview ? 'redirect-monitor-preview-enabled' : 'redirect-monitor-enabled';
+const completionKey = `${preferenceKey}-completed-at`;
 
 type Phase = 'healthy' | 'pending' | 'alert' | 'attention';
 export type MonitorRecord = { identity:string; phase:Phase; checkedAt:string; message:string; dnsMode:'system'|'public'; failures:number; unresolvedAlert:boolean };
@@ -27,6 +28,20 @@ export function monitorIdentity(link:Link, state:State):string {
 }
 function readPreference():boolean { try { return window.localStorage.getItem(preferenceKey) === 'true'; } catch { return false; } }
 function writePreference(value:boolean) { try { window.localStorage.setItem(preferenceKey, String(value)); } catch { /* Private or unavailable storage: session choice still works. */ } }
+// Persist only a completion timestamp, never link identities, URLs or reports.
+function readCompletion():string|null {
+  try {
+    const value = window.localStorage.getItem(completionKey);
+    const time = value ? Date.parse(value) : NaN;
+    return Number.isFinite(time) && time <= Date.now() ? new Date(time).toISOString() : null;
+  } catch { return null; }
+}
+function writeCompletion(value:string|null) {
+  try {
+    if (value === null) window.localStorage.removeItem(completionKey);
+    else window.localStorage.setItem(completionKey,value);
+  } catch { /* Scheduling still works for this session when storage is unavailable. */ }
+}
 function validReport(value:unknown):value is RedirectCheck {
   if (!value || typeof value !== 'object') return false;
   const item = value as Partial<RedirectCheck>;
@@ -41,7 +56,7 @@ export function useRedirectMonitor({state,paused,ready,check = defaultCheck}:Opt
   const [records,setRecords] = useState<Record<string,MonitorRecord>>({});
   const [active,setActive] = useState(false);
   const [progress,setProgress] = useState({done:0,total:0});
-  const [lastCompletion,setLastCompletion] = useState<string|null>(null);
+  const [lastCompletion,setLastCompletion] = useState<string|null>(readCompletion);
   const [now,setNow] = useState(Date.now());
   const stateRef = useRef(state);
   const checkRef = useRef(check);
@@ -49,7 +64,7 @@ export function useRedirectMonitor({state,paused,ready,check = defaultCheck}:Opt
   const recordsRef = useRef(records);
   const mounted = useRef(true);
   const running = useRef(false);
-  const dueAt = useRef(0);
+  const dueAt = useRef(lastCompletion ? Date.parse(lastCompletion) + MONITOR_INTERVAL_MS : 0);
   const revision = useRef(0);
   const requestSequence = useRef<Record<string,number>>({});
   const busyRetries = useRef<Record<string,number>>({});
@@ -79,10 +94,10 @@ export function useRedirectMonitor({state,paused,ready,check = defaultCheck}:Opt
     confirmations.current.delete(key);
   };
 
-  const checkOne = async (key:string, expectedIdentity:string, confirm:boolean):Promise<void> => {
-    if (!canStart() || currentIdentity(key) !== expectedIdentity) return;
+  const checkOne = async (key:string, expectedIdentity:string, confirm:boolean):Promise<boolean> => {
+    if (!canStart() || currentIdentity(key) !== expectedIdentity) return false;
     const link = stateRef.current.links.find(item => monitorKey(item) === key);
-    if (!link) return;
+    if (!link) return false;
     const domain = stateRef.current.domains.find(item => item.id === link.domainId);
     const seq = (requestSequence.current[key] || 0) + 1;
     requestSequence.current[key] = seq;
@@ -93,8 +108,9 @@ export function useRedirectMonitor({state,paused,ready,check = defaultCheck}:Opt
       try { result = await checkRef.current(link.domainId,link.slug); }
       catch (error) { result = {status:'unknown',message:error instanceof Error ? error.message : '巡检暂时无法完成。',reason:'request_failed',checkedAt:new Date().toISOString(),dnsMode:'system'}; }
     }
-    if (!mounted.current || !gateRef.current.enabled || revision.current !== runRevision || requestSequence.current[key] !== seq || currentIdentity(key) !== expectedIdentity) return;
+    if (!mounted.current || !gateRef.current.enabled || revision.current !== runRevision || requestSequence.current[key] !== seq || currentIdentity(key) !== expectedIdentity) return false;
     if (!validReport(result)) result = {status:'unknown',message:'巡检返回内容无效。',reason:'invalid_report',checkedAt:new Date().toISOString(),dnsMode:'system'};
+    if (result.status !== 'passed') writeCompletion(null);
     if (result.reason === 'busy') {
       clearConfirmation(key);
       if ((busyRetries.current[key] || 0) < 1) {
@@ -103,7 +119,7 @@ export function useRedirectMonitor({state,paused,ready,check = defaultCheck}:Opt
         confirmations.current.set(key,{identity:expectedIdentity,due});
         confirmationTimers.current.set(key,window.setTimeout(() => { confirmationTimers.current.delete(key); void drainRef.current(); },CONFIRM_DELAY_MS));
       }
-      return;
+      return false;
     }
     busyRetries.current[key] = 0;
     const previous = recordsRef.current[key];
@@ -128,6 +144,7 @@ export function useRedirectMonitor({state,paused,ready,check = defaultCheck}:Opt
       confirmations.current.set(key,{identity:expectedIdentity,due});
       confirmationTimers.current.set(key,window.setTimeout(() => { confirmationTimers.current.delete(key); void drainRef.current(); },CONFIRM_DELAY_MS));
     }
+    return result.status === 'passed';
   };
 
   const drainRef = useRef<() => Promise<void>>(async () => {});
@@ -147,21 +164,35 @@ export function useRedirectMonitor({state,paused,ready,check = defaultCheck}:Opt
       await runDueConfirmations();
       if (canStart() && dueAt.current <= Date.now()) {
         dueAt.current = Date.now() + MONITOR_INTERVAL_MS;
+        writeCompletion(null);
         busyRetries.current = {};
         const cycleRevision = revision.current;
         const items = stateRef.current.links.map(link => [monitorKey(link),monitorIdentity(link,stateRef.current)] as const);
         setProgress({done:0,total:items.length});
         let done = 0;
+        let allPassed = items.length > 0;
         for (const [key,identity] of items) {
           if (!canStart() || revision.current !== cycleRevision) { dueAt.current = 0; break; }
           await runDueConfirmations();
           if (!canStart() || revision.current !== cycleRevision) { dueAt.current = 0; break; }
-          await checkOne(key,identity,false);
+          const passed = await checkOne(key,identity,false);
+          allPassed = allPassed && passed;
+          if (!canStart() || revision.current !== cycleRevision) { dueAt.current = 0; break; }
           done++;
           if (mounted.current) setProgress({done,total:items.length});
           if (done < items.length) await new Promise<void>(resolve => window.setTimeout(resolve,SPACING_MS));
         }
-        if (done === items.length && mounted.current) setLastCompletion(new Date().toISOString());
+        if (done === items.length && canStart() && revision.current === cycleRevision) {
+          const completedAt = new Date().toISOString();
+          setLastCompletion(completedAt);
+          dueAt.current = Date.now() + MONITOR_INTERVAL_MS;
+          // Interrupted or unresolved cycles must be rechecked after restarting.
+          const allHealthy = allPassed && confirmations.current.size === 0 && items.every(([key,identity]) => {
+            const record = recordsRef.current[key];
+            return currentIdentity(key) === identity && record?.identity === identity && record.phase === 'healthy';
+          });
+          writeCompletion(allHealthy ? completedAt : null);
+        }
       }
     } finally {
       running.current = false;
@@ -173,6 +204,7 @@ export function useRedirectMonitor({state,paused,ready,check = defaultCheck}:Opt
   const setEnabled = useCallback((value:boolean) => {
     writePreference(value);
     if (!value) {
+      writeCompletion(null);
       revision.current++;
       for (const key of [...confirmations.current.keys()]) clearConfirmation(key);
       dueAt.current = 0;

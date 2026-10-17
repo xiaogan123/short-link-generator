@@ -1,6 +1,6 @@
 import {act,cleanup,renderHook} from '@testing-library/react';
 import {afterEach,beforeEach,expect,it,vi} from 'vitest';
-import {CONFIRM_DELAY_MS,MONITOR_INTERVAL_MS,monitorIdentity,useRedirectMonitor} from './useRedirectMonitor';
+import {CONFIRM_DELAY_MS,MONITOR_INTERVAL_MS,STALE_AFTER_MS,monitorIdentity,useRedirectMonitor} from './useRedirectMonitor';
 import type {RedirectCheck,State} from './types';
 
 const base:State = {accounts:[],domains:[{id:'d',accountId:'a',zoneId:'z',host:'go.example.com',prefix:'r',routeId:'route'}],links:[{domainId:'d',slug:'one',cnUrl:'https://example.com/a',defaultUrl:'https://example.org/b',updated:'u1'}],pools:[],pendingOperations:[],pendingActions:[]};
@@ -9,7 +9,7 @@ const tick = async (ms=0) => {await act(async()=>{await vi.advanceTimersByTimeAs
 beforeEach(()=>{vi.useFakeTimers();vi.setSystemTime(new Date('2026-10-17T00:00:00Z'));localStorage.clear();});
 afterEach(()=>{cleanup();vi.useRealTimers();localStorage.clear();});
 
-it('defaults off, checks once on enable, then repeats after 30 minutes without overlap',async()=>{
+it('defaults off, checks once on enable, then repeats after 48 hours without overlap',async()=>{
   let release!: (value:RedirectCheck)=>void;
   const check=vi.fn().mockImplementationOnce(()=>new Promise<RedirectCheck>(resolve=>{release=resolve;})).mockImplementation(()=>Promise.resolve(report('passed')));
   const {result}=renderHook(()=>useRedirectMonitor({state:base,paused:false,ready:true,check}));
@@ -101,7 +101,7 @@ it('keeps busy responses quiet, retries once, and lets healthy results expire',a
   expect(check).toHaveBeenCalledTimes(2);
   expect(result.current.getRecord(base.links[0])?.phase).toBe('healthy');
   rerender({paused:true});
-  await tick(66*60_000);
+  await tick(STALE_AFTER_MS+60_000);
   expect(result.current.getRecord(base.links[0])?.stale).toBe(true);
   expect(result.current.summary.attention).toBe(1);
 });
@@ -145,7 +145,7 @@ it('keeps an expired confirmed alert in the unresolved count rather than claimin
   act(()=>result.current.setEnabled(true));await tick(CONFIRM_DELAY_MS);
   expect(result.current.summary).toEqual({alert:1,unresolved:0,attention:0});
   rerender({paused:true});
-  await tick(66*60_000);
+  await tick(STALE_AFTER_MS+60_000);
   expect(result.current.getRecord(base.links[0])?.stale).toBe(true);
   expect(result.current.summary).toEqual({alert:0,unresolved:1,attention:0});
 });
@@ -197,4 +197,102 @@ it('clears pending state on disable and starts a fresh cycle after re-enable',as
   expect(result.current.getRecord(base.links[0])?.phase).toBe('healthy');
   await tick(CONFIRM_DELAY_MS);
   expect(check).toHaveBeenCalledTimes(2);
+});
+
+
+it('remembers a healthy completion across restart and waits the full 48 hours',async()=>{
+  const check=vi.fn(()=>Promise.resolve(report('passed')));
+  const first=renderHook(()=>useRedirectMonitor({state:base,paused:false,ready:true,check}));
+  act(()=>first.result.current.setEnabled(true));await tick();
+  first.unmount();
+  await tick(47*60*60_000);
+  const second=renderHook(()=>useRedirectMonitor({state:base,paused:false,ready:true,check}));
+  await tick();
+  expect(second.result.current.lastCompletion).toBe('2026-10-17T00:00:00.000Z');
+  expect(check).toHaveBeenCalledTimes(1);
+  await tick(60*60_000-60_000);
+  expect(check).toHaveBeenCalledTimes(1);
+  await tick(60_000);
+  expect(check).toHaveBeenCalledTimes(2);
+  expect(localStorage.getItem('redirect-monitor-preview-enabled-completed-at')).toBe('2026-10-19T00:00:00.000Z');
+});
+
+it('catches up only once after several closed days and retains manual run',async()=>{
+  localStorage.setItem('redirect-monitor-preview-enabled','true');
+  localStorage.setItem('redirect-monitor-preview-enabled-completed-at','2026-10-10T00:00:00.000Z');
+  const check=vi.fn(()=>Promise.resolve(report('passed')));
+  const {result}=renderHook(()=>useRedirectMonitor({state:base,paused:false,ready:true,check}));
+  await tick();
+  expect(check).toHaveBeenCalledTimes(1);
+  await tick(60_000);
+  expect(check).toHaveBeenCalledTimes(1);
+  act(()=>result.current.runNow());await tick();
+  expect(check).toHaveBeenCalledTimes(2);
+});
+
+it.each(['not-a-date','2027-01-01T00:00:00Z'])('ignores invalid or future saved completion: %s',async value=>{
+  localStorage.setItem('redirect-monitor-preview-enabled','true');
+  localStorage.setItem('redirect-monitor-preview-enabled-completed-at',value);
+  const check=vi.fn(()=>Promise.resolve(report('passed')));
+  renderHook(()=>useRedirectMonitor({state:base,paused:false,ready:true,check}));await tick();
+  expect(check).toHaveBeenCalledTimes(1);
+});
+
+it('does not delay rechecking unresolved results after restarting or persist report data',async()=>{
+  const check=vi.fn(()=>Promise.resolve(report('failed')));
+  const first=renderHook(()=>useRedirectMonitor({state:base,paused:false,ready:true,check}));
+  act(()=>first.result.current.setEnabled(true));await tick(CONFIRM_DELAY_MS);
+  expect(first.result.current.getRecord(base.links[0])?.phase).toBe('alert');
+  expect(localStorage.getItem('redirect-monitor-preview-enabled-completed-at')).toBeNull();
+  first.unmount();
+  renderHook(()=>useRedirectMonitor({state:base,paused:false,ready:true,check}));await tick();
+  expect(check).toHaveBeenCalledTimes(3);
+  expect(Object.keys(localStorage)).toEqual(['redirect-monitor-preview-enabled']);
+});
+
+it('does not save an interrupted cycle as completed',async()=>{
+  let finish!:(value:RedirectCheck)=>void;
+  const check=vi.fn(()=>new Promise<RedirectCheck>(resolve=>{finish=resolve;}));
+  const first=renderHook(()=>useRedirectMonitor({state:base,paused:false,ready:true,check}));
+  act(()=>first.result.current.setEnabled(true));await tick();
+  act(()=>first.result.current.setEnabled(false));
+  await act(async()=>finish(report('passed')));
+  expect(first.result.current.lastCompletion).toBeNull();
+  expect(localStorage.getItem('redirect-monitor-preview-enabled-completed-at')).toBeNull();
+});
+
+
+it('does not reuse an earlier healthy result when a later cycle is busy',async()=>{
+  const check=vi.fn().mockImplementationOnce(()=>Promise.resolve(report('passed')))
+    .mockImplementationOnce(()=>Promise.resolve(report('unknown','busy')))
+    .mockImplementation(()=>Promise.resolve(report('failed')));
+  const {result}=renderHook(()=>useRedirectMonitor({state:base,paused:false,ready:true,check}));
+  act(()=>result.current.setEnabled(true));await tick();
+  expect(localStorage.getItem('redirect-monitor-preview-enabled-completed-at')).not.toBeNull();
+  act(()=>result.current.runNow());await tick();
+  expect(result.current.getRecord(base.links[0])?.phase).toBe('healthy');
+  expect(localStorage.getItem('redirect-monitor-preview-enabled-completed-at')).toBeNull();
+  await tick(CONFIRM_DELAY_MS*2);
+  expect(result.current.getRecord(base.links[0])?.phase).toBe('alert');
+  expect(localStorage.getItem('redirect-monitor-preview-enabled-completed-at')).toBeNull();
+});
+
+it.each(['paused','offline'])('retries after the last in-flight check completes while %s',async blocker=>{
+  let finish!:(value:RedirectCheck)=>void;
+  const check=vi.fn().mockImplementationOnce(()=>new Promise<RedirectCheck>(resolve=>{finish=resolve;}))
+    .mockImplementation(()=>Promise.resolve(report('passed')));
+  const online=vi.spyOn(window.navigator,'onLine','get').mockReturnValue(true);
+  const {result,rerender}=renderHook(({paused})=>useRedirectMonitor({state:base,paused,ready:true,check}),{initialProps:{paused:false}});
+  act(()=>result.current.setEnabled(true));await tick();
+  if(blocker==='paused') rerender({paused:true});
+  else online.mockReturnValue(false);
+  await act(async()=>finish(report('passed')));
+  expect(result.current.lastCompletion).toBeNull();
+  expect(localStorage.getItem('redirect-monitor-preview-enabled-completed-at')).toBeNull();
+  if(blocker==='paused') rerender({paused:false});
+  else {online.mockReturnValue(true);act(()=>window.dispatchEvent(new Event('online')));}
+  await tick();
+  expect(check).toHaveBeenCalledTimes(2);
+  expect(result.current.lastCompletion).not.toBeNull();
+  online.mockRestore();
 });

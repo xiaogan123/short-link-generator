@@ -40,7 +40,7 @@ function formatDate(value:string|null) {
 export default function RedirectMonitor({enabled,active,online,progress,lastCompletion,onEnabled,onRun,disabled}:Props) {
   return <section className="redirect-monitor panel" aria-label="自动巡检">
     <div className="redirect-monitor-main">
-      <div className="redirect-monitor-title"><WarningCircle size={18} aria-hidden="true"/><div><h2>自动巡检</h2><p>应用打开且联网时每 30 分钟检查一次；关闭应用或电脑休眠后停止。</p></div></div>
+      <div className="redirect-monitor-title"><WarningCircle size={18} aria-hidden="true"/><div><h2>自动巡检</h2><p>每 48 小时巡检一次；仅在应用打开且联网时执行，关闭期间到期的巡检会在下次打开后补查。</p></div></div>
       <div className="redirect-monitor-actions">
         <label className="redirect-monitor-switch"><input type="checkbox" checked={enabled} onChange={event=>onEnabled(event.target.checked)}/><span>{enabled?'已开启':'未开启'}</span></label>
         <button type="button" className="button secondary" onClick={onRun} disabled={!enabled || active || disabled || !online}><ArrowClockwise size={15} aria-hidden="true"/>立即巡检</button>
