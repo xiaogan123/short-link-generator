@@ -24,6 +24,7 @@ mod redirect_check;
 mod secret_store;
 #[cfg(test)]
 mod selftest_resource_recovery_tests;
+mod traffic_guard;
 #[cfg(target_os = "windows")]
 mod windows_configuration;
 #[cfg(all(test, target_os = "windows"))]
@@ -82,6 +83,7 @@ async fn lock_backend<'a>(
             | "check_pool_health"
             | "get_link_stats"
             | "get_stats_center"
+            | "get_click_protection"
             | "selftest_link"
             | "prepare_monitor"
             | "disable_monitor"
@@ -837,6 +839,7 @@ impl Backend {
             PlanKind::MigrateCredentials { .. } => return Ok(()),
             PlanKind::UpgradeWorker { account_id, .. }
             | PlanKind::SetClickStats { account_id, .. }
+            | PlanKind::SetClickProtection { account_id, .. }
             | PlanKind::ResumeWorkerUpgrade { account_id } => {
                 return self.require_credentials(account_id);
             }
@@ -2062,6 +2065,8 @@ impl Backend {
             | "resume_worker_upgrade"
             | "dismiss_worker_upgrade"
             | "enable_click_stats"
+            | "enable_click_protection"
+            | "disable_click_protection"
             | "disable_click_stats" => {
                 return self.prepare_worker_upgrade(kind, field(payload, "accountId")?);
             }
@@ -2379,6 +2384,7 @@ impl Backend {
             "get_state" => Ok(self.state()),
             "get_link_stats" => self.get_link_stats(payload).await,
             "get_stats_center" => self.get_stats_center(payload).await,
+            "get_click_protection" => self.get_click_protection(payload).await,
             "token_template" => Ok(Value::String(Self::token_template())),
             "import_token" => {
                 let expected_account_id = match payload.get("expectedAccountId") {
@@ -3269,7 +3275,7 @@ impl Backend {
             .ok_or("无法读取 Worker 绑定")?;
         let missing_key_recovery = self.account(account_id)?.needs_selftest_key;
         let mut names = HashSet::new();
-        let expected = (1..=4).contains(&bindings.len())
+        let expected = (1..=6).contains(&bindings.len())
             && bindings.iter().any(|b| {
                 b["type"] == "kv_namespace"
                     && b["name"] == "LINKS"
@@ -3288,6 +3294,9 @@ impl Backend {
                         }
                         "SELFTEST_KEY" | "PROBE_KEY" => b["type"] == "secret_text",
                         "CLICK_EVENTS" => click_stats::valid_binding(b, &resources.namespace),
+                        traffic_guard::LIMITER | traffic_guard::DISABLED => {
+                            traffic_guard::normalize(b, &resources.namespace).is_some()
+                        }
                         _ => false,
                     }
             });
@@ -3316,7 +3325,7 @@ impl Backend {
                 account_id,
                 target_hash,
             } => {
-                self.apply_worker_upgrade(&account_id, &target_hash, None)
+                self.apply_worker_upgrade(&account_id, &target_hash, None, None)
                     .await
             }
             PlanKind::SetClickStats {
@@ -3324,7 +3333,15 @@ impl Backend {
                 target_hash,
                 enabled,
             } => {
-                self.apply_worker_upgrade(&account_id, &target_hash, Some(enabled))
+                self.apply_worker_upgrade(&account_id, &target_hash, Some(enabled), None)
+                    .await
+            }
+            PlanKind::SetClickProtection {
+                account_id,
+                target_hash,
+                enabled,
+            } => {
+                self.apply_worker_upgrade(&account_id, &target_hash, None, Some(enabled))
                     .await
             }
             PlanKind::ResumeWorkerUpgrade { account_id } => {

@@ -61,7 +61,7 @@ it('cloud upgrade is explicit, account-scoped and cancellable; startup never upg
   fireEvent.click(screen.getByRole('button', { name: /^Cloudflare 账户$/ }));
   fireEvent.click(screen.getByRole('button', { name: '管理 示例账户' }));
   const manager = screen.getByRole('dialog', { name: '账户管理' });
-  fireEvent.click(within(manager).getByRole('button', { name: '启用名称大小写兼容' }));
+  fireEvent.click(within(manager).getByRole('button', { name: '升级云端跳转服务' }));
   const review = await screen.findByRole('dialog', { name: '启用名称大小写兼容' });
   expect(review.textContent).toContain('go.example.com/r/');
   expect(review.textContent).toContain('links.example.org/go/');

@@ -612,7 +612,8 @@ impl Cloud {
             "compatibility_date": "2025-01-01",
             "bindings": [
                 {"type":"kv_namespace","name":"LINKS","namespace_id":namespace},
-                {"type":"secret_text","name":"SELFTEST_KEY","text":key_hex}
+                {"type":"secret_text","name":"SELFTEST_KEY","text":key_hex},
+                crate::traffic_guard::binding(namespace)
             ]
         });
         let url = self.url(&format!("accounts/{account}/workers/scripts/{script}"))?;

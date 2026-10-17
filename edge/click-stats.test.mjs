@@ -103,7 +103,7 @@ test('successful browser navigation writes the fixed privacy-bounded schema with
   assert.deepEqual(analytics.points, [{
     indexes: [HOST],
     blobs: ['v1', HOST, PREFIX, 'Offer_1', 'likely_human', 'click', 'browser_navigation'],
-    doubles: [1],
+    doubles: [1, 1, 0],
   }]);
   const serialized = JSON.stringify(analytics.points[0]);
   for (const forbidden of [

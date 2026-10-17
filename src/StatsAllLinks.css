@@ -1,0 +1,42 @@
+.sall { overflow: hidden; border: 1px solid #dfe5dd; border-radius: 10px; background: #fff; }
+.sall-head { display: flex; justify-content: space-between; align-items: flex-start; flex-wrap: wrap; gap: 10px 18px; padding: 16px 18px 13px; }
+.sall-head h2 { margin: 0 0 3px; color: #203128; font-size: 15px; }
+.sall-head p { margin: 0; color: #77877c; font-size: 11px; line-height: 1.5; }
+.sall-counts { color: #63786a; font-size: 11px; white-space: nowrap; }
+.sall-counts strong { color: #185239; font-size: 15px; }
+.sall-counts span { margin: 0 5px; color: #a9b7ab; }
+.sall-controls { display: flex; gap: 10px; align-items: end; padding: 10px 18px 12px; border-block: 1px solid #e9ede6; background: #fafbf8; }
+.sall-controls label { display: grid; gap: 4px; min-width: 0; color: #65766b; font-size: 10px; font-weight: 750; }
+.sall-controls label:first-child { flex: 1 1 280px; }
+.sall-controls label:last-child { flex: 0 1 175px; }
+.sall-controls input, .sall-controls select { width: 100%; height: 34px; min-width: 0; border: 1px solid #d6ded4; border-radius: 6px; background: #fff; color: #2c4636; padding: 0 9px; font-size: 11px; }
+.sall-loading { margin: 0; padding: 9px 18px; border-bottom: 1px solid #e9ede6; background: #f4f8f1; color: #55705d; font-size: 10px; line-height: 1.5; }
+.sall-scroll { width: 100%; overflow-x: auto; }
+.sall-table { width: 100%; min-width: 760px; table-layout: fixed; border-collapse: collapse; }
+.sall-table thead { display: table-header-group; }
+.sall-table tbody { display: table-row-group; }
+.sall-table tbody tr { display: table-row; padding: 0; }
+.sall-table th, .sall-table td { display: table-cell; grid-column: auto; grid-row: auto; padding: 10px 8px; border-top: 1px solid #edf0e9; color: #66786c; font-size: 10px; vertical-align: top; }
+.sall-table th { border-top: 0; background: #fcfdfa; color: #718279; font-weight: 750; white-space: nowrap; }
+.sall-table th:first-child { width: 28%; }
+.sall-table th:nth-child(2) { width: 18%; }
+.sall-table th:nth-child(3) { width: 10%; }
+.sall-table th:nth-child(4), .sall-table th:nth-child(5), .sall-table th:nth-child(6) { width: 10%; }
+.sall-table th:last-child { width: 14%; }
+.sall-table th:nth-child(n+3), .sall-table td:nth-child(n+3) { text-align: right; }
+.sall-table .sall-url { display: block; color: #237650; font-weight: 650; line-height: 1.45; overflow-wrap: anywhere; }
+.sall-table td:first-child small { display: block; margin-top: 3px; color: #87958d; font-size: 9px; }
+.sall-table .sall-account { color: #304c3a; font-weight: 650; overflow-wrap: anywhere; }
+.sall-table .sall-total { color: #194c35; font-size: 14px; font-weight: 800; }
+.sall-table .sall-total small { display: block; margin-top: 4px; color: #718276; font-size: 9px; font-weight: 500; line-height: 1.4; }
+.sall-table .sall-detail { min-height: 27px; padding: 4px 7px; font-size: 10px; }
+.sall-table .sall-empty { padding: 26px 12px; color: #7d8e82; text-align: center !important; }
+.sall-pagination { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 10px 18px; border-top: 1px solid #e9ede6; background: #fafbf7; color: #6c7e72; font-size: 10px; }
+.sall-pagination > div { display: flex; gap: 6px; }
+.sall-pagination .button { min-height: 28px; padding: 4px 8px; }
+@media (max-width: 620px) {
+  .sall-head, .sall-controls, .sall-pagination { padding-inline: 14px; }
+  .sall-controls { flex-wrap: wrap; }
+  .sall-controls label:last-child { flex: 1 1 160px; }
+  .sall-pagination { flex-wrap: wrap; }
+}

@@ -34,7 +34,7 @@ fn unsupported_annotation_fields(value: &Value) -> Vec<&'static str> {
 
 /// Normalize only safe settings. Values of secret bindings are never accepted,
 /// copied into a journal, or included in upload metadata.
-fn normalized_settings(raw: &Value, namespace: &str) -> Result<Value, String> {
+pub(super) fn normalized_settings(raw: &Value, namespace: &str) -> Result<Value, String> {
     let object = raw.as_object().ok_or("Worker 设置格式无效")?;
     let mut unsupported = Vec::new();
     for (key, value) in object {
@@ -145,6 +145,12 @@ fn normalized_settings(raw: &Value, namespace: &str) -> Result<Value, String> {
                 if click_stats::valid_binding(binding, namespace) =>
             {
                 normalized.push(binding.clone());
+            }
+            (traffic_guard::LIMITER | traffic_guard::DISABLED, _) => {
+                normalized.push(
+                    traffic_guard::normalize(binding, namespace)
+                        .ok_or("Worker 防刷绑定无法安全保留，停止升级")?,
+                );
             }
             _ => return Err("Worker 绑定无法安全保留，停止升级".into()),
         }
@@ -307,18 +313,30 @@ impl Backend {
                 (if enabled { "启用点击统计" } else { "关闭点击统计" },
                     PlanKind::SetClickStats { account_id: account_id.into(), target_hash: bundled_source_hash(), enabled },
                     vec![format!("{}此账户全部已导入域名的点击统计：{}", if enabled { "启用" } else { "关闭" }, if domains.is_empty() { "无".into() } else { domains.join("、") }),
-                        if enabled { "核对云端归属及分析读取权限后部署本版本转发程序，并启用 Analytics Engine 统计绑定".into() } else { "保留当前转发程序，仅移除统计绑定；之后不再向该数据集写入点击事件".into() },
+                        if enabled { "核对云端归属及分析读取权限后部署本版本转发程序，启用 Analytics Engine；默认开启防刷，保留此前主动关闭的选择".into() } else { "保留当前转发程序，仅移除统计绑定；之后不再向该数据集写入点击事件".into() },
                         "保留链接、检测密钥、兼容设置和计划任务；上传未确认时保留恢复记录，不重复上传".into()],
-                    if enabled { vec!["分类是被动估计，不能确认真人或去重访客；预览与预取单独统计，不改变跳转体验".into(),
+                    if enabled { vec!["分类不能确认真人；30 分钟去重仅为估算，跨节点或服务重启可能重复计入，预览与预取单独统计".into(),
                         "Cloudflare 可能采样，统计有延迟；Analytics Engine 的用量、收费和保留期遵循账户的服务方案".into(),
                         "事件包含短链主机、目录、名称及固定分类，不记录 IP、原始 UA、来源、查询参数、跳转目标或邀请码".into()] }
                     else { vec!["关闭不会删除已存历史事件；历史数据按 Cloudflare 的保留策略到期。此应用关闭后不再查询统计".into()] })
             }
+            "enable_click_protection" | "disable_click_protection" => {
+                self.require_upgrade_start(account_id)?;
+                let enabled = kind == "enable_click_protection";
+                (if enabled { "开启高频访问保护" } else { "关闭高频访问保护" },
+                    PlanKind::SetClickProtection { account_id: account_id.into(), target_hash: bundled_source_hash(), enabled },
+                    vec![format!("{}此账户全部已导入域名的防刷保护：{}", if enabled { "开启" } else { "关闭" }, if domains.is_empty() { "无".into() } else { domains.join("、") }),
+                        if enabled { "部署本版本转发程序：同一 IP、同一条短链约每 10 秒最多 100 次，超出时暂时返回 429，下一窗口自动恢复".into() } else { "保留当前转发程序，仅关闭高频限速；保留统计、去重和链接数据，之后升级也保留关闭选择".into() },
+                        "不添加验证码或中间页；保留跳转目标和邀请码。上传未确认时保留恢复记录，不重复上传".into()],
+                    vec!["限速按 Cloudflare 节点近似计算，共享 IP 的访问可能叠加；无法阻挡所有分布式攻击或保证不产生用量".into(),
+                        "限速服务异常时继续跳转；统计去重不阻止正常重复访问".into()])
+            }
             "upgrade_worker" => {
                 self.require_upgrade_start(account_id)?;
-                ("启用名称大小写兼容", PlanKind::UpgradeWorker { account_id: account_id.into(), target_hash: bundled_source_hash() },
+                ("升级云端转发功能", PlanKind::UpgradeWorker { account_id: account_id.into(), target_hash: bundled_source_hash() },
                     vec![format!("升级此账户的转发程序 {}，影响全部已导入域名：{}", resources.script, if domains.is_empty() { "无".into() } else { domains.join("、") }),
-                        "先核对云端归属、源码、设置与计划任务，保留检测密钥绑定；应用更新不会自动执行此升级".into()],
+                        "先核对云端归属、源码、设置与计划任务，保留检测密钥绑定；应用更新不会自动执行此升级".into(),
+                        "默认开启高频防刷，保留此前主动关闭的选择；已开启统计的账户将开始记录 30 分钟估算去重".into()],
                     vec!["旧名称保留精确匹配；其他大小写先匹配小写名称，再匹配唯一旧名称。目录前缀与跳转目标不变".into(),
                         "上传或核对失败会保留恢复记录；仅在明确确认计划后执行，恢复不会重新上传".into()])
             }
@@ -439,6 +457,7 @@ impl Backend {
         account_id: &str,
         target_hash: &str,
         click_stats_enabled: Option<bool>,
+        click_protection_enabled: Option<bool>,
     ) -> Result<(), String> {
         self.require_upgrade_start(account_id)?;
         if target_hash != bundled_source_hash() {
@@ -469,6 +488,13 @@ impl Backend {
             }
             bindings.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
         }
+        if click_stats_enabled != Some(false) {
+            traffic_guard::configure(
+                &mut target_settings,
+                &resources.namespace,
+                click_protection_enabled,
+            )?;
+        }
         let schedules = self
             .read_upgrade_schedules(&token, account_id, &resources)
             .await?;
@@ -481,8 +507,10 @@ impl Backend {
         if manifest["sourceHash"] != previous_hash {
             return Err("Worker 与清单已变化，停止升级".into());
         }
-        // Disabling collection changes only bindings, never the user's code.
-        let effective_target_hash = if click_stats_enabled == Some(false) {
+        // Disabling a feature changes only bindings, never the user's code.
+        let preserve_source =
+            click_stats_enabled == Some(false) || click_protection_enabled == Some(false);
+        let effective_target_hash = if preserve_source {
             previous_hash.clone()
         } else {
             target_hash.to_owned()
@@ -546,7 +574,7 @@ impl Backend {
                 &resources.script,
                 &resources.namespace,
                 &target_settings,
-                if click_stats_enabled == Some(false) {
+                if preserve_source {
                     &source
                 } else {
                     include_bytes!("../../edge/worker.mjs")

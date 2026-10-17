@@ -266,7 +266,7 @@ async fn upgrade_preserves_secrets_settings_schedules_and_has_single_use_preview
     assert_eq!(metadata["keep_bindings"], json!(["secret_text"]));
     assert_eq!(
         metadata["bindings"],
-        json!([{"type":"kv_namespace","name":"LINKS","namespace_id":"ns1"}])
+        json!([traffic_guard::binding("ns1"), {"type":"kv_namespace","name":"LINKS","namespace_id":"ns1"}])
     );
     assert_eq!(metadata["compatibility_date"], "2025-01-01");
     assert_eq!(
@@ -1033,7 +1033,7 @@ async fn upgrade_ignores_only_readonly_annotation_in_preflight_and_readback() {
             "main_module":"worker.mjs",
             "compatibility_date":"2025-01-01",
             "compatibility_flags":["nodejs_compat","streams_enable_constructors"],
-            "bindings":[{"type":"kv_namespace","name":"LINKS","namespace_id":"ns1"}],
+            "bindings":[traffic_guard::binding("ns1"), {"type":"kv_namespace","name":"LINKS","namespace_id":"ns1"}],
             "keep_bindings":["secret_text"]
         })
     );
@@ -1420,7 +1420,12 @@ async fn old_worker_upgrade_journal_without_target_settings_still_resumes() {
     assert!(backend.db.pending_worker_upgrades[0]
         .target_settings
         .is_none());
-    remote.lock().unwrap().fail_manifest = false;
+    {
+        // Old releases changed source only: no targetSettings and no new binding.
+        let mut state = remote.lock().unwrap();
+        state.fail_manifest = false;
+        state.settings = backend.db.pending_worker_upgrades[0].settings.clone();
+    }
     resume_upgrade(&mut backend).await.unwrap();
     assert_eq!(script_uploads(&server).await.len(), 1);
 }
@@ -1468,5 +1473,110 @@ async fn enable_click_stats_read_permission_preflight_failure_leaves_no_journal_
             .unwrap()
             .iter()
             .all(|r| r.method == "GET" || r.url.path() == ANALYTICS_PATH));
+    }
+}
+
+async fn apply_click_protection(backend: &mut Backend, enabled: bool) -> Result<Value, String> {
+    let plan = backend.prepare_change(&json!({"kind":if enabled {"enable_click_protection"} else {"disable_click_protection"},"accountId":"acct1"}))?;
+    backend
+        .dispatch("apply_plan", &json!({"planId":plan["id"]}))
+        .await
+}
+
+#[tokio::test]
+async fn protection_default_readback_optout_upgrade_and_explicit_reenable() {
+    let (server, mut backend, _guard) = fixture().await;
+    mount_upgrade(&server, &backend.path).await;
+    let status = backend
+        .dispatch("get_click_protection", &json!({"accountId":"acct1"}))
+        .await
+        .unwrap();
+    assert_eq!(status["status"], "upgrade_required");
+    assert!(writes(&server).await.is_empty());
+    apply_upgrade(&mut backend).await.unwrap();
+    let status = backend
+        .dispatch("get_click_protection", &json!({"accountId":"acct1"}))
+        .await
+        .unwrap();
+    assert_eq!(status["status"], "enabled");
+    assert_eq!(status["limit"], 100);
+    assert_eq!(status["periodSeconds"], 10);
+    apply_click_protection(&mut backend, false).await.unwrap();
+    let status = backend
+        .dispatch("get_click_protection", &json!({"accountId":"acct1"}))
+        .await
+        .unwrap();
+    assert_eq!(status["status"], "disabled");
+    let before = script_uploads(&server).await.len();
+    apply_upgrade(&mut backend).await.unwrap();
+    assert_eq!(script_uploads(&server).await.len(), before);
+    apply_click_protection(&mut backend, true).await.unwrap();
+    let status = backend
+        .dispatch("get_click_protection", &json!({"accountId":"acct1"}))
+        .await
+        .unwrap();
+    assert_eq!(status["status"], "enabled");
+    assert!(backend.db.pending_worker_upgrades.is_empty());
+}
+
+#[tokio::test]
+async fn disabling_protection_preserves_old_source_and_resumes_without_reupload() {
+    let (server, mut backend, _guard) = fixture().await;
+    let remote = mount_upgrade(&server, &backend.path).await;
+    remote.lock().unwrap().upload_status = 503;
+    assert!(apply_click_protection(&mut backend, false).await.is_err());
+    assert_eq!(backend.db.pending_worker_upgrades.len(), 1);
+    let pending = &backend.db.pending_worker_upgrades[0];
+    assert_eq!(pending.previous_hash, pending.target_hash);
+    let uploads = script_uploads(&server).await;
+    assert_eq!(uploads.len(), 1);
+    let (metadata, source) = sync_upload_parts(&uploads[0]);
+    assert_eq!(source, OLD_SOURCE);
+    assert!(metadata["bindings"]
+        .as_array()
+        .unwrap()
+        .contains(&json!({"name":"CLICK_GUARD_DISABLED","type":"plain_text","text":"1"})));
+    backend.db = serde_json::from_slice(&fs::read(&backend.path).unwrap()).unwrap();
+    resume_upgrade(&mut backend).await.unwrap();
+    assert_eq!(script_uploads(&server).await.len(), 1);
+    assert_eq!(remote.lock().unwrap().source, OLD_SOURCE);
+}
+
+#[tokio::test]
+async fn statistics_enable_and_disable_preserve_explicit_protection_optout() {
+    let (server, mut backend, _guard) = fixture().await;
+    let remote = click_stats_remote(&server, &mut backend).await;
+    analytics_permission(&server, 200).await;
+    apply_click_protection(&mut backend, false).await.unwrap();
+    apply_click_stats(&mut backend, true).await.unwrap();
+    apply_click_stats(&mut backend, false).await.unwrap();
+    let state = remote.lock().unwrap();
+    let bindings = state.settings["bindings"].as_array().unwrap();
+    assert!(bindings.contains(&traffic_guard::binding(ANALYTICS_NAMESPACE)));
+    assert!(
+        bindings.contains(&json!({"name":"CLICK_GUARD_DISABLED","type":"plain_text","text":"1"}))
+    );
+    assert!(!bindings.iter().any(|b| b["name"] == "CLICK_EVENTS"));
+}
+
+#[tokio::test]
+async fn invalid_protection_bindings_stop_before_write() {
+    for bad in [
+        json!({"name":"CLICK_RATE_LIMITER","type":"ratelimit","namespace_id":"42","simple":{"limit":100,"period":10}}),
+        json!({"name":"CLICK_GUARD_DISABLED","type":"plain_text","text":"0"}),
+        json!({"name":"CLICK_GUARD_DISABLED","type":"plain_text","text":"1","unknown":"private-value"}),
+    ] {
+        let (server, mut backend, _guard) = fixture().await;
+        let remote = mount_upgrade(&server, &backend.path).await;
+        remote.lock().unwrap().settings["bindings"]
+            .as_array_mut()
+            .unwrap()
+            .push(bad);
+        assert!(apply_click_protection(&mut backend, true).await.is_err());
+        assert!(backend
+            .dispatch("get_click_protection", &json!({"accountId":"acct1"}))
+            .await
+            .is_err());
+        assert!(writes(&server).await.is_empty());
     }
 }

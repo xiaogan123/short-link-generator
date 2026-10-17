@@ -290,6 +290,8 @@ export default function App() {
   const updates = useUpdateCheck(!loading && !loadFailed && !!state.appVersion && !busy && !updateStatus && !installedUpdate);
   const redirectMonitor = useRedirectMonitor({state,ready:!loading && !loadFailed,paused:busy || updates.checking || !!updateStatus});
   const [manageAccount, setManageAccount] = useState<Account | null>(null);
+  const [protectionRead, setProtectionRead] = useState<{accountId:string;loading?:boolean;status?:import('./types').ClickProtection;error?:string} | null>(null);
+  const protectionReadSequence = useRef(0);
   const [statsTarget, setStatsTarget] = useState<{link: Link; domain: Domain} | null>(null);
   const [statsRevision, setStatsRevision] = useState(0);
   const [statsConfigurationError, setStatsConfigurationError] = useState<{accountId: string; message: string} | null>(null);
@@ -579,7 +581,7 @@ export default function App() {
           ...(kind === "recover_selftest_resources"
             ? ["本次只找回本机检测配置；完成后，恢复检测密钥仍需另行查看计划并确认。"]
             : []),
-          ...((kind === "upgrade_worker" || kind === "resume_worker_upgrade" || kind === "enable_click_stats" || kind === "disable_click_stats")
+          ...((kind === "upgrade_worker" || kind === "resume_worker_upgrade" || kind === "enable_click_stats" || kind === "disable_click_stats" || kind === "enable_click_protection" || kind === "disable_click_protection")
             ? state.domains.filter((d) => d.accountId === fields.accountId).map((d) => `影响域名：${d.host}/${d.prefix}/`)
             : []),
         ]);
@@ -656,6 +658,10 @@ export default function App() {
             ? "点击统计已启用。之后的访问会逐步显示在统计中，访客仍然直接跳转。"
           : appliedKind === "disable_click_stats"
             ? "点击统计已停用。跳转保持不变，已有统计按服务保留期处理。"
+          : appliedKind === "enable_click_protection"
+            ? "访问保护已启用：同一 IP 对同一短链接 10 秒内最多 100 次请求。"
+          : appliedKind === "disable_click_protection"
+            ? "访问保护已停用。"
           : appliedKind === "add_domain"
             ? "域名已接入。现在可以创建第一条短链接；云端配置可能需要稍等片刻才生效。"
             : appliedKind === "fix_domain_dns"
@@ -670,9 +676,13 @@ export default function App() {
           : appliedKind === "save_pool" || (appliedKind === "migrate_credentials" && page === "pools") ? setPoolError : undefined,
       );
       if (next) {
+        if (["enable_click_protection", "disable_click_protection", "upgrade_worker", "resume_worker_upgrade"].includes(appliedKind)) {
+          protectionReadSequence.current += 1;
+          setProtectionRead(null);
+        }
         stateRef.current = next;
         setState(next);
-        if (["enable_click_stats", "disable_click_stats", "resume_worker_upgrade"].includes(appliedKind)) {
+        if (["enable_click_stats", "disable_click_stats", "upgrade_worker", "resume_worker_upgrade"].includes(appliedKind)) {
           setStatsRevision((n) => n + 1);
           setStatsConfigurationError(null);
           setStatsPlanAccountId("");
@@ -2623,7 +2633,7 @@ export default function App() {
                                 className="button secondary"
                                 disabled={mutation === "prepare_credentials"}
                                 aria-label={`管理 ${account.label}`}
-                                onClick={() => setManageAccount(account)}
+                                onClick={() => { protectionReadSequence.current += 1; setProtectionRead(null); setManageAccount(account); }}
                               >
                                 管理账户
                               </button>
@@ -3689,14 +3699,47 @@ export default function App() {
             {manageAccount.hasResources && (
               <section className="manager-section">
                 <div className="manager-section-heading">
-                  <strong>名称大小写兼容</strong>
-                  <p>启用后，这个账户下所有短链接域名都支持名称大小写兼容。旧链接保持原样；已有重名时先匹配原名称，再匹配小写名称。现有密钥和检测设置会保留。</p>
+                  <strong>短链接访问保护</strong>
+                  <p>默认启用：同一 IP 对同一短链接每 10 秒最多 100 次请求，超出时暂时限制；访客无需验证。此设置作用于本账户的全部短链接域名。</p>
+                  <p>状态只在点击读取后查询云端。</p>
+                  {protectionRead?.accountId === manageAccount.id && <p role="status">{protectionRead.loading ? "正在读取访问保护状态…" : protectionRead.error ? `读取失败：${protectionRead.error}` : protectionRead.status ? `当前状态：${protectionRead.status.status === "enabled" ? "已启用" : protectionRead.status.status === "disabled" ? "已停用" : "需要升级云端跳转服务"} · ${protectionRead.status.limit} 次 / ${protectionRead.status.periodSeconds} 秒` : "尚未读取"}</p>}
+                </div>
+                <div className="manager-actions">
+                  <button className="button secondary" disabled={busy || Boolean(protectionRead?.loading) || Boolean(manageAccount.needsCredentialMigration)} onClick={async () => {
+                    const accountId = manageAccount.id;
+                    const sequence = ++protectionReadSequence.current;
+                    setProtectionRead({accountId,loading:true});
+                    try {
+                      const status = await dispatch<import('./types').ClickProtection>("get_click_protection", {accountId});
+                      if (sequence !== protectionReadSequence.current) return;
+                      if (status.accountId !== accountId || !["enabled", "disabled", "upgrade_required"].includes(status.status) || status.limit !== 100 || status.periodSeconds !== 10 || typeof status.checkedAt !== "string") throw new Error("返回的访问保护状态无效，请重试。");
+                      setProtectionRead({accountId,status});
+                    } catch (readError) {
+                      if (sequence === protectionReadSequence.current) setProtectionRead({accountId,error:errorMessage(readError)});
+                    }
+                  }}>读取保护状态</button>
+                  <button className="button secondary" disabled={busy || Boolean(manageAccount.needsCredentialMigration)} onClick={() => {
+                    void prepare("enable_click_protection", {accountId:manageAccount.id});
+                    setManageAccount(null);
+                  }}>启用访问保护</button>
+                  <button className="button secondary" disabled={busy || Boolean(manageAccount.needsCredentialMigration)} onClick={() => {
+                    void prepare("disable_click_protection", {accountId:manageAccount.id});
+                    setManageAccount(null);
+                  }}>停用访问保护</button>
+                </div>
+              </section>
+            )}
+            {manageAccount.hasResources && (
+              <section className="manager-section">
+                <div className="manager-section-heading">
+                  <strong>云端跳转功能</strong>
+                  <p>升级此账户的云端跳转服务以启用新版功能，包括名称大小写兼容与默认访问保护。旧链接保持原样；已有重名时先匹配原名称，再匹配小写名称。现有密钥和检测设置会保留；此前明确停用的保护设置也会保留。</p>
                 </div>
                 <div className="manager-actions">
                   <button disabled={busy} className="button secondary" onClick={() => {
                     void prepare("upgrade_worker", { accountId: manageAccount.id });
                     setManageAccount(null);
-                  }}>启用名称大小写兼容</button>
+                  }}>升级云端跳转服务</button>
                 </div>
               </section>
             )}

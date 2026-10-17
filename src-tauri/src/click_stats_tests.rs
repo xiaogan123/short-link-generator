@@ -59,7 +59,18 @@ async fn resource(server: &MockServer, enabled: bool) {
         .await;
 }
 fn row(class: &str, kind: &str, reason: &str, count: Value) -> Value {
-    json!({"classification":class,"traffic_kind":kind,"reason":reason,"count":count})
+    row_dedup(class, kind, reason, count, json!(0), json!(0))
+}
+fn row_dedup(
+    class: &str,
+    kind: &str,
+    reason: &str,
+    count: Value,
+    first: Value,
+    repeat: Value,
+) -> Value {
+    json!({"classification":class,"traffic_kind":kind,"reason":reason,"count":count,
+        "first_count":first,"repeat_count":repeat})
 }
 fn envelope(rows: Vec<Value>) -> Value {
     json!({"meta":[],"rows":rows.len(),"data":rows})
@@ -98,8 +109,33 @@ fn page_row(
     reason: &str,
     count: Value,
 ) -> Value {
+    page_row_dedup(
+        host,
+        prefix,
+        slug,
+        class,
+        kind,
+        reason,
+        count,
+        json!(0),
+        json!(0),
+    )
+}
+#[allow(clippy::too_many_arguments)]
+fn page_row_dedup(
+    host: &str,
+    prefix: &str,
+    slug: &str,
+    class: &str,
+    kind: &str,
+    reason: &str,
+    count: Value,
+    first: Value,
+    repeat: Value,
+) -> Value {
     json!({"host":host,"prefix":prefix,"canonical_slug":slug,
-        "classification":class,"traffic_kind":kind,"reason":reason,"count":count})
+        "classification":class,"traffic_kind":kind,"reason":reason,"count":count,
+        "first_count":first,"repeat_count":repeat})
 }
 async fn query(backend: &mut Backend, days: u64) -> Value {
     backend
@@ -173,7 +209,7 @@ async fn stats_weighted_counts_query_only_owned_scope_and_keep_preview_prefetch_
     assert_eq!(value["status"], "ready");
     assert_eq!(
         value["totals"],
-        json!({"total":15,"likelyHuman":3,"likelyBot":5,"unknown":7,"previews":11,"prefetches":13})
+        json!({"total":15,"likelyHuman":3,"likelyBot":5,"unknown":7,"previews":11,"prefetches":13,"dedup":{"first":0,"repeat":0}})
     );
     assert_eq!(value["estimated"], true);
     assert_eq!(value["domainId"], "domain1");
@@ -185,6 +221,8 @@ async fn stats_weighted_counts_query_only_owned_scope_and_keep_preview_prefetch_
     assert!(sql.contains(&format!("FROM slg_clicks_{NAMESPACE}")));
     for clause in [
         "SUM(_sample_interval)",
+        "SUM(_sample_interval * double2) AS first_count",
+        "SUM(_sample_interval * double3) AS repeat_count",
         "blob1 = 'v1'",
         "blob2 = 'example.com'",
         "blob3 = 'go'",
@@ -226,8 +264,38 @@ async fn stats_accepts_pre_aggregation_event_metadata() {
     assert_eq!(value["status"], "ready");
     assert_eq!(
         value["totals"],
-        json!({"total":9,"likelyHuman":0,"likelyBot":7,"unknown":2,"previews":1,"prefetches":1})
+        json!({"total":9,"likelyHuman":0,"likelyBot":7,"unknown":2,"previews":1,"prefetches":1,"dedup":{"first":0,"repeat":0}})
     );
+}
+
+#[tokio::test]
+async fn stats_mixed_legacy_and_new_events_report_only_measured_dedup() {
+    let (server, mut backend, _guard) = fixture().await;
+    arrange(&mut backend);
+    resource(&server, true).await;
+    Mock::given(method("POST"))
+        .and(path(SQL_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(envelope(vec![
+            // The same group can contain old events without double2/3 and new events.
+            row_dedup(
+                "likely_human",
+                "click",
+                "browser_navigation",
+                json!(12),
+                json!("3.0"),
+                json!(2.0),
+            ),
+            row("likely_bot", "click", "ua_bot", json!(4)),
+            row("likely_bot", "preview", "ua_preview", json!(2)),
+        ])))
+        .mount(&server)
+        .await;
+
+    let value = query(&mut backend, 7).await;
+    assert_eq!(value["status"], "ready");
+    assert_eq!(value["totals"]["total"], 16);
+    assert_eq!(value["totals"]["dedup"], json!({"first":3,"repeat":2}));
+    assert_eq!(value["totals"]["previews"], 2);
 }
 
 #[tokio::test]
@@ -266,6 +334,9 @@ async fn stats_empty_is_no_data_but_zero_weight_group_is_ready() {
         let value = query(&mut backend, 30).await;
         assert_eq!(value["status"], expected);
         assert_eq!(value.get("totals").is_some(), expected == "ready");
+        if expected == "ready" {
+            assert_eq!(value["totals"]["dedup"], json!({"first":0,"repeat":0}));
+        }
     }
 }
 
@@ -322,6 +393,13 @@ async fn stats_reject_malformed_unknown_duplicate_or_overflow_data() {
     wrong_rows["rows"] = json!(2);
     let mut extra = valid.clone();
     extra["raw_ua"] = json!("private-ua");
+    let mut missing_dedup = valid.clone();
+    missing_dedup.as_object_mut().unwrap().remove("first_count");
+    let mut missing_repeat = valid.clone();
+    missing_repeat
+        .as_object_mut()
+        .unwrap()
+        .remove("repeat_count");
     let mut error = envelope(vec![]);
     error["exception"] = json!("private-query");
     let mut cases = vec![
@@ -331,6 +409,8 @@ async fn stats_reject_malformed_unknown_duplicate_or_overflow_data() {
         error,
         envelope(vec![valid.clone(), valid]),
         envelope(vec![extra]),
+        envelope(vec![missing_dedup]),
+        envelope(vec![missing_repeat]),
         envelope(vec![row("human", "click", "browser_navigation", json!(1))]),
         envelope(vec![row("likely_human", "preview", "ua_preview", json!(1))]),
         envelope(vec![row(
@@ -358,6 +438,11 @@ async fn stats_reject_malformed_unknown_duplicate_or_overflow_data() {
         json!(-1),
         json!(0.5),
         json!("NaN"),
+        json!("0.5"),
+        json!("-0.0"),
+        json!("9007199254740992.0"),
+        json!("9007199254740990.1"),
+        json!("1e0"),
         json!("Infinity"),
         json!(true),
         Value::Null,
@@ -372,6 +457,63 @@ async fn stats_reject_malformed_unknown_duplicate_or_overflow_data() {
             count,
         )]));
     }
+    for bad in [
+        json!(-1),
+        json!(0.5),
+        json!("NaN"),
+        json!("0.5"),
+        json!("-0.0"),
+        json!("9007199254740992.0"),
+        json!("9007199254740990.1"),
+        json!("1e0"),
+        json!(true),
+        Value::Null,
+        json!(9_007_199_254_740_992_u64),
+        json!("18446744073709551616"),
+    ] {
+        cases.push(envelope(vec![row_dedup(
+            "likely_human",
+            "click",
+            "browser_navigation",
+            json!(2),
+            bad.clone(),
+            json!(0),
+        )]));
+        cases.push(envelope(vec![row_dedup(
+            "likely_human",
+            "click",
+            "browser_navigation",
+            json!(2),
+            json!(0),
+            bad,
+        )]));
+    }
+    cases.extend([
+        envelope(vec![row_dedup(
+            "likely_human",
+            "click",
+            "browser_navigation",
+            json!(1),
+            json!(1),
+            json!(1),
+        )]),
+        envelope(vec![row_dedup(
+            "likely_bot",
+            "preview",
+            "ua_preview",
+            json!(2),
+            json!(1),
+            json!(0),
+        )]),
+        envelope(vec![row_dedup(
+            "unknown",
+            "prefetch",
+            "prefetch_header",
+            json!(2),
+            json!(0),
+            json!(1),
+        )]),
+    ]);
     for body in cases {
         let (server, mut backend, _guard) = fixture().await;
         arrange(&mut backend);
@@ -487,7 +629,14 @@ async fn stats_center_summary_covers_scope_while_rows_only_cover_stable_current_
         .and(path(SQL_PATH))
         .and(body_string_contains("SELECT blob5 AS classification"))
         .respond_with(ResponseTemplate::new(200).set_body_json(envelope(vec![
-            row("likely_human", "click", "browser_navigation", json!(30)),
+            row_dedup(
+                "likely_human",
+                "click",
+                "browser_navigation",
+                json!(30),
+                json!(6.0),
+                json!(3.0),
+            ),
             row("likely_bot", "click", "cf_score_low", json!(20)),
             row("unknown", "click", "insufficient_signals", json!(10)),
             row("likely_bot", "preview", "ua_preview", json!(4)),
@@ -499,7 +648,7 @@ async fn stats_center_summary_covers_scope_while_rows_only_cover_stable_current_
         .and(path(SQL_PATH))
         .and(body_string_contains("SELECT blob2 AS host"))
         .respond_with(ResponseTemplate::new(200).set_body_json(envelope(vec![
-            page_row(
+            page_row_dedup(
                 "second.example.com",
                 "out",
                 "S24",
@@ -507,6 +656,8 @@ async fn stats_center_summary_covers_scope_while_rows_only_cover_stable_current_
                 "click",
                 "browser_navigation",
                 json!("3"),
+                json!(2),
+                json!(1),
             ),
             page_row(
                 "second.example.com",
@@ -528,12 +679,13 @@ async fn stats_center_summary_covers_scope_while_rows_only_cover_stable_current_
     assert_eq!(value["pageSize"], 25);
     assert_eq!(
         value["totals"],
-        json!({"total":60,"likelyHuman":30,"likelyBot":20,"unknown":10,"previews":4,"prefetches":2})
+        json!({"total":60,"likelyHuman":30,"likelyBot":20,"unknown":10,"previews":4,"prefetches":2,"dedup":{"first":6,"repeat":3}})
     );
     assert_eq!(
         value["rows"],
         json!([{"domainId":"domain2","slug":"S24","totals":{
-            "total":3,"likelyHuman":3,"likelyBot":0,"unknown":0,"previews":1,"prefetches":0
+            "total":3,"likelyHuman":3,"likelyBot":0,"unknown":0,"previews":1,"prefetches":0,
+            "dedup":{"first":2,"repeat":1}
         }}])
     );
     assert!(value["message"].as_str().unwrap().contains("已删除链接"));
@@ -566,6 +718,10 @@ async fn stats_center_summary_covers_scope_while_rows_only_cover_stable_current_
     assert!(!detail.contains("blob4 = 'S23'"));
     assert!(!detail.contains("blob4 = 'OK'"));
     assert!(detail.contains("LIMIT 12 FORMAT JSON"));
+    for sql in [summary, detail] {
+        assert!(sql.contains("SUM(_sample_interval * double2) AS first_count"));
+        assert!(sql.contains("SUM(_sample_interval * double3) AS repeat_count"));
+    }
 }
 
 #[tokio::test]
@@ -608,8 +764,7 @@ async fn stats_center_accepts_pre_aggregation_event_metadata_for_summary_and_pag
         .await;
 
     let value = center_query(&mut backend, Some("domain1"), 1).await;
-    let expected =
-        json!({"total":9,"likelyHuman":0,"likelyBot":7,"unknown":2,"previews":1,"prefetches":1});
+    let expected = json!({"total":9,"likelyHuman":0,"likelyBot":7,"unknown":2,"previews":1,"prefetches":1,"dedup":{"first":0,"repeat":0}});
     assert_eq!(value["status"], "ready");
     assert_eq!(value["totals"], expected);
     assert_eq!(value["rows"][0]["totals"], expected);
@@ -644,7 +799,8 @@ async fn stats_center_no_data_keeps_summary_status_and_zero_fills_current_rows()
     assert_eq!(
         value["rows"],
         json!([{"domainId":"domain1","slug":"OK","totals":{
-            "total":0,"likelyHuman":0,"likelyBot":0,"unknown":0,"previews":0,"prefetches":0
+            "total":0,"likelyHuman":0,"likelyBot":0,"unknown":0,"previews":0,"prefetches":0,
+            "dedup":{"first":0,"repeat":0}
         }}])
     );
     assert_eq!(
@@ -747,6 +903,51 @@ async fn stats_center_rejects_corrupt_summary_or_detail_without_partial_success(
 }
 
 #[tokio::test]
+async fn stats_center_rejects_invalid_dedup_in_page_without_partial_totals() {
+    let (server, mut backend, _guard) = fixture().await;
+    arrange(&mut backend);
+    resource(&server, true).await;
+    Mock::given(method("POST"))
+        .and(path(SQL_PATH))
+        .and(body_string_contains("SELECT blob5 AS classification"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(envelope(vec![row_dedup(
+                "likely_human",
+                "click",
+                "browser_navigation",
+                json!(4),
+                json!(2),
+                json!(1),
+            )])),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(SQL_PATH))
+        .and(body_string_contains("SELECT blob2 AS host"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(envelope(vec![page_row_dedup(
+                "example.com",
+                "go",
+                "OK",
+                "likely_human",
+                "click",
+                "browser_navigation",
+                json!(4),
+                json!(3),
+                json!(2),
+            )])),
+        )
+        .mount(&server)
+        .await;
+
+    let value = center_query(&mut backend, None, 1).await;
+    assert_eq!(value["status"], "unavailable");
+    assert!(value.get("totals").is_none());
+    assert!(value.get("rows").is_none());
+}
+
+#[tokio::test]
 async fn stats_center_accepts_a_full_legal_page_larger_than_single_link_budget() {
     let (server, mut backend, _guard) = fixture().await;
     backend.db.accounts[0].resources.as_mut().unwrap().namespace = NAMESPACE.into();
@@ -816,7 +1017,7 @@ async fn stats_center_accepts_a_full_legal_page_larger_than_single_link_budget()
     for row in value["rows"].as_array().unwrap() {
         assert_eq!(
             row["totals"],
-            json!({"total":9,"likelyHuman":2,"likelyBot":5,"unknown":2,"previews":1,"prefetches":1})
+            json!({"total":9,"likelyHuman":2,"likelyBot":5,"unknown":2,"previews":1,"prefetches":1,"dedup":{"first":0,"repeat":0}})
         );
     }
 }

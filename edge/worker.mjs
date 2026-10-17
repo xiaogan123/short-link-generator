@@ -7,7 +7,9 @@ const ROUTE = /^\/([a-z0-9-]{1,12})\/([A-Za-z0-9_-]{1,32})$/;
 const SELFTEST = /^([0-9]{1,16})\.([A-Z]{2})\.([0-9a-f]{64})$/;
 const HEX_KEY = /^[0-9a-fA-F]{64}$/;
 const CACHE_TTL_MS = 60_000;
+const NEGATIVE_TTL_MS = 3_000;
 const MAX_CACHE_ENTRIES = 256;
+const MAX_NEGATIVE_ENTRIES = 128;
 const MAX_CONFIG_BYTES = 1024;
 const MAX_LINK_BYTES = 16_384;
 const MAX_URL_LENGTH = 2048;
@@ -21,6 +23,14 @@ const MAX_PROBE_BODY_BYTES = 128 * 1024;
 const MAX_PROBE_TARGETS = 20;
 const encoder = new TextEncoder();
 const caches = new WeakMap();
+const inflightReads = new WeakMap();
+const signingKeys = new WeakMap();
+let fallbackSecret;
+const dedupSeen = new Map();
+let lastDedupTime = 0;
+const DEDUP_TTL_MS = 30 * 60_000;
+const MAX_DEDUP_ENTRIES = 4096;
+const GUARD_TIMEOUT_MS = 50;
 const nameCaches = new WeakMap();
 const NAME_TTL_MS = 10 * 60_000;
 const NAME_WINDOW_MS = 60 * 60_000;
@@ -178,19 +188,103 @@ function classifyTraffic(request) {
   };
 }
 
-function recordClick(env, request, host, prefix, canonicalSlug) {
+function clientIp(request) {
+  const value = headerValue(request, 'CF-Connecting-IP');
+  if (value.length > 45) return null;
+  if (/^\d{1,3}(?:\.\d{1,3}){3}$/.test(value)) {
+    const octets = value.split('.').map(Number);
+    return octets.every(octet => octet <= 255) ? octets.join('.') : null;
+  }
+  if (!value.includes(':') || !/^[0-9a-fA-F:.]+$/.test(value)) return null;
+  try {
+    return new URL(`http://[${value}]/`).hostname.slice(1, -1);
+  } catch {
+    return null;
+  }
+}
+
+async function signingKey(env) {
+  const secret = typeof env.SELFTEST_KEY === 'string' && HEX_KEY.test(env.SELFTEST_KEY)
+    ? env.SELFTEST_KEY : null;
+  let entry = signingKeys.get(env);
+  if (!entry || entry.secret !== secret) {
+    if (!secret) fallbackSecret ??= crypto.getRandomValues(new Uint8Array(32));
+    entry = { secret, key: crypto.subtle.importKey('raw', secret ? hexBytes(secret) : fallbackSecret,
+      { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']) };
+    signingKeys.set(env, entry);
+  }
+  return entry.key;
+}
+
+async function privateDigest(env, purpose, parts) {
+  const key = await signingKey(env);
+  const message = encoder.encode(JSON.stringify([`slg:${purpose}:v1`, ...parts]));
+  const signature = new Uint8Array(await crypto.subtle.sign('HMAC', key, message));
+  return Array.from(signature, byte => byte.toString(16).padStart(2, '0')).join('');
+}
+
+async function allowClick(env, request, host, prefix, slug, selftest) {
+  if (selftest !== null || env.CLICK_GUARD_DISABLED === '1' ||
+      typeof env.CLICK_RATE_LIMITER?.limit !== 'function') return true;
+  const ip = clientIp(request);
+  if (!ip) return true;
+  try {
+    const key = await privateDigest(env, 'rate', [host, prefix, slug.toLowerCase(), ip]);
+    let timer;
+    const timeout = new Promise(resolve => { timer = setTimeout(() => resolve(null), GUARD_TIMEOUT_MS); });
+    try {
+      const result = await Promise.race([env.CLICK_RATE_LIMITER.limit({ key }), timeout]);
+      return result?.success !== false;
+    } finally {
+      clearTimeout(timer);
+    }
+  } catch {
+    return true;
+  }
+}
+
+async function clickDedup(env, request, host, prefix, slug) {
+  const ip = clientIp(request);
+  const ua = headerValue(request, 'User-Agent');
+  if (!ip || !ua || ua.length > 512) return [0, 0];
+  try {
+    const digest = await privateDigest(env, 'dedup', [host, prefix, slug, ip, ua]);
+    // Keep expiries in insertion order even if the wall clock moves backwards.
+    const now = Math.max(Date.now(), lastDedupTime);
+    lastDedupTime = now;
+    const expiry = dedupSeen.get(digest);
+    if (expiry && expiry > now) return [0, 1];
+    if (expiry) dedupSeen.delete(digest);
+    if (dedupSeen.size >= MAX_DEDUP_ENTRIES) {
+      while (dedupSeen.size) {
+        const [oldest, until] = dedupSeen.entries().next().value;
+        if (until > now) break;
+        dedupSeen.delete(oldest);
+      }
+    }
+    if (dedupSeen.size >= MAX_DEDUP_ENTRIES) return [0, 0];
+    dedupSeen.set(digest, now + DEDUP_TTL_MS);
+    return [1, 0];
+  } catch {
+    return [0, 0];
+  }
+}
+
+async function recordClick(env, request, host, prefix, canonicalSlug) {
   try {
     const binding = env.CLICK_EVENTS;
     if (!binding || typeof binding.writeDataPoint !== 'function') return;
     const { classification, trafficKind, reason } = classifyTraffic(request);
+    const [first, repeat] = trafficKind === 'click'
+      ? await clickDedup(env, request, host, prefix, canonicalSlug) : [0, 0];
     const pending = binding.writeDataPoint({
       indexes: [host.slice(0, 96)],
       blobs: ['v1', host, prefix, canonicalSlug, classification, trafficKind, reason],
-      doubles: [1],
+      doubles: [1, first, repeat],
     });
-    // Analytics must stay off the redirect's critical path. Analytics Engine
-    // sampling is accounted for when querying with SUM(_sample_interval).
-    Promise.resolve(pending).catch(() => {});
+    // The execution context keeps any asynchronous analytics work alive after
+    // the redirect is returned. Sampling uses SUM(_sample_interval) in queries.
+    await Promise.resolve(pending);
   } catch {
     // Missing, malformed or failing analytics bindings never change redirects.
   }
@@ -248,6 +342,17 @@ function cacheFor(binding) {
   return cache;
 }
 
+function trimCache(cache) {
+  const misses = [...cache].filter(([, entry]) => entry.value === null).map(([key]) => key);
+  for (const key of misses.slice(0, Math.max(0, misses.length - MAX_NEGATIVE_ENTRIES))) {
+    cache.delete(key);
+  }
+  while (cache.size > MAX_CACHE_ENTRIES) {
+    const oldestMiss = [...cache].find(([, entry]) => entry.value === null)?.[0];
+    cache.delete(oldestMiss ?? cache.keys().next().value);
+  }
+}
+
 async function readKV(binding, key, maxBytes, bypassCache, validate) {
   const cache = cacheFor(binding);
   const now = Date.now();
@@ -260,25 +365,42 @@ async function readKV(binding, key, maxBytes, bypassCache, validate) {
     }
     if (entry) cache.delete(key);
   }
+  let reads = inflightReads.get(binding);
+  if (!reads) {
+    reads = new Map();
+    inflightReads.set(binding, reads);
+  }
+  if (!bypassCache && reads.has(key)) return reads.get(key);
   // Leave Cloudflare's own KV cache at its documented default. Authenticated
-  // probes bypass only this process cache; global KV propagation may lag.
-  const value = await binding.get(key, 'text');
-  if (value === null) return null;
-  if (typeof value !== 'string' || encoder.encode(value).byteLength > maxBytes) {
-    throw new Error('Invalid KV value');
-  }
-  let parsed;
+  // probes bypass this process cache and ordinary in-flight reads.
+  const pending = (async () => {
+    const value = await binding.get(key, 'text');
+    if (value === null) {
+      if (!bypassCache) cache.set(key, { value: null, expires: Date.now() + NEGATIVE_TTL_MS });
+      return null;
+    }
+    if (typeof value !== 'string' || encoder.encode(value).byteLength > maxBytes) {
+      throw new Error('Invalid KV value');
+    }
+    let parsed;
+    try {
+      parsed = JSON.parse(value);
+    } catch {
+      throw new Error('Invalid KV JSON');
+    }
+    if (!validate(parsed)) throw new Error('Invalid KV record');
+    if (!bypassCache) cache.set(key, { value: parsed, expires: Date.now() + CACHE_TTL_MS });
+    return parsed;
+  })();
+  if (!bypassCache) reads.set(key, pending);
   try {
-    parsed = JSON.parse(value);
-  } catch {
-    throw new Error('Invalid KV JSON');
+    return await pending;
+  } finally {
+    if (!bypassCache) {
+      reads.delete(key);
+      trimCache(cache);
+    }
   }
-  if (!validate(parsed)) throw new Error('Invalid KV record');
-  if (!bypassCache) {
-    cache.set(key, { value: parsed, expires: now + CACHE_TTL_MS });
-    while (cache.size > MAX_CACHE_ENTRIES) cache.delete(cache.keys().next().value);
-  }
-  return parsed;
 }
 
 function validDestination(value) {
@@ -565,7 +687,7 @@ function requestParts(rawUrl) {
 }
 
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     const head = request.method === 'HEAD';
     if (request.method !== 'GET' && !head) {
       return response(405, 'Method Not Allowed', false, { Allow: 'GET, HEAD' });
@@ -578,6 +700,9 @@ export default {
     const { host, path } = parts;
     const selftest = await selftestCountry(request, env, host, path);
     const country = selftest ?? (request.cf?.country === 'CN' ? 'CN' : '');
+    if (!await allowClick(env, request, host, route[1], route[2], selftest)) {
+      return response(429, 'Too Many Requests', head, { 'Retry-After': '10' });
+    }
     if (!env.LINKS || typeof env.LINKS.get !== 'function') {
       return response(503, 'Service Unavailable', head);
     }
@@ -608,7 +733,20 @@ export default {
       // Serialize validated HTTPS URLs before constructing a header: Unicode
       // hostnames need punycode and path/query characters need percent encoding.
       const redirect = response(302, null, head, { Location: new URL(destination).href });
-      if (!head && selftest === null) recordClick(env, request, host, config.prefix, canonicalSlug);
+      if (!head && selftest === null) {
+        if (typeof ctx?.waitUntil === 'function') {
+          const pending = recordClick(env, request, host, config.prefix, canonicalSlug);
+          try {
+            ctx.waitUntil(pending);
+          } catch {
+            // Statistics cannot affect a validated redirect.
+            pending.catch(() => {});
+          }
+        } else {
+          // The local test harness does not provide an execution context.
+          await recordClick(env, request, host, config.prefix, canonicalSlug);
+        }
+      }
       return redirect;
     } catch {
       return response(503, 'Service Unavailable', head);

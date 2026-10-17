@@ -3,6 +3,22 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 beforeEach(() => { vi.resetModules(); window.history.replaceState({}, '', '/?preview=1'); });
 
 describe('explicit preview bridge', () => {
+  it('keeps ASCII identity ordering consistent across preview statistics pages',async()=>{
+    window.history.replaceState({}, '', '/?preview=1&clickStats=1&manyLinks=1');
+    const {dispatch}=await import('./bridge');
+    for (const slug of ['Zebra', '_sample', 'alpha']) {
+      const plan=await dispatch<{id:string}>('prepare_change',{kind:'save_link',domainId:'demo-d1',slug,cnUrl:'https://example.com/zh',defaultUrl:'https://example.org/en',createOnly:true});
+      await dispatch('apply_plan',{planId:plan.id});
+    }
+    const state=await dispatch<import('./types').State>('get_state');
+    const expected=state.links.map(link=>`${link.domainId}\u0000${link.slug}`).sort();
+    const actual:string[]=[];
+    for (let page=1;page<=Math.ceil(expected.length/25);page++) {
+      const report=await dispatch<import('./types').StatsCenterReport>('get_stats_center',{accountId:'demo-a',days:7,page,pageSize:25});
+      actual.push(...(report.rows||[]).map(row=>`${row.domainId}\u0000${row.slug}`));
+    }
+    expect(actual).toEqual(expected);
+  });
   it('returns one explicitly selected statistics-center scope with fixed pagination',async()=>{
     window.history.replaceState({}, '', '/?preview=1&clickStats=1&manyLinks=1');
     const {dispatch}=await import('./bridge');

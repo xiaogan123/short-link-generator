@@ -8,7 +8,10 @@ import type {
   Domain,
   Link,
   StatsCenterReport,
+  StatsCenterRow,
 } from "./types";
+import StatsAllLinks from "./StatsAllLinks";
+import { dedupLabel, dedupNote, sumDedup, validDedup } from "./clickDedup";
 import "./StatsCenter.css";
 
 const PAGE_SIZE = 25 as const;
@@ -25,10 +28,10 @@ type ViewState =
   | { kind: "error"; message: string };
 
 type OverviewEntry =
-  | { kind: "report"; report: StatsCenterReport }
+  | { kind: "report"; report: StatsCenterReport; allRows: StatsCenterRow[]; detailError?: string }
   | { kind: "migration" }
   | { kind: "error"; message: string };
-type OverviewState = { kind: "idle" | "loading" | "complete"; entries: Record<string, OverviewEntry>; completed: number; identity?: string };
+type OverviewState = { kind: "idle" | "loading" | "complete"; entries: Record<string, OverviewEntry>; completed: number; identity?: string; stopped?: boolean };
 
 type Props = {
   accounts: Account[];
@@ -53,7 +56,7 @@ function validTotals(totals: unknown): totals is ClickStatsTotals {
 function addTotals(values: ClickStatsTotals[]): ClickStatsTotals | null {
   const result: ClickStatsTotals = { total: 0, likelyHuman: 0, likelyBot: 0, unknown: 0, previews: 0, prefetches: 0 };
   for (const value of values) {
-    for (const key of Object.keys(result) as (keyof ClickStatsTotals)[]) {
+    for (const key of ["total", "likelyHuman", "likelyBot", "unknown", "previews", "prefetches"] as const) {
       const next = result[key] + value[key];
       if (!Number.isSafeInteger(next)) return null;
       result[key] = next;
@@ -117,13 +120,37 @@ function validReport(
     const key = `${row.domainId}\u0000${row.slug}`;
     if (seen.has(key)) return false;
     seen.add(key);
-    if (report.status === "no_data" && Object.values(row.totals).some((number) => number !== 0)) return false;
+    if (report.status === "no_data" && (row.totals.total !== 0 || row.totals.likelyHuman !== 0 || row.totals.likelyBot !== 0 || row.totals.unknown !== 0 || row.totals.previews !== 0 || row.totals.prefetches !== 0 || (row.totals.dedup !== undefined && (row.totals.dedup.first !== 0 || row.totals.dedup.repeat !== 0)))) return false;
   }
   return true;
 }
 
 function number(value: number) {
   return value.toLocaleString("zh-CN");
+}
+
+// Match the backend's byte ordering: validated domain IDs and slugs are ASCII.
+function overviewScopeLinks(accountId: string, domains: Domain[], links: Link[]) {
+  const ids = new Set(domains.filter((domain) => domain.accountId === accountId).map((domain) => domain.id));
+  const compare = (left: string, right: string) => left < right ? -1 : left > right ? 1 : 0;
+  return links.filter((link) => ids.has(link.domainId))
+    .sort((left, right) => compare(left.domainId, right.domainId) || compare(left.slug, right.slug));
+}
+
+function completeOverviewPage(report: StatsCenterReport, scope: Link[]) {
+  if (report.totalLinks !== scope.length) return false;
+  if (report.status !== "ready" && report.status !== "no_data") return true;
+  const expected = scope.slice((report.page - 1) * PAGE_SIZE, report.page * PAGE_SIZE);
+  const keys = new Set(expected.map((link) => `${link.domainId}\u0000${link.slug}`));
+  return report.rows?.length === expected.length
+    && report.rows.every((row) => keys.has(`${row.domainId}\u0000${row.slug}`));
+}
+
+function overviewEntryStatus(entry?: OverviewEntry) {
+  return entry?.kind === "migration" ? "需迁移授权"
+    : entry?.kind === "error" ? "读取失败"
+      : entry?.kind === "report" ? ({ ready: "可汇总", disabled: "未启用", no_data: "无可汇总数据", permission_denied: "权限不足", unavailable: "暂不可用" }[entry.report.status])
+        : "未读取";
 }
 
 function wholePercentages(values: number[]) {
@@ -311,6 +338,10 @@ export default function StatsCenter({
       return;
     }
     const entries: Record<string, OverviewEntry> = {};
+    let completed = 0;
+    const publishProgress = () => {
+      if (current()) setOverview({ kind: "loading", entries: { ...entries }, completed, identity: requestDataIdentity });
+    };
     for (const account of accounts) {
       if (!current()) return;
       let entry: OverviewEntry;
@@ -318,23 +349,59 @@ export default function StatsCenter({
         entry = { kind: "migration" };
       } else {
         const expected = { accountId: account.id, domainId: null, days, page: 1 };
+        const scope = overviewScopeLinks(account.id, domains, links);
         try {
           const report = await dispatch<StatsCenterReport>("get_stats_center", {
             accountId: account.id, days, page: 1, pageSize: PAGE_SIZE,
           });
           if (!current()) return;
-          entry = validReport(report, expected, domains, links)
-            ? { kind: "report", report }
+          entry = validReport(report, expected, domains, links) && completeOverviewPage(report, scope)
+            ? { kind: "report", report, allRows: report.rows || [] }
             : { kind: "error", message: "返回的统计结果与当前账户或范围不一致。" };
+          if (entry.kind === "report" && (report.status === "ready" || report.status === "no_data")) {
+            entries[account.id] = entry;
+            publishProgress();
+            // Bound the queue by current local identities, never a remote count.
+            const pages = Math.ceil(scope.length / PAGE_SIZE);
+            for (let nextPage = 2; nextPage <= pages; nextPage += 1) {
+              if (!current()) return;
+              try {
+                const next = await dispatch<StatsCenterReport>("get_stats_center", {
+                  accountId: account.id, days, page: nextPage, pageSize: PAGE_SIZE,
+                });
+                if (!current()) return;
+                if (!validReport(next, { ...expected, page: nextPage }, domains, links)
+                  || !completeOverviewPage(next, scope)
+                  || (next.status !== "ready" && next.status !== "no_data")) {
+                  throw new Error("部分链接明细未能完整读取，请刷新重试。未读取的链接不显示为零。");
+                }
+                // Each page repeats the full-scope summary. Keep only the first
+                // summary; append validated, disjoint local-link pages only.
+                entry = { ...entry, allRows: [...entry.allRows, ...(next.rows || [])] };
+                entries[account.id] = entry;
+                publishProgress();
+              } catch (error) {
+                if (!current()) return;
+                entry = { ...entry, detailError: errorMessage(error) };
+                break;
+              }
+            }
+          }
         } catch (error) {
           if (!current()) return;
           entry = { kind: "error", message: errorMessage(error) };
         }
       }
       entries[account.id] = entry;
-      setOverview({ kind: "loading", entries: { ...entries }, completed: Object.keys(entries).length, identity: requestDataIdentity });
+      completed += 1;
+      publishProgress();
     }
     if (current()) setOverview({ kind: "complete", entries: { ...entries }, completed: accounts.length, identity: requestDataIdentity });
+  };
+
+  const stopOverview = () => {
+    requestSequence.current += 1;
+    setOverview((state) => ({ ...state, kind: "complete", stopped: true }));
   };
 
   const openTokenSettings = async () => {
@@ -400,7 +467,7 @@ export default function StatsCenter({
 
   const body = (() => {
     if (accounts.length === 0) return <Notice title="还没有可查询的账户" tone="warning">请先导入一个 Cloudflare 账户，再从这里读取访问统计。</Notice>;
-    if (!currentAccount) return <AccountsOverview accounts={accounts} domains={domains} links={links} days={days} overview={overview} onSelect={chooseAccount} />;
+    if (!currentAccount) return <AccountsOverview accounts={accounts} domains={domains} links={links} days={days} overview={overview} onSelect={chooseAccount} onOpenLinkStats={onOpenLinkStats} onStop={stopOverview} />;
     if (currentAccount.needsCredentialMigration) return <Notice title="需要先更新本机授权" tone="warning">请先到“Cloudflare 账户”完成此账户的本机授权迁移，再读取或配置访问统计。</Notice>;
     if (view.kind === "loading") return <div className="scenter-loading" role="status">正在读取所选账户的第 {page} 页统计…</div>;
     if (view.kind === "error") return <Notice title="统计读取失败" tone="error">{view.message || "操作未完成，请重试。"}</Notice>;
@@ -437,6 +504,7 @@ export default function StatsCenter({
     );
     if (!report.totals) return null;
     const totals = report.totals;
+    const dedup = validDedup(totals);
     const categories = [
       { key: "human", label: "疑似真人", value: totals.likelyHuman },
       { key: "bot", label: "疑似机器人", value: totals.likelyBot },
@@ -473,6 +541,7 @@ export default function StatsCenter({
             </div>
           </div>
         </section>
+        <p className="scenter-dedup" aria-label="约 30 分钟访问去重估算">约 30 分钟去重估算：首次 <strong>{dedup ? number(dedup.first) : "—"}</strong> · 重复 <strong>{dedup ? number(dedup.repeat) : "—"}</strong> · 测量覆盖 <strong>{dedup ? `${number(dedup.measured)} / ${number(totals.total)}` : "未覆盖"}</strong> 次访问。{dedupNote}</p>
         {contextDetails}
         <StatsTable report={report} domains={domains} links={links} onOpenLinkStats={onOpenLinkStats} />
       </>
@@ -568,26 +637,47 @@ export default function StatsCenter({
   );
 }
 
-function AccountsOverview({ accounts, domains, links, days, overview, onSelect }: {
+function AccountsOverview({ accounts, domains, links, days, overview, onSelect, onOpenLinkStats, onStop }: {
   accounts: Account[];
   domains: Domain[];
   links: Link[];
   days: ClickStatsDays;
   overview: OverviewState;
   onSelect: (accountId: string) => void;
+  onOpenLinkStats: (link: Link, domain: Domain) => void;
+  onStop: () => void;
 }) {
-  if (overview.kind === "idle") return <Notice title="全部账户">选择时间范围后点击“读取统计”，将依次读取各账户汇总。可选择账户查看链接明细。</Notice>;
   if (overview.entries[""]?.kind === "error") return <Notice title="无法读取总览" tone="error">{overview.entries[""].message}</Notice>;
+  const byDomain = new Map(domains.map((domain) => [domain.id, domain]));
+  const byAccount = new Map(accounts.map((account) => [account.id, account]));
+  const allRows = new Map(Object.values(overview.entries).flatMap((entry) => entry.kind === "report"
+    ? entry.allRows.map((row) => [`${row.domainId}\u0000${row.slug}`, row] as const) : []));
+  const items = links.flatMap((link) => {
+    const domain = byDomain.get(link.domainId);
+    const account = domain && byAccount.get(domain.accountId);
+    if (!domain || !account) return [];
+    const entry = overview.entries[account.id];
+    const row = allRows.get(`${domain.id}\u0000${link.slug}`);
+    const status = row ? "已读取 · 估算次数" : entry?.kind === "report" && entry.detailError ? "读取失败"
+      : entry?.kind === "report" && (entry.report.status === "ready" || entry.report.status === "no_data") ? "未读取"
+        : overviewEntryStatus(entry);
+    return [{ account, domain, link, totals: row?.totals, status }];
+  });
   const ready = accounts.flatMap((account) => {
     const entry = overview.entries[account.id];
     return entry?.kind === "report" && entry.report.status === "ready" && entry.report.totals ? [entry.report.totals] : [];
   });
   const aggregate = addTotals(ready);
+  const aggregateDedup = sumDedup(ready);
+  const hasDedupCoverage = Boolean(aggregateDedup && (aggregateDedup.measured > 0 || (aggregate?.total === 0 && ready.some((value) => validDedup(value)))));
   const range = ranges.find((item) => item.value === days)?.label;
   return <>
+    {overview.kind === "idle" && <Notice title="选择范围，读取全部链接">点击“读取统计”，将依次读取各账户和全部短链接明细。未读取的数值显示为“—”。</Notice>}
+    {overview.stopped && <Notice title="已停止读取">已读取的数据保留，未读取的链接显示为“—”。点击“刷新统计”可重新读取。</Notice>}
+    {overview.kind !== "idle" && <>
     <div className="scenter-overview-status" role="status">
       已处理 {overview.completed} / {accounts.length} 个账户 · 可汇总 {ready.length} 个
-      {overview.kind === "loading" && <span>正在依次读取…</span>}
+      {overview.kind === "loading" && <button type="button" className="button ghost" onClick={onStop}>停止读取</button>}
     </div>
     {ready.length > 0 && aggregate && <section className="scenter-overview-summary" aria-label="全部账户估算汇总">
       <div className="scenter-overview-grand"><span>估算总访问</span><strong>{number(aggregate.total)}</strong><small>{range} · 仅已读且可汇总账户</small></div>
@@ -599,31 +689,33 @@ function AccountsOverview({ accounts, domains, links, days, overview, onSelect }
         <div><dt>预加载</dt><dd>{number(aggregate.prefetches)}</dd></div>
       </dl>
     </section>}
+    {ready.length > 0 && aggregate && <p className="scenter-dedup" aria-label="全部账户约 30 分钟访问去重估算">约 30 分钟去重估算：首次 <strong>{hasDedupCoverage && aggregateDedup ? number(aggregateDedup.first) : "—"}</strong> · 重复 <strong>{hasDedupCoverage && aggregateDedup ? number(aggregateDedup.repeat) : "—"}</strong> · 测量覆盖 <strong>{hasDedupCoverage && aggregateDedup ? `${number(aggregateDedup.measured)} / ${number(aggregate.total)}` : "未覆盖"}</strong> 次访问。仅汇总有有效去重记录的账户；{dedupNote}</p>}
     {ready.length > 0 && !aggregate && <Notice title="汇总数值超出安全范围" tone="error">已停止显示跨账户汇总；各账户结果仍可查看。</Notice>}
-    <p className="scenter-overview-note">只汇总状态为“可汇总”的已读账户；其他状态及尚未读取的账户不按零计算。汇总覆盖各账户已导入域名的历史事件，包括已删除链接；链接数量仅为当前本机数据。</p>
+    </>}
+    <StatsAllLinks items={items} loading={overview.kind === "loading"} onOpenLinkStats={onOpenLinkStats} />
+    <p className="scenter-overview-note">估算访问次数，不是去重人数。各页读取时点可能不同；顶部汇总含已删除链接的历史事件，表格只列当前本机链接，二者可能不相等。未读取不当作零；已读零值仅表示本时段未返回事件。</p>
+    {overview.kind !== "idle" && <details className="scenter-account-details">
+    <summary>账户汇总与读取状态 <span>{ready.length} / {accounts.length} 个可汇总</span></summary>
     <div className="scenter-table-scroll"><table className="scenter-overview-table" aria-label="账户统计总览">
       <thead><tr><th>账户</th><th>总访问</th><th>疑似真人</th><th>疑似机器人</th><th>未知</th><th>本机域名 / 链接</th><th>状态</th><th>操作</th></tr></thead>
       <tbody>{accounts.map((account) => {
         const entry = overview.entries[account.id];
-        const status = entry?.kind === "migration" ? "需迁移授权"
-          : entry?.kind === "error" ? "读取失败"
-            : entry?.kind === "report" ? ({ ready: "可汇总", disabled: "未启用", no_data: "无可汇总数据", permission_denied: "权限不足", unavailable: "暂不可用" }[entry.report.status])
-              : "未读取";
+        const status = overviewEntryStatus(entry);
         const totals = entry?.kind === "report" && entry.report.status === "ready" ? entry.report.totals : undefined;
         const domainIds = new Set(domains.filter((domain) => domain.accountId === account.id).map((domain) => domain.id));
         const linkCount = links.filter((link) => domainIds.has(link.domainId)).length;
         return <tr key={account.id}>
           <td><strong>{account.label}</strong></td>
-          <td>{totals ? number(totals.total) : "—"}</td>
+          <td>{totals ? number(totals.total) : "—"}{totals && <small>{dedupLabel(totals)}</small>}</td>
           <td>{totals ? number(totals.likelyHuman) : "—"}</td>
           <td>{totals ? number(totals.likelyBot) : "—"}</td>
           <td>{totals ? number(totals.unknown) : "—"}</td>
           <td>{number(domainIds.size)} / {number(linkCount)}</td>
-          <td><span className={`scenter-account-status ${totals ? "is-ready" : ""}`}>{status}</span>{entry?.kind === "error" && <small>{entry.message}</small>}{entry?.kind === "report" && entry.report.status !== "ready" && entry.report.message && <small>{entry.report.message}</small>}</td>
+          <td><span className={`scenter-account-status ${totals ? "is-ready" : ""}`}>{status}</span>{entry?.kind === "error" && <small>{entry.message}</small>}{entry?.kind === "report" && entry.report.status !== "ready" && entry.report.message && <small>{entry.report.message}</small>}{entry?.kind === "report" && entry.detailError && <small>{entry.detailError}</small>}</td>
           <td><button type="button" className="button ghost" onClick={() => onSelect(account.id)}>查看链接</button></td>
         </tr>;
       })}</tbody>
-    </table></div>
+    </table></div></details>}
   </>;
 }
 
@@ -655,7 +747,7 @@ function StatsTable({ report, domains, links, onOpenLinkStats }: {
                     <td>{number(row.totals.likelyHuman)}</td>
                     <td>{number(row.totals.likelyBot)}</td>
                     <td>{number(row.totals.unknown)}</td>
-                    <td><strong>{number(row.totals.total)}</strong></td>
+                    <td><strong>{number(row.totals.total)}</strong><small>{dedupLabel(row.totals)}</small></td>
                     <td><button type="button" className="button ghost" disabled={!link || !domain} aria-label={`查看 ${row.slug} 的详细统计`} onClick={() => link && domain && onOpenLinkStats(link, domain)}>详细统计</button></td>
                   </tr>
                 );

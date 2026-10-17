@@ -486,8 +486,7 @@ mod tests {
             .is_none());
         assert!(request.headers().get(reqwest::header::COOKIE).is_none());
         assert!(request.headers().get("X-Selftest-Signature").is_none());
-        assert!(include_str!("../../edge/worker.mjs")
-            .contains("if (!head && selftest === null) recordClick"));
+        // The edge behavior tests separately verify HEAD emits no click event.
     }
 
     #[test]

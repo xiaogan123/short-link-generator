@@ -29,6 +29,9 @@
 .cstats-breakdown span { color: #6d7e73; font-size: 10px; }
 .cstats-breakdown strong { color: #263e30; font: 700 21px/1.1 Georgia, "Songti SC", serif; }
 .cstats-secondary { display: flex; align-items: center; gap: 17px; border-radius: 7px; background: #f4f6f1; padding: 10px 12px; color: #6c7c72; font-size: 10px; }
+.cstats-dedup { display: grid; gap: 5px; border: 1px solid #e0e5dd; border-radius: 8px; padding: 11px 13px; color: #536b5b; font-size: 11px; }
+.cstats-dedup strong { color: #263e30; font-size: 14px; }
+.cstats-dedup small { color: #829087; line-height: 1.5; }
 .cstats-secondary strong { color: #40594a; }
 .cstats-secondary small { margin-left: auto; color: #929e95; }
 .cstats-message, .cstats-updated, .cstats-scope { margin: 0; color: #7e8e84; font-size: 10px; line-height: 1.55; }

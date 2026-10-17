@@ -35,6 +35,13 @@ struct Totals {
     unknown: u64,
     previews: u64,
     prefetches: u64,
+    dedup: Dedup,
+}
+
+#[derive(Clone, Default, Serialize)]
+struct Dedup {
+    first: u64,
+    repeat: u64,
 }
 
 #[derive(Clone, Copy, Serialize)]
@@ -160,11 +167,18 @@ fn literal(value: &str) -> String {
 fn sql(dataset: &str, domain: &Domain, slug: &str, days: u64) -> String {
     // Values originate in validated owned local records, not SQL supplied by a
     // caller. Escaping remains explicit even though their alphabets exclude '.
-    format!("SELECT blob5 AS classification, blob6 AS traffic_kind, blob7 AS reason, SUM(_sample_interval) AS count \
+    format!(
+        "SELECT blob5 AS classification, blob6 AS traffic_kind, blob7 AS reason, \
+        SUM(_sample_interval) AS count, SUM(_sample_interval * double2) AS first_count, \
+        SUM(_sample_interval * double3) AS repeat_count \
         FROM {dataset} WHERE blob1 = 'v1' AND blob2 = {} AND blob3 = {} AND blob4 = {} \
         AND timestamp > NOW() - INTERVAL '{days}' DAY AND timestamp <= NOW() \
         GROUP BY blob5, blob6, blob7 LIMIT {} FORMAT JSON",
-        literal(&domain.host), literal(&domain.prefix), literal(slug), MAX_GROUPS + 1)
+        literal(&domain.host),
+        literal(&domain.prefix),
+        literal(slug),
+        MAX_GROUPS + 1
+    )
 }
 
 fn bounded_sql(query: String) -> Result<String, String> {
@@ -188,7 +202,9 @@ fn summary_sql(dataset: &str, domains: &[ScopeDomain], days: u64) -> Result<Stri
         .collect::<Vec<_>>()
         .join(" OR ");
     bounded_sql(format!(
-        "SELECT blob5 AS classification, blob6 AS traffic_kind, blob7 AS reason, SUM(_sample_interval) AS count \
+        "SELECT blob5 AS classification, blob6 AS traffic_kind, blob7 AS reason, \
+        SUM(_sample_interval) AS count, SUM(_sample_interval * double2) AS first_count, \
+        SUM(_sample_interval * double3) AS repeat_count \
         FROM {dataset} WHERE blob1 = 'v1' AND ({allowlist}) \
         AND timestamp > NOW() - INTERVAL '{days}' DAY AND timestamp <= NOW() \
         GROUP BY blob5, blob6, blob7 LIMIT {} FORMAT JSON",
@@ -212,7 +228,8 @@ fn page_sql(dataset: &str, links: &[PageLink], days: u64) -> Result<String, Stri
     bounded_sql(format!(
         "SELECT blob2 AS host, blob3 AS prefix, blob4 AS canonical_slug, \
         blob5 AS classification, blob6 AS traffic_kind, blob7 AS reason, \
-        SUM(_sample_interval) AS count FROM {dataset} \
+        SUM(_sample_interval) AS count, SUM(_sample_interval * double2) AS first_count, \
+        SUM(_sample_interval * double3) AS repeat_count FROM {dataset} \
         WHERE blob1 = 'v1' AND ({allowlist}) \
         AND timestamp > NOW() - INTERVAL '{days}' DAY AND timestamp <= NOW() \
         GROUP BY blob2, blob3, blob4, blob5, blob6, blob7 LIMIT {} FORMAT JSON",
@@ -265,12 +282,56 @@ fn weighted_count(value: &Value) -> Result<u64, AnalyticsError> {
     Ok(count)
 }
 
+fn weighted_double_count(value: &Value) -> Result<u64, AnalyticsError> {
+    // SUM of a double column may be encoded as a JSON float even when its
+    // weighted result is an integer. Some responses quote that float as a
+    // decimal string, so inspect its fractional digits before parsing the
+    // integer part; parsing the whole string as f64 could round a fraction.
+    if let Some(raw) = value.as_str() {
+        let (whole, fractional) = raw.split_once('.').unwrap_or((raw, ""));
+        if whole.is_empty()
+            || whole.len() > 16
+            || !whole.bytes().all(|byte| byte.is_ascii_digit())
+            || fractional.len() > 16
+            || !fractional.bytes().all(|byte| byte == b'0')
+            || (raw.contains('.') && fractional.is_empty())
+        {
+            return Err(AnalyticsError::Unavailable);
+        }
+        return weighted_count(&Value::String(whole.to_owned()));
+    }
+    if let Some(number) = value.as_f64() {
+        if !number.is_finite()
+            || number < 0.0
+            || number > MAX_SAFE_COUNT as f64
+            || number.fract() != 0.0
+        {
+            return Err(AnalyticsError::Unavailable);
+        }
+        return Ok(number as u64);
+    }
+    Err(AnalyticsError::Unavailable)
+}
+
 fn add_count(total: &mut u64, count: u64) -> Result<(), AnalyticsError> {
     *total = total
         .checked_add(count)
         .filter(|n| *n <= MAX_SAFE_COUNT)
         .ok_or(AnalyticsError::Unavailable)?;
     Ok(())
+}
+
+fn dedup_counts(row: &Value, kind: &str, count: u64) -> Result<(u64, u64), AnalyticsError> {
+    let first = weighted_double_count(&row["first_count"])?;
+    let repeat = weighted_double_count(&row["repeat_count"])?;
+    let measured = first
+        .checked_add(repeat)
+        .filter(|measured| *measured <= count)
+        .ok_or(AnalyticsError::Unavailable)?;
+    if kind != "click" && measured != 0 {
+        return Err(AnalyticsError::Unavailable);
+    }
+    Ok((first, repeat))
 }
 
 fn aggregate(value: &Value) -> Result<Option<Totals>, AnalyticsError> {
@@ -292,9 +353,17 @@ fn aggregate(value: &Value) -> Result<Option<Totals>, AnalyticsError> {
     let mut all_events = 0;
     for row in rows {
         let object = row.as_object().ok_or(AnalyticsError::Unavailable)?;
-        if object.len() != 4
+        if object.len() != 6
             || object.keys().any(|k| {
-                !["classification", "traffic_kind", "reason", "count"].contains(&k.as_str())
+                ![
+                    "classification",
+                    "traffic_kind",
+                    "reason",
+                    "count",
+                    "first_count",
+                    "repeat_count",
+                ]
+                .contains(&k.as_str())
             })
         {
             return Err(AnalyticsError::Unavailable);
@@ -310,12 +379,15 @@ fn aggregate(value: &Value) -> Result<Option<Totals>, AnalyticsError> {
             return Err(AnalyticsError::Unavailable);
         }
         let count = weighted_count(&row["count"])?;
+        let (first, repeat) = dedup_counts(row, kind, count)?;
         add_count(&mut all_events, count)?;
         match kind {
             "preview" => add_count(&mut totals.previews, count)?,
             "prefetch" => add_count(&mut totals.prefetches, count)?,
             _ => {
                 add_count(&mut totals.total, count)?;
+                add_count(&mut totals.dedup.first, first)?;
+                add_count(&mut totals.dedup.repeat, repeat)?;
                 match class {
                     "likely_human" => add_count(&mut totals.likely_human, count)?,
                     "likely_bot" => add_count(&mut totals.likely_bot, count)?,
@@ -353,7 +425,7 @@ fn aggregate_page(
     let mut groups = HashSet::new();
     for row in rows {
         let object = row.as_object().ok_or(AnalyticsError::Unavailable)?;
-        if object.len() != 7
+        if object.len() != 9
             || object.keys().any(|key| {
                 ![
                     "host",
@@ -363,6 +435,8 @@ fn aggregate_page(
                     "traffic_kind",
                     "reason",
                     "count",
+                    "first_count",
+                    "repeat_count",
                 ]
                 .contains(&key.as_str())
             })
@@ -391,12 +465,15 @@ fn aggregate_page(
             return Err(AnalyticsError::Unavailable);
         }
         let count = weighted_count(&row["count"])?;
+        let (first, repeat) = dedup_counts(row, kind, count)?;
         add_count(&mut all_events[index], count)?;
         match kind {
             "preview" => add_count(&mut totals[index].previews, count)?,
             "prefetch" => add_count(&mut totals[index].prefetches, count)?,
             _ => {
                 add_count(&mut totals[index].total, count)?;
+                add_count(&mut totals[index].dedup.first, first)?;
+                add_count(&mut totals[index].dedup.repeat, repeat)?;
                 match classification {
                     "likely_human" => add_count(&mut totals[index].likely_human, count)?,
                     "likely_bot" => add_count(&mut totals[index].likely_bot, count)?,

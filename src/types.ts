@@ -11,12 +11,13 @@ export type DomainPreparation = { host: string; prefix: string; dnsMode?: 'syste
 export type DomainDnsPreparation = { host: string; candidates: { accountId: string; label: string; zoneId: string; status: string }[]; checks: DomainCheck[]; dnsStatus: 'ready'|'missing'|'dnsOnly'|'unsupported'|'conflict'|'readFailed'; actions: { kind: 'createPlaceholder'|'enableProxy'; recordType: string; name: string }[]; canApply: boolean; plan?: Plan };
 export type Selftest = { status: 'passed' | 'pending' | 'failed' | 'key_missing'; message: string; checks: (Check & {reason?: string})[] };
 export type UpdateStatus = { status: 'unavailable' | 'up_to_date' | 'available' | 'installed'; currentVersion?: string; version?: string; notes?: string };
-export type Action = 'get_state' | 'token_template' | 'import_token' | 'rename_account' | 'remove_account' | 'refresh_accounts' | 'refresh_domains' | 'prepare_domain' | 'prepare_domain_dns' | 'prepare_change' | 'apply_plan' | 'selftest_link' | 'export_config' | 'import_config' | 'check_update' | 'install_update' | 'prepare_monitor' | 'disable_monitor' | 'resume_monitor' | 'check_link_targets' | 'check_pool_health' | 'get_link_stats' | 'get_stats_center' | 'check_link_redirect';
+export type Action = 'get_state' | 'token_template' | 'import_token' | 'rename_account' | 'remove_account' | 'refresh_accounts' | 'refresh_domains' | 'prepare_domain' | 'prepare_domain_dns' | 'prepare_change' | 'apply_plan' | 'selftest_link' | 'export_config' | 'import_config' | 'check_update' | 'install_update' | 'prepare_monitor' | 'disable_monitor' | 'resume_monitor' | 'check_link_targets' | 'check_pool_health' | 'get_link_stats' | 'get_stats_center' | 'get_click_protection' | 'check_link_redirect';
 export type RedirectCheck = {status:'passed'|'failed'|'unknown';message:string;reason?:string;checkedAt:string;dnsMode:'system'|'public'};
 
 export type ClickStatsDays = 1 | 7 | 30;
 export type ClickStatsStatus = 'ready' | 'disabled' | 'no_data' | 'permission_denied' | 'unavailable';
-export type ClickStatsTotals = {total: number; likelyHuman: number; likelyBot: number; unknown: number; previews: number; prefetches: number};
+export type ClickStatsTotals = {total: number; likelyHuman: number; likelyBot: number; unknown: number; previews: number; prefetches: number; dedup?: {first:number;repeat:number}};
+export type ClickProtection = {accountId:string;status:'enabled'|'disabled'|'upgrade_required';limit:number;periodSeconds:number;checkedAt:string};
 export type ClickStats = {
   status: ClickStatsStatus;
   message: string;

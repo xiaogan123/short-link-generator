@@ -47,6 +47,14 @@ function row(domainId = "domain-a1", slug = "sample-01", value = totals): StatsC
   return { domainId, slug, totals: value };
 }
 
+const compareAscii = (left: string, right: string) => left < right ? -1 : left > right ? 1 : 0;
+const sortedALinks = links.filter((link) => link.domainId !== "domain-b1")
+  .sort((left, right) => compareAscii(left.domainId, right.domainId) || compareAscii(left.slug, right.slug));
+const aPageRows = (page: number, value = totals) => sortedALinks
+  .slice((page - 1) * 25, page * 25)
+  .map((link) => row(link.domainId, link.slug, value));
+const singleLinks = [links[0], links[30]];
+
 function response(overrides: Partial<StatsCenterReport> = {}): StatsCenterReport {
   return {
     status: "ready",
@@ -91,10 +99,13 @@ afterEach(() => {
   vi.clearAllMocks();
 });
 
-it("reads all accounts serially, sums only ready reports, and drills into links", async () => {
+it("reads every account page serially, sums each account once, and drills into links", async () => {
   const first = deferred<StatsCenterReport>();
   const second = deferred<StatsCenterReport>();
-  mockedDispatch.mockImplementationOnce(() => first.promise).mockImplementationOnce(() => second.promise);
+  const third = deferred<StatsCenterReport>();
+  mockedDispatch.mockImplementationOnce(() => first.promise)
+    .mockImplementationOnce(() => second.promise)
+    .mockImplementationOnce(() => third.promise);
   render(view());
   expect((screen.getByLabelText("统计账户") as HTMLSelectElement).value).toBe("");
   expect(mockedDispatch).not.toHaveBeenCalled();
@@ -102,13 +113,18 @@ it("reads all accounts serially, sums only ready reports, and drills into links"
   expect(mockedDispatch).toHaveBeenCalledTimes(1);
   expect(mockedDispatch).toHaveBeenNthCalledWith(1, "get_stats_center", { accountId: "account-a", days: 7, page: 1, pageSize: 25 });
   expect(screen.getByText(/已处理 0 \/ 2 个账户/)).toBeTruthy();
-  await act(async () => first.resolve(response()));
+  await act(async () => first.resolve(response({ totalLinks: 30, rows: aPageRows(1) })));
   expect(mockedDispatch).toHaveBeenCalledTimes(2);
-  expect(mockedDispatch).toHaveBeenNthCalledWith(2, "get_stats_center", { accountId: "account-b", days: 7, page: 1, pageSize: 25 });
+  expect(mockedDispatch).toHaveBeenNthCalledWith(2, "get_stats_center", { accountId: "account-a", days: 7, page: 2, pageSize: 25 });
+  expect(screen.getByText(/已处理 0 \/ 2 个账户/)).toBeTruthy();
+  await act(async () => second.resolve(response({ page: 2, totalLinks: 30, rows: aPageRows(2) })));
+  expect(mockedDispatch).toHaveBeenCalledTimes(3);
+  expect(mockedDispatch).toHaveBeenNthCalledWith(3, "get_stats_center", { accountId: "account-b", days: 7, page: 1, pageSize: 25 });
   expect(screen.getByText(/已处理 1 \/ 2 个账户/)).toBeTruthy();
   const bTotals: ClickStatsTotals = { total: 30, likelyHuman: 20, likelyBot: 7, unknown: 3, previews: 2, prefetches: 1 };
-  await act(async () => second.resolve(response({ accountId: "account-b", totals: bTotals, rows: [row("domain-b1", "welcome", bTotals)] })));
+  await act(async () => third.resolve(response({ accountId: "account-b", totals: bTotals, rows: [row("domain-b1", "welcome", bTotals)] })));
   expect(screen.getByText(/已处理 2 \/ 2 个账户/)).toBeTruthy();
+  expect(screen.getByText(/已读 31 条/)).toBeTruthy();
   const summary = screen.getByLabelText("全部账户估算汇总");
   expect(within(summary).getByText("150")).toBeTruthy();
   expect(within(summary).getByText("100")).toBeTruthy();
@@ -123,25 +139,92 @@ it("reads all accounts serially, sums only ready reports, and drills into links"
   expect((screen.getByLabelText("统计账户") as HTMLSelectElement).value).toBe("account-a");
   expect(screen.getByLabelText("统计域名")).toBeTruthy();
   expect(screen.getByRole("table", { name: "当前本机短链接统计" })).toBeTruthy();
-  expect(mockedDispatch).toHaveBeenCalledTimes(2);
+  expect(mockedDispatch).toHaveBeenCalledTimes(3);
   expect(screen.queryByLabelText("全部账户估算汇总")).toBeNull();
 });
 
 it("reuses a validated overview page for drilldown and fetches only the next page", async () => {
-  mockedDispatch.mockResolvedValueOnce(response({ totalLinks: 30 }))
-    .mockResolvedValueOnce(response({ accountId: "account-b", status: "no_data", totals: undefined, rows: [], totalLinks: 0 }))
-    .mockResolvedValueOnce(response({ page: 2, totalLinks: 30, rows: [row("domain-a1", "sample-03")] }));
+  mockedDispatch.mockResolvedValueOnce(response({ totalLinks: 30, rows: aPageRows(1) }))
+    .mockResolvedValueOnce(response({ page: 2, totalLinks: 30, rows: aPageRows(2) }))
+    .mockResolvedValueOnce(response({ accountId: "account-b", status: "no_data", totals: undefined, rows: [row("domain-b1", "welcome", zeroTotals)] }))
+    .mockResolvedValueOnce(response({ page: 2, totalLinks: 30, rows: aPageRows(2) }));
   render(view());
   fireEvent.click(screen.getByRole("button", { name: "读取统计" }));
   const table = await screen.findByRole("table", { name: "账户统计总览" });
   await waitFor(() => expect(screen.getByText(/已处理 2 \/ 2 个账户/)).toBeTruthy());
   fireEvent.click(within(within(table).getByText("示例账户 A").closest("tr") as HTMLElement).getByRole("button", { name: "查看链接" }));
   expect(screen.getByText(/第 1 \/ 2 页/)).toBeTruthy();
-  expect(mockedDispatch).toHaveBeenCalledTimes(2);
+  expect(mockedDispatch).toHaveBeenCalledTimes(3);
   fireEvent.click(screen.getByRole("button", { name: "下一页统计" }));
   expect(await screen.findByText(/第 2 \/ 2 页/)).toBeTruthy();
-  expect(mockedDispatch).toHaveBeenCalledTimes(3);
+  expect(mockedDispatch).toHaveBeenCalledTimes(4);
   expect(mockedDispatch).toHaveBeenLastCalledWith("get_stats_center", { accountId: "account-a", days: 7, page: 2, pageSize: 25 });
+});
+
+it.each(["request failure", "wrong page identities"])("keeps later links unread after %s and skips remaining pages", async (failure) => {
+  const manyLinks = Array.from({ length: 55 }, (_, index): Link => ({
+    ...links[0], slug: `extra-${String(index + 1).padStart(2, "0")}`,
+  }));
+  mockedDispatch.mockImplementation((_action, payload) => {
+    if (payload?.accountId === "account-b") return Promise.resolve(response({
+      accountId: "account-b", status: "no_data", totals: undefined,
+      rows: [row("domain-b1", "welcome", zeroTotals)],
+    }));
+    if (payload?.page === 1) return Promise.resolve(response({
+      totalLinks: 55, rows: manyLinks.slice(0, 25).map((link) => row(link.domainId, link.slug)),
+    }));
+    if (failure === "request failure") return Promise.reject(new Error("第 2 页读取失败"));
+    return Promise.resolve(response({
+      page: 2, totalLinks: 55,
+      rows: manyLinks.slice(0, 25).map((link) => row(link.domainId, link.slug)),
+    }));
+  });
+  render(view({ links: [...manyLinks, links[30]] }));
+  fireEvent.click(screen.getByRole("button", { name: "读取统计" }));
+  await waitFor(() => expect(screen.getByText(/已处理 2 \/ 2 个账户/)).toBeTruthy());
+  expect(mockedDispatch.mock.calls.map((call) => [call[1]?.accountId, call[1]?.page])).toEqual([
+    ["account-a", 1], ["account-a", 2], ["account-b", 1],
+  ]);
+  const overview = screen.getByRole("table", { name: "账户统计总览" });
+  const aRow = within(overview).getByText("示例账户 A").closest("tr") as HTMLElement;
+  expect(within(aRow).getByText("120")).toBeTruthy();
+  expect(within(aRow).getByText(failure === "request failure" ? "第 2 页读取失败" : /部分链接明细未能完整读取/)).toBeTruthy();
+  expect(within(screen.getByLabelText("全部账户估算汇总")).getByText("120")).toBeTruthy();
+  fireEvent.change(screen.getByRole("searchbox", { name: "搜索短链接或账户" }), { target: { value: "extra-55" } });
+  const linkRow = within(screen.getByRole("table", { name: "全部短链接统计" })).getByText(/extra-55/).closest("tr") as HTMLElement;
+  expect(within(linkRow).getAllByText("—")).toHaveLength(4);
+  expect(within(linkRow).getByText("读取失败")).toBeTruthy();
+});
+
+it("stops queued account pages and retains only already read link counts", async () => {
+  const secondPage = deferred<StatsCenterReport>();
+  mockedDispatch.mockResolvedValueOnce(response({ totalLinks: 30, rows: aPageRows(1) }))
+    .mockImplementationOnce(() => secondPage.promise);
+  render(view());
+  fireEvent.click(screen.getByRole("button", { name: "读取统计" }));
+  await waitFor(() => expect(mockedDispatch).toHaveBeenCalledTimes(2));
+  fireEvent.click(screen.getByRole("button", { name: "停止读取" }));
+  await act(async () => secondPage.resolve(response({ page: 2, totalLinks: 30, rows: aPageRows(2) })));
+  expect(mockedDispatch).toHaveBeenCalledTimes(2);
+  expect(screen.getByText(/已处理 0 \/ 2 个账户/)).toBeTruthy();
+  expect(screen.getByText(/已读 25 条/)).toBeTruthy();
+  fireEvent.change(screen.getByRole("searchbox", { name: "搜索短链接或账户" }), { target: { value: "sample-30" } });
+  const linkRow = within(screen.getByRole("table", { name: "全部短链接统计" })).getByText(/sample-30/).closest("tr") as HTMLElement;
+  expect(within(linkRow).getAllByText("—")).toHaveLength(4);
+});
+
+it("discards a later overview page when the local revision changes", async () => {
+  const secondPage = deferred<StatsCenterReport>();
+  mockedDispatch.mockResolvedValueOnce(response({ totalLinks: 30, rows: aPageRows(1) }))
+    .mockImplementationOnce(() => secondPage.promise);
+  const { rerender } = render(view());
+  fireEvent.click(screen.getByRole("button", { name: "读取统计" }));
+  await waitFor(() => expect(mockedDispatch).toHaveBeenCalledTimes(2));
+  rerender(view({ revision: 1 }));
+  await act(async () => secondPage.resolve(response({ page: 2, totalLinks: 30, rows: aPageRows(2) })));
+  expect(mockedDispatch).toHaveBeenCalledTimes(2);
+  expect(screen.queryByRole("table", { name: "账户统计总览" })).toBeNull();
+  expect(screen.getByText(/已读 0 条/)).toBeTruthy();
 });
 
 it("keeps unknown account states out of totals and retries failed accounts on refresh", async () => {
@@ -157,13 +240,13 @@ it("keeps unknown account states out of totals and retries failed accounts on re
     const id = String(payload?.accountId);
     if (id === "account-a") return Promise.resolve(response({ totals: zeroTotals, rows: [row("domain-a1", "sample-01", zeroTotals)] }));
     if (id === "account-b") return Promise.resolve(response({ accountId: id, status: "no_data", totals: undefined, rows: [], totalLinks: 0 }));
-    if (id === "account-d") return Promise.resolve(response({ accountId: id, status: "disabled", totals: undefined, rows: undefined }));
-    if (id === "account-e") return Promise.resolve(response({ accountId: id, status: "permission_denied", totals: undefined, rows: undefined }));
-    if (id === "account-f") return Promise.resolve(response({ accountId: id, status: "unavailable", totals: undefined, rows: undefined }));
+    if (id === "account-d") return Promise.resolve(response({ accountId: id, status: "disabled", totals: undefined, rows: undefined, totalLinks: 0 }));
+    if (id === "account-e") return Promise.resolve(response({ accountId: id, status: "permission_denied", totals: undefined, rows: undefined, totalLinks: 0 }));
+    if (id === "account-f") return Promise.resolve(response({ accountId: id, status: "unavailable", totals: undefined, rows: undefined, totalLinks: 0 }));
     if (fail) return Promise.reject(new Error("读取失败，请重试"));
-    return Promise.resolve(response({ accountId: id, status: "disabled", totals: undefined, rows: undefined }));
+    return Promise.resolve(response({ accountId: id, status: "disabled", totals: undefined, rows: undefined, totalLinks: 0 }));
   });
-  render(view({ accounts: [...accounts, ...extraAccounts] }));
+  render(view({ accounts: [...accounts, ...extraAccounts], links: [links[0]] }));
   fireEvent.click(screen.getByRole("button", { name: "读取统计" }));
   expect(await screen.findByText(/已处理 7 \/ 7 个账户/)).toBeTruthy();
   expect(mockedDispatch).toHaveBeenCalledTimes(6);
@@ -187,7 +270,7 @@ it("keeps unknown account states out of totals and retries failed accounts on re
 it("stops an obsolete all-account queue after a range change", async () => {
   const first = deferred<StatsCenterReport>();
   mockedDispatch.mockImplementationOnce(() => first.promise);
-  render(view());
+  render(view({ links: singleLinks }));
   fireEvent.click(screen.getByRole("button", { name: "读取统计" }));
   fireEvent.change(screen.getByLabelText("统计时间范围"), { target: { value: "30" } });
   await act(async () => first.resolve(response()));
@@ -199,9 +282,9 @@ it("stops an obsolete all-account queue after a range change", async () => {
 it("stops the remaining queue when the data revision changes", async () => {
   const first = deferred<StatsCenterReport>();
   mockedDispatch.mockImplementationOnce(() => first.promise);
-  const { rerender } = render(view());
+  const { rerender } = render(view({ links: singleLinks }));
   fireEvent.click(screen.getByRole("button", { name: "读取统计" }));
-  rerender(view({ revision: 1 }));
+  rerender(view({ revision: 1, links: singleLinks }));
   await act(async () => first.resolve(response()));
   expect(mockedDispatch).toHaveBeenCalledTimes(1);
   expect(screen.queryByRole("table", { name: "账户统计总览" })).toBeNull();
@@ -210,7 +293,7 @@ it("stops the remaining queue when the data revision changes", async () => {
 it("treats a cross-account response as an error without adding its totals", async () => {
   mockedDispatch.mockResolvedValueOnce(response({ accountId: "account-b" }))
     .mockResolvedValueOnce(response({ accountId: "account-b", status: "no_data", totals: undefined, rows: [], totalLinks: 0 }));
-  render(view());
+  render(view({ links: [links[0]] }));
   fireEvent.click(screen.getByRole("button", { name: "读取统计" }));
   const table = await screen.findByRole("table", { name: "账户统计总览" });
   await waitFor(() => expect(within(table).getByText("读取失败")).toBeTruthy());
@@ -223,7 +306,7 @@ it("rejects duplicate scope identities and suppresses unsafe cross-account sums"
   fireEvent.click(screen.getByRole("button", { name: "读取统计" }));
   expect(screen.getByText(/身份重复或归属不明/)).toBeTruthy();
   expect(mockedDispatch).not.toHaveBeenCalled();
-  rerender(view());
+  rerender(view({ links: singleLinks }));
   const huge: ClickStatsTotals = { total: Number.MAX_SAFE_INTEGER, likelyHuman: Number.MAX_SAFE_INTEGER, likelyBot: 0, unknown: 0, previews: 0, prefetches: 0 };
   mockedDispatch.mockResolvedValueOnce(response({ totals: huge, rows: [row("domain-a1", "sample-01", zeroTotals)] }))
     .mockResolvedValueOnce(response({ accountId: "account-b", rows: [row("domain-b1", "welcome")] }));

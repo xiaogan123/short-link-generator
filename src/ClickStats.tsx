@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import Dialog from "./Dialog";
 import { dispatch, errorMessage, preview } from "./bridge";
 import type { Account, ClickStats, ClickStatsDays, Domain, Link } from "./types";
+import { dedupNote, validDedup } from "./clickDedup";
 import "./ClickStats.css";
 
 type Props = {
@@ -196,6 +197,7 @@ export default function ClickStatsDialog({
     const current = view.report;
     if (current.status === "ready" && validTotals(current.totals)) {
       const totals = current.totals;
+      const dedup = validDedup(totals);
       return (
         <>
           <section className="cstats-total" aria-label="总访问">
@@ -207,6 +209,11 @@ export default function ClickStatsDialog({
             <div><span>疑似真人</span><strong>{number(totals.likelyHuman)}</strong></div>
             <div><span>疑似机器人</span><strong>{number(totals.likelyBot)}</strong></div>
             <div><span>未知</span><strong>{number(totals.unknown)}</strong></div>
+          </div>
+          <div className="cstats-dedup" aria-label="约 30 分钟访问去重估算">
+            <span>约 30 分钟去重估算</span>
+            <strong>首次 {dedup ? number(dedup.first) : "—"} · 重复 {dedup ? number(dedup.repeat) : "—"}</strong>
+            <small>测量覆盖 {dedup ? `${number(dedup.measured)} / ${number(totals.total)}` : "未覆盖"} 次访问。{dedupNote}</small>
           </div>
           <div className="cstats-secondary" aria-label="预览和预加载请求">
             <span>预览请求 <strong>{number(totals.previews)}</strong></span>

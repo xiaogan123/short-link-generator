@@ -493,6 +493,11 @@ pub struct DomainCheck {
 
 #[derive(Clone)]
 pub enum PlanKind {
+    SetClickProtection {
+        account_id: String,
+        target_hash: String,
+        enabled: bool,
+    },
     SetClickStats {
         account_id: String,
         target_hash: String,
