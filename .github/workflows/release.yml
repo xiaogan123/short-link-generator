@@ -108,7 +108,7 @@ jobs:
           if [ "$RUNNER_OS" = "macOS" ]; then
             ulimit -S -c 0
             ulimit -H -c 0
-            node scripts/stable-macos-sign.mjs -- npm run tauri -- build --target ${{ matrix.target }} --config release-config.json --bundles ${{ matrix.bundles }}
+            node scripts/stable-macos-sign.mjs -- npm run tauri -- build --target ${{ matrix.target }} --config release-config.json --bundles ${{ matrix.bundles }} ${{ matrix.target == 'x86_64-apple-darwin' && '--verbose' || '' }}
           else
             npm run tauri -- build --target ${{ matrix.target }} --config release-config.json --bundles ${{ matrix.bundles }}
           fi

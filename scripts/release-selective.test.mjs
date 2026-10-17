@@ -459,6 +459,7 @@ test('release workflow is manual, selective, and scans before one-day upload', (
   assert.equal(signerStep.run, 'node scripts/rcodesign-tool.mjs --install');
   assert.match(packageStep.run, /ulimit -S -c 0\s+ulimit -H -c 0\s+node scripts\/stable-macos-sign/);
   assert.match(packageStep.run, /stable-macos-sign\.mjs -- npm run tauri/);
+  assert.ok(packageStep.run.includes("${{ matrix.target == 'x86_64-apple-darwin' && '--verbose' || '' }}"));
   assert.match(packageStep.env.SLG_MACOS_SIGNING_P12_BASE64, /runner\.os == 'macOS'/);
   assert.equal(steps[scan].id, 'privacy');
   assert.match(steps[scan].env.SLG_MACOS_SIGNING_P12_BASE64, /runner\.os == 'macOS'/);
