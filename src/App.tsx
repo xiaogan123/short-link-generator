@@ -58,6 +58,8 @@ import LinkGroups from "./LinkGroups";
 import ClickStatsDialog from "./ClickStats";
 import StatsCenter from "./StatsCenter";
 import { useUpdateCheck } from "./useUpdateCheck";
+import RedirectMonitor, {monitorBannerText} from './RedirectMonitor';
+import { useRedirectMonitor } from './useRedirectMonitor';
 
 type Page = "links" | "stats" | "pools" | "domains" | "accounts";
 type LinkDraft = {
@@ -208,6 +210,7 @@ export default function App() {
   const [domainSuccessId, setDomainSuccessId] = useState("");
   const [search, setSearch] = useState("");
   const [filter, setFilter] = useState("all");
+  const [attentionOnly, setAttentionOnly] = useState(false);
   const [linkDraft, setLinkDraft] = useState<LinkDraft | null>(null);
   const [originalSlug, setOriginalSlug] = useState<string | null>(null);
   const [copySource, setCopySource] = useState<{domainId: string; slug: string} | null>(null);
@@ -285,6 +288,7 @@ export default function App() {
   const [installedUpdate, setInstalledUpdate] = useState<UpdateStatus | null>(null);
   const [dismissedUpdate, setDismissedUpdate] = useState<string | null>(null);
   const updates = useUpdateCheck(!loading && !loadFailed && !!state.appVersion && !busy && !updateStatus && !installedUpdate);
+  const redirectMonitor = useRedirectMonitor({state,ready:!loading && !loadFailed,paused:busy || updates.checking || !!updateStatus});
   const [manageAccount, setManageAccount] = useState<Account | null>(null);
   const [statsTarget, setStatsTarget] = useState<{link: Link; domain: Domain} | null>(null);
   const [statsRevision, setStatsRevision] = useState(0);
@@ -1896,12 +1900,13 @@ export default function App() {
       links: state.links.filter(
         (link) =>
           link.domainId === domain.id &&
+          (!attentionOnly || (() => { const item = redirectMonitor.getRecord(link); return item && (item.stale || item.phase !== 'healthy'); })()) &&
           `${link.slug} ${link.cnUrl} ${link.defaultUrl} ${link.code || ""} ${state.pools?.find((p) => p.id === link.poolId)?.name || ""} ${domain.host}`
             .toLowerCase()
             .includes(search.trim().toLowerCase()),
       ),
     }))
-    .filter((group) => !search || group.links.length);
+    .filter((group) => !search && !attentionOnly || group.links.length);
   const title =
     page === "links"
       ? "短链接"
@@ -2029,6 +2034,7 @@ export default function App() {
           </div>
         </div>
         <div className="content">
+          {redirectMonitor.enabled && monitorBannerText(redirectMonitor.summary) && <section className="update-banner redirect-monitor-banner" aria-label="自动巡检提醒" role="status"><WarningCircle size={22} weight="fill" aria-hidden="true"/><div><strong>{monitorBannerText(redirectMonitor.summary)}</strong><p>打开短链接列表查看每条链接的首跳结果。</p></div><button type="button" className="button secondary" onClick={() => {setPage('links');setAttentionOnly(true);setSearch('');setFilter('all');}}>查看需关注</button></section>}
           {updates.available && dismissedUpdate !== updates.available.version && (
             <section className="update-banner" aria-label="新版本提醒">
               <WarningCircle size={22} weight="fill" aria-hidden="true" />
@@ -2265,6 +2271,7 @@ export default function App() {
             />
           ) : page === "links" ? (
             <>
+              <RedirectMonitor enabled={redirectMonitor.enabled} active={redirectMonitor.active} online={redirectMonitor.online} progress={redirectMonitor.progress} lastCompletion={redirectMonitor.lastCompletion} onEnabled={(value) => {if (!value) setAttentionOnly(false);redirectMonitor.setEnabled(value);}} onRun={redirectMonitor.runNow} disabled={busy || loading || updates.checking || !!updateStatus}/>
               <div className="metric-row">
                 <div className="metric">
                   <span>全部链接</span>
@@ -2294,6 +2301,7 @@ export default function App() {
                     </h2>
                   </div>
                   <div className="panel-tools">
+                    <button type="button" className={`button secondary ${attentionOnly ? 'redirect-monitor-filter-active' : ''}`} aria-pressed={attentionOnly} disabled={!redirectMonitor.enabled} onClick={() => {setAttentionOnly(!attentionOnly);setSearch('');setFilter('all');}}>只看需关注</button>
                     <label className="searchbox">
                       <MagnifyingGlass size={17} />
                       <input
@@ -2341,14 +2349,14 @@ export default function App() {
                 ) : !groups.length ? (
                   <Empty
                     icon={<LinkSimple size={28} />}
-                    title={search ? "没有匹配的链接" : "还没有短链接"}
+                    title={attentionOnly ? "目前没有需关注的链接" : search ? "没有匹配的链接" : "还没有短链接"}
                     description={
-                      search
+                      attentionOnly ? "可切回全部链接查看。" : search
                         ? "换个关键词或域名试试。"
                         : "为已连接域名创建第一条短链接。"
                     }
                     action={
-                      !search && (
+                      !search && !attentionOnly && (
                         <button
                           className="button secondary"
                           onClick={() => openLink()}
@@ -2373,6 +2381,7 @@ export default function App() {
                         } : {}),
                       };
                     }}
+                    getAutoDetection={redirectMonitor.enabled ? redirectMonitor.getRecord : undefined}
                     onCopy={(url) => void copy(url)}
                     onCheck={(link, domain) => void selftest(link, domain)}
                     onStats={(link, domain) => {

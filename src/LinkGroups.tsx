@@ -2,6 +2,8 @@ import { Fragment, useId, useRef, useState } from "react";
 import { ChartBar, CaretDown, CaretLeft, CaretRight, Copy, Globe, PencilSimple, Plus, ShieldCheck, Trash } from "@phosphor-icons/react";
 import { shortUrl } from "./validators";
 import type { Domain, Link, Pool } from "./types";
+import { monitorDisplay } from './RedirectMonitor';
+import type { VisibleMonitorRecord } from './useRedirectMonitor';
 import "./LinkGroups.css";
 
 export type LinkGroup = { domain: Domain; links: Link[] };
@@ -17,6 +19,7 @@ type Props = {
   groups: LinkGroup[];
   pools: Pool[];
   getDetection: (link: Link) => LinkDetection;
+  getAutoDetection?: (link: Link) => VisibleMonitorRecord | null;
   onCopy: (url: string) => void;
   onCheck: (link: Link, domain: Domain) => void;
   onStats?: (link: Link, domain: Domain) => void;
@@ -109,7 +112,7 @@ function Targets({ link, pool }: { link: Link; pool: Pool | undefined }) {
   );
 }
 
-function LinkGroupSection({ domain, links, pools, getDetection, onCopy, onCheck, onStats, onEdit, onDelete, onCreate, busy = false }: Props & LinkGroup) {
+function LinkGroupSection({ domain, links, pools, getDetection, getAutoDetection, onCopy, onCheck, onStats, onEdit, onDelete, onCreate, busy = false }: Props & LinkGroup) {
   const detailPrefix = useId();
   const [pageSize, setPageSize] = useState<(typeof pageSizes)[number]>(25);
   const [pageState, setPageState] = useState({ linkKey: "", page: 1 });
@@ -164,6 +167,8 @@ function LinkGroupSection({ domain, links, pools, getDetection, onCopy, onCheck,
                 const url = shortUrl(domain.host, domain.prefix, link.slug);
                 const pool = link.poolId ? poolById.get(link.poolId) : undefined;
                 const detection = getDetection(link);
+                const automatic = getAutoDetection?.(link) || null;
+                const automaticDisplay = getAutoDetection ? monitorDisplay(automatic) : null;
                 const open = expanded.has(link.slug);
                 const detailId = `${detailPrefix}-${encodeURIComponent(link.slug)}`;
                 return (
@@ -180,8 +185,10 @@ function LinkGroupSection({ domain, links, pools, getDetection, onCopy, onCheck,
                       </td>
                       <td className="slg-status-cell">
                         <span className={`slg-check slg-check-${detection.tone}`} title={detection.title}>
-                          <span className="slg-check-dot" aria-hidden="true" />{detection.label}
+                          <span className="slg-check-dot" aria-hidden="true" />{getAutoDetection && <span>手动</span>}{detection.label}
                         </span>
+                        {automaticDisplay && <div className="slg-auto-line"><span className="slg-auto-prefix">自动</span><span className={`slg-check slg-check-${automaticDisplay.tone}`} title={automatic?.message}><span className="slg-check-dot" aria-hidden="true" />{automaticDisplay.label}</span></div>}
+                        {automatic?.checkedAt && <span className="slg-auto-checked">上次巡检 {formatUpdated(automatic.checkedAt)}</span>}
                         <span className="slg-updated">{link.updated && "更新于 "}{formatUpdated(link.updated)}</span>
                       </td>
                       <td className="slg-action-cell">

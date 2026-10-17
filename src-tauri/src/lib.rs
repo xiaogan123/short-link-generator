@@ -20,6 +20,7 @@ mod mac_helper_adapter;
 mod mac_helper_ffi;
 mod model;
 mod pools;
+mod redirect_check;
 mod secret_store;
 #[cfg(test)]
 mod selftest_resource_recovery_tests;
@@ -6295,6 +6296,14 @@ async fn dispatch(
             backend.health_snapshot(field(&payload, "poolId")?)?
         };
         return run_pool_health(snapshot).await;
+    }
+    if action == "check_link_redirect" {
+        return redirect_check::check_link_redirect(
+            &state,
+            field(&payload, "domainId")?,
+            field(&payload, "slug")?,
+        )
+        .await;
     }
     if action == "check_link_targets" {
         let mode = requested_dns_mode(&payload)?;

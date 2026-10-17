@@ -206,9 +206,11 @@ test('signed selftest selects probe country and bypasses process cache', async (
   assert.equal(env.LINKS.reads.length, 6);
 });
 
-test('invalid, expired, future, and replayed selftests are ignored', async () => {
+test('invalid, expired, future, and replayed selftests are ignored', async (t) => {
+  const fixedNow = Date.now();
+  t.mock.method(Date, 'now', () => fixedNow);
   const env = fixture();
-  const now = Math.floor(Date.now() / 1000);
+  const now = Math.floor(fixedNow / 1000);
   const headers = [
     await signed('other.example.com'),
     await signed(HOST, '/r/another'),
@@ -237,9 +239,11 @@ test('selftest signing requires a 32-byte hex secret', async () => {
   assert.equal(await location(await worker.fetch(req(undefined, 'US', 'GET', { 'X-Selftest': await signed() }), env)), DEFAULT);
 });
 
-test('selftest accepts the exact 300-second boundary', async () => {
+test('selftest accepts the exact 300-second boundary', async (t) => {
+  const fixedNow = Date.now();
+  t.mock.method(Date, 'now', () => fixedNow);
   const env = fixture();
-  const now = Math.floor(Date.now() / 1000);
+  const now = Math.floor(fixedNow / 1000);
   const header = await signed(HOST, '/r/Offer_1', 'CN', now - 300);
   assert.equal(await location(await worker.fetch(req(undefined, 'US', 'GET', { 'X-Selftest': header }), env)), CN);
 });

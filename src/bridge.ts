@@ -1,6 +1,6 @@
 import { invoke } from '@tauri-apps/api/core';
 import { normalizeHost } from './validators';
-import type { Action, ClickStats, ClickStatsDays, ClickStatsTotals, DomainPreparation, Link, Plan, Pool, PoolHealth, Selftest, State, StatsCenterReport, StatsCenterRow, TargetReport } from './types';
+import type { Action, ClickStats, ClickStatsDays, ClickStatsTotals, DomainPreparation, Link, Plan, Pool, PoolHealth, RedirectCheck, Selftest, State, StatsCenterReport, StatsCenterRow, TargetReport } from './types';
 
 export const preview = new URLSearchParams(window.location.search).get('preview') === '1';
 const now = () => new Date().toISOString();
@@ -59,6 +59,13 @@ function makePlan(title: string, steps: string[], warnings: string[], action: st
 }
 function previewDispatch(action: Action, payload: Record<string, unknown>): unknown {
   if (action === 'get_state') return clone();
+  if (action === 'check_link_redirect') {
+    const link = local.links.find(item => item.domainId === payload.domainId && item.slug === payload.slug);
+    if (!link) return {status:'unknown',message:'示例链接已不存在。',reason:'link_missing',checkedAt:now(),dnsMode:'system'} satisfies RedirectCheck;
+    const varied = new URLSearchParams(window.location.search).get('monitorPreview') === '1';
+    const status = !varied ? 'passed' : link.slug === 'guide' ? 'failed' : link.slug === 'news' ? 'unknown' : 'passed';
+    return {status,message:status === 'passed' ? '示例首跳符合预期。' : status === 'failed' ? '示例首跳位置不符。' : '示例网络状态未能确认。',reason:status === 'failed' ? 'location_mismatch' : undefined,checkedAt:now(),dnsMode:'system'} satisfies RedirectCheck;
+  }
   if (action === 'get_stats_center') {
     const accountId = typeof payload.accountId === 'string' ? payload.accountId : '';
     const account = local.accounts.find((item) => item.id === accountId);
