@@ -17,7 +17,7 @@
 .sall-table tbody { display: table-row-group; }
 .sall-table tbody tr { display: table-row; padding: 0; }
 .sall-table th, .sall-table td { display: table-cell; grid-column: auto; grid-row: auto; padding: 10px 8px; border-top: 1px solid #edf0e9; color: #66786c; font-size: 10px; vertical-align: top; }
-.sall-table th { border-top: 0; background: #fcfdfa; color: #718279; font-weight: 750; white-space: nowrap; }
+.sall-table th { border-top: 0; background: #fcfdfa; color: #526b5b; font-size: 11px; font-weight: 750; white-space: nowrap; }
 .sall-table th:first-child { width: 28%; }
 .sall-table th:nth-child(2) { width: 18%; }
 .sall-table th:nth-child(3) { width: 10%; }
@@ -28,6 +28,8 @@
 .sall-table td:first-child small { display: block; margin-top: 3px; color: #87958d; font-size: 9px; }
 .sall-table .sall-account { color: #304c3a; font-weight: 650; overflow-wrap: anywhere; }
 .sall-table .sall-total { color: #194c35; font-size: 14px; font-weight: 800; }
+.sall-table td:nth-child(n+3):nth-child(-n+6) { font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.sall-table td:nth-child(n+4):nth-child(-n+6) { color: #294837; font-size: 14px; font-weight: 700; }
 .sall-table .sall-total small { display: block; margin-top: 4px; color: #718276; font-size: 9px; font-weight: 500; line-height: 1.4; }
 .sall-table .sall-detail { min-height: 27px; padding: 4px 7px; font-size: 10px; }
 .sall-table .sall-empty { padding: 26px 12px; color: #7d8e82; text-align: center !important; }
