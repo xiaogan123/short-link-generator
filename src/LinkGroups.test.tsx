@@ -118,7 +118,8 @@ it("paginates each domain at 25/50/100 and resets on changed filtered or deleted
   expect(within(group).getByText("显示 26–50 / 共 61 条")).toBeTruthy();
   expect(within(group).getByRole("row", { name: "https://go.example.com/r/item-26" })).toBeTruthy();
   rerender(view([{ domain, links: [links[40], links[59]] }]));
-  expect(within(group).getByText("显示 1–2 / 共 2 条")).toBeTruthy();
+  expect(within(group).queryByLabelText(`${domain.host} 的分页`)).toBeNull();
+  expect(within(group).getAllByRole("row")).toHaveLength(3);
   expect(within(group).getByRole("row", { name: "https://go.example.com/r/item-41" })).toBeTruthy();
   rerender(view([{ domain, links }]));
   expect(within(group).getByText("显示 1–25 / 共 61 条")).toBeTruthy();
@@ -171,4 +172,30 @@ it("gives a domain with no links its own create action", () => {
   expect(within(group).queryByRole("table")).toBeNull();
   fireEvent.click(within(group).getByRole("button", { name: "创建第一条短链接" }));
   expect(onCreate).toHaveBeenCalledWith(domain.id);
+});
+
+it.each([1,25])('omits the pagination footer for %s fully visible links while keeping every row action',count=>{
+  const links=Array.from({length:count},(_,index)=>({...manual,slug:`compact-${index}`}));
+  render(view([{domain,links}]));
+  const group=groupFor(domain.host);
+  expect(within(group).queryByLabelText(`${domain.host} 的分页`)).toBeNull();
+  expect(within(group).queryByRole('combobox',{name:`${domain.host} 每页条数`})).toBeNull();
+  expect(within(group).getAllByRole('row')).toHaveLength(count+1);
+  for(const link of links) expect(within(group).getByRole('button',{name:`编辑 ${link.slug}`})).toBeTruthy();
+});
+it('keeps size controls for 26 links even when size 50 produces one page, and restores that size after filtering',()=>{
+  const links=Array.from({length:26},(_,index)=>({...manual,slug:`compact-${index}`}));
+  const {rerender}=render(view([{domain,links}]));
+  const group=groupFor(domain.host);
+  const size=within(group).getByRole('combobox',{name:`${domain.host} 每页条数`}) as HTMLSelectElement;
+  expect(size.value).toBe('25');expect(within(group).getByText('第 1 / 2 页')).toBeTruthy();
+  fireEvent.change(size,{target:{value:'50'}});
+  expect(within(group).getByText('第 1 / 1 页')).toBeTruthy();expect(size.value).toBe('50');
+  rerender(view([{domain,links:links.slice(0,1)}]));
+  expect(within(group).queryByLabelText(`${domain.host} 的分页`)).toBeNull();
+  rerender(view([{domain,links}]));
+  expect((within(group).getByRole('combobox',{name:`${domain.host} 每页条数`}) as HTMLSelectElement).value).toBe('50');
+  expect(within(group).getByText('显示 1–26 / 共 26 条')).toBeTruthy();
+  fireEvent.change(within(group).getByRole('combobox',{name:`${domain.host} 每页条数`}),{target:{value:'25'}});
+  expect(within(group).getByText('第 1 / 2 页')).toBeTruthy();
 });

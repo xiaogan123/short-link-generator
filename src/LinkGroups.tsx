@@ -220,7 +220,7 @@ function LinkGroupSection({ domain, links, pools, getDetection, getAutoDetection
               })}
             </tbody>
           </table>
-          <div className="slg-pagination" aria-label={`${domain.host} 的分页`}>
+          {links.length > pageSizes[0] && <div className="slg-pagination" aria-label={`${domain.host} 的分页`}>
             <span>显示 {start + 1}–{start + visible.length} / 共 {links.length} 条</span>
             <label>每页 <select aria-label={`${domain.host} 每页条数`} value={pageSize} onChange={(event) => { setPageSize(Number(event.target.value) as (typeof pageSizes)[number]); setPageState({ linkKey, page: 1 }); showPageStart(); }}>
               {pageSizes.map((size) => <option value={size} key={size}>{size}</option>)}
@@ -230,7 +230,7 @@ function LinkGroupSection({ domain, links, pools, getDetection, getAutoDetection
               <span>第 {page} / {pageCount} 页</span>
               <button type="button" aria-label={`${domain.host} 下一页`} disabled={page === pageCount} onClick={() => choosePage(page + 1)}>下一页</button>
             </div>
-          </div>
+          </div>}
         </>
       ) : (
         <div className="slg-domain-empty">

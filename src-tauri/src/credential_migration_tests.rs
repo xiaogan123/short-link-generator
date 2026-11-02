@@ -427,8 +427,21 @@ async fn migration_new_accounts_activate_only_after_all_writes_and_persistent_co
                 .contains("macCredentialSchema"));
         } else {
             assert!(result.is_err());
-            assert!(backend.db.accounts.is_empty());
-            assert!(!backend.path.exists());
+            if fail == "persist" {
+                // The pre-secret commit failed, so no placeholder or secret may change.
+                assert!(backend.db.accounts.is_empty());
+                assert!(!backend.path.exists());
+                assert!(mock_keys().lock().unwrap().is_empty());
+            } else {
+                // A durable placeholder is visible for recovery but never activated.
+                assert_eq!(backend.db.accounts.len(), 2);
+                assert!(backend.db.accounts.iter().all(|a| a.token_import_pending));
+                assert!(backend.require_credentials("acct1").is_err());
+                assert!(backend.require_credentials("acct2").is_err());
+                let disk: Database =
+                    serde_json::from_slice(&fs::read(&backend.path).unwrap()).unwrap();
+                assert!(disk.accounts.iter().all(|a| a.token_import_pending));
+            }
             if fail == "orphan-conflict" {
                 assert_eq!(mock_keys().lock().unwrap()["token:acct1"], "orphan-newer");
             }

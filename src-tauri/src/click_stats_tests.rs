@@ -1125,3 +1125,149 @@ async fn stats_center_bounds_generated_sql_before_credentials() {
     assert!(mock_key_reads().lock().unwrap().is_empty());
     assert!(server.received_requests().await.unwrap().is_empty());
 }
+
+async fn session_fixture(server: &MockServer, backend: &mut Backend) {
+    arrange(backend);
+    for n in 0..25 {
+        let mut link = backend.db.links[0].clone();
+        link.slug = format!("s{n:02}");
+        backend.db.links.push(link);
+    }
+    resource(server, true).await;
+    Mock::given(method("POST"))
+        .and(path(SQL_PATH))
+        .and(body_string_contains("SELECT blob5"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(envelope(vec![row(
+            "unknown",
+            "click",
+            "insufficient_signals",
+            json!(100),
+        )])))
+        .mount(server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(SQL_PATH))
+        .and(body_string_contains("SELECT blob2"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(envelope(vec![])))
+        .mount(server)
+        .await;
+}
+#[tokio::test]
+async fn stats_read_session_reuses_summary_and_ownership_with_a_fixed_window() {
+    let (server, mut backend, _guard) = fixture().await;
+    session_fixture(&server, &mut backend).await;
+    let first = center_query(&mut backend, None, 1).await;
+    let session = first["readSessionId"].clone();
+    assert!(session.is_string());
+    let reads = server.received_requests().await.unwrap().len();
+    let second = backend
+        .dispatch(
+            "get_stats_center",
+            &json!({"accountId":"acct1","days":7,"page":2,"pageSize":25,"readSessionId":session}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(second["status"], "ready");
+    assert_eq!(second["readSessionId"], session);
+    assert_eq!(second["queriedAt"], first["queriedAt"]);
+    assert_eq!(second["totals"], first["totals"]);
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), reads + 1);
+    let queries: Vec<_> = requests
+        .iter()
+        .filter(|r| r.method == "POST")
+        .map(|r| std::str::from_utf8(&r.body).unwrap())
+        .collect();
+    assert_eq!(
+        queries
+            .iter()
+            .filter(|q| q.starts_with("SELECT blob5"))
+            .count(),
+        1
+    );
+    let windows: Vec<_> = queries
+        .iter()
+        .map(|q| {
+            q.split("toDateTime(")
+                .nth(1)
+                .unwrap()
+                .split(')')
+                .next()
+                .unwrap()
+        })
+        .collect();
+    assert!(windows.iter().all(|window| *window == windows[0]));
+    assert!(queries.iter().all(|q| !q.contains("NOW()")));
+    // Old clients remain valid and obtain a fresh independently verified read.
+    let fresh = center_query(&mut backend, None, 2).await;
+    assert_ne!(fresh["readSessionId"], session);
+    assert!(server.received_requests().await.unwrap().len() > reads + 2);
+}
+#[tokio::test]
+async fn stats_read_session_rejects_scope_state_expiry_and_unknown_identity_before_io() {
+    let (server, mut backend, _guard) = fixture().await;
+    session_fixture(&server, &mut backend).await;
+    let first = center_query(&mut backend, None, 1).await;
+    let payload = json!({"accountId":"acct1","days":7,"page":2,"pageSize":25,"readSessionId":first["readSessionId"]});
+    let before = server.received_requests().await.unwrap().len();
+    mock_key_reads().lock().unwrap().clear();
+    for (key, value) in [
+        ("days", json!(30)),
+        ("domainId", json!("domain1")),
+        ("readSessionId", json!("0".repeat(32))),
+        ("readSessionId", json!(true)),
+    ] {
+        let mut invalid = payload.clone();
+        invalid[key] = value;
+        assert!(backend
+            .dispatch("get_stats_center", &invalid)
+            .await
+            .is_err());
+    }
+    backend.db.links[0].default_url = "https://example.org/changed".into();
+    assert!(backend
+        .dispatch("get_stats_center", &payload)
+        .await
+        .unwrap_err()
+        .contains("刷新"));
+    assert_eq!(server.received_requests().await.unwrap().len(), before);
+    assert!(mock_key_reads().lock().unwrap().is_empty());
+    let fresh = center_query(&mut backend, None, 1).await;
+    let before = server.received_requests().await.unwrap().len();
+    backend.expire_read_sessions();
+    let mut expired = payload;
+    expired["readSessionId"] = fresh["readSessionId"].clone();
+    assert!(backend
+        .dispatch("get_stats_center", &expired)
+        .await
+        .unwrap_err()
+        .contains("过期"));
+    assert_eq!(server.received_requests().await.unwrap().len(), before);
+}
+#[tokio::test]
+async fn failed_stats_session_page_invalidates_its_read_receipt() {
+    let (server, mut backend, _guard) = fixture().await;
+    session_fixture(&server, &mut backend).await;
+    let first = center_query(&mut backend, None, 1).await;
+    Mock::given(method("POST"))
+        .and(path(SQL_PATH))
+        .and(body_string_contains("SELECT blob2"))
+        .respond_with(ResponseTemplate::new(403))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    let payload = json!({"accountId":"acct1","days":7,"page":2,"pageSize":25,"readSessionId":first["readSessionId"]});
+    let failed = backend
+        .dispatch("get_stats_center", &payload)
+        .await
+        .unwrap();
+    assert_eq!(failed["status"], "permission_denied");
+    assert!(failed.get("totals").is_none());
+    assert!(failed.get("rows").is_none());
+    let before = server.received_requests().await.unwrap().len();
+    assert!(backend
+        .dispatch("get_stats_center", &payload)
+        .await
+        .is_err());
+    assert_eq!(server.received_requests().await.unwrap().len(), before);
+}

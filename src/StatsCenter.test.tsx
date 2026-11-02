@@ -611,3 +611,65 @@ it("wires the independent App navigation to the center and reuses detailed link 
   expect(await screen.findByRole("dialog", { name: "访问统计 · /sample-01" })).toBeTruthy();
   expect(mockedDispatch.mock.calls.filter((call) => call[0] === "get_link_stats")).toHaveLength(1);
 });
+
+it('carries one read session across account pages and starts a new one on explicit refresh',async()=>{
+  mockedDispatch.mockImplementation((_action,payload)=>Promise.resolve(response({page:Number(payload?.page),totalLinks:30,rows:aPageRows(Number(payload?.page)),readSessionId:payload?.readSessionId as string || 'session-a'})));
+  render(view());chooseAccount();
+  fireEvent.click(screen.getByRole('button',{name:'读取统计'}));await expectSummary('120');
+  fireEvent.click(screen.getByRole('button',{name:'下一页统计'}));await screen.findByText(/第 2 \/ 2 页/);
+  expect(mockedDispatch).toHaveBeenLastCalledWith('get_stats_center',expect.objectContaining({page:2,readSessionId:'session-a'}));
+  fireEvent.click(screen.getByRole('button',{name:'上一页统计'}));await screen.findByText(/第 1 \/ 2 页/);
+  expect(mockedDispatch).toHaveBeenLastCalledWith('get_stats_center',expect.objectContaining({page:1,readSessionId:'session-a'}));
+  fireEvent.click(screen.getByRole('button',{name:'刷新统计'}));await expectSummary('120');
+  expect(mockedDispatch.mock.calls.at(-1)?.[1]).not.toHaveProperty('readSessionId');
+});
+
+it('never carries an account session into a changed date range',async()=>{
+  mockedDispatch.mockImplementation((_action,payload)=>Promise.resolve(response({days:Number(payload?.days) as 1|7|30,readSessionId:'session-a'})));
+  render(view({links:singleLinks}));chooseAccount();
+  fireEvent.click(screen.getByRole('button',{name:'读取统计'}));await expectSummary('120');
+  fireEvent.change(screen.getByLabelText('统计时间范围'),{target:{value:30}});
+  fireEvent.click(screen.getByRole('button',{name:'读取统计'}));await expectSummary('120');
+  expect(mockedDispatch.mock.calls.at(-1)?.[1]).toEqual({accountId:'account-a',days:30,page:1,pageSize:25});
+});
+
+it('uses separate per-account sessions for overview pages and preserves partial results on expiry',async()=>{
+  mockedDispatch.mockImplementation((_action,payload)=>{
+    if(payload?.accountId==='account-b') return Promise.resolve(response({accountId:'account-b',rows:[row('domain-b1','welcome')],readSessionId:'session-b'}));
+    if(payload?.page===2) return Promise.reject(Error('统计读取会话已过期，请刷新统计。'));
+    return Promise.resolve(response({totalLinks:30,rows:aPageRows(1),readSessionId:'session-a'}));
+  });
+  render(view());fireEvent.click(screen.getByRole('button',{name:'读取统计'}));
+  await screen.findByText(/已处理 2 \/ 2 个账户/);
+  expect(mockedDispatch).toHaveBeenNthCalledWith(2,'get_stats_center',expect.objectContaining({accountId:'account-a',page:2,readSessionId:'session-a'}));
+  expect(mockedDispatch.mock.calls[2][1]).not.toHaveProperty('readSessionId');
+  expect(screen.getByText(/已读 26 条/)).toBeTruthy();
+  expect(screen.getByText('统计读取会话已过期，请刷新统计。')).toBeTruthy();
+});
+
+it('rejects a continuation response from a different session',async()=>{
+  mockedDispatch.mockResolvedValueOnce(response({totalLinks:30,rows:aPageRows(1),readSessionId:'session-a'}))
+    .mockResolvedValueOnce(response({page:2,totalLinks:30,rows:aPageRows(2),readSessionId:'session-b'}));
+  render(view());chooseAccount();fireEvent.click(screen.getByRole('button',{name:'读取统计'}));await expectSummary('120');
+  fireEvent.click(screen.getByRole('button',{name:'下一页统计'}));
+  expect(await screen.findByText(/返回的统计结果与当前账户/)).toBeTruthy();
+  expect(screen.queryByLabelText('估算总访问')).toBeNull();
+});
+
+it('stops waiting on a single-account request and ignores its late response',async()=>{
+  const request=deferred<StatsCenterReport>();
+  mockedDispatch.mockReturnValue(request.promise);
+  render(view());chooseAccount();fireEvent.click(screen.getByRole('button',{name:'读取统计'}));
+  fireEvent.click(screen.getByRole('button',{name:'停止等待'}));
+  expect(screen.getByText(/当前网络请求可能仍在完成/)).toBeTruthy();
+  await act(async()=>request.resolve(response({readSessionId:'old-session'})));
+  expect(screen.queryByLabelText('估算总访问')).toBeNull();
+});
+
+it('does not read credentials for an account with incomplete token import',async()=>{
+  render(view({accounts:[{...accounts[0],needsTokenRecovery:true}],domains:domains.slice(0,2),links:links.slice(0,30)}));
+  chooseAccount();
+  expect(screen.getByText('令牌导入未完成')).toBeTruthy();
+  expect((screen.getByRole('button',{name:'读取统计'}) as HTMLButtonElement).disabled).toBe(true);
+  expect(mockedDispatch).not.toHaveBeenCalled();
+});

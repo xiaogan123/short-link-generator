@@ -8,6 +8,8 @@ import { inspect, loadWords, scanRepository } from './privacy-check.mjs';
 
 test('private terms are case-insensitive and never echoed', () => {
   assert.deepEqual(inspect('alpha PRIVATE-EXAMPLE omega',['private-example']),['private-term-1']);
+  assert.deepEqual(inspect('example%2Fterm', ['example%2Fterm']), ['private-term-1']);
+  assert.deepEqual(inspect('example%2Fterm', ['example/term']), ['private-term-1']);
 });
 test('binary UTF-16 text is inspected', () => {
   assert.deepEqual(inspect(Buffer.from('Private-Example','utf16le'),['private-example']),['private-term-1']);
@@ -16,6 +18,19 @@ test('credential and home path detector', () => {
   assert.ok(inspect('Bearer ' + 'a'.repeat(40)).includes('cloud-credential'));
   assert.ok(inspect('/Us' + 'ers/' + 'person/file').includes('home-directory'));
   assert.deepEqual(inspect('https://example.com/go/read'),[]);
+});
+test('external mount paths are detected across text and common encoded forms without echoing names', () => {
+  const mac = '/' + 'Vol' + 'umes/' + 'Example Archive/project/file.txt';
+  const paths = [mac, '/m' + 'nt/example/project/file.txt', '/me' + 'dia/example/file.txt',
+    '/run/m' + 'edia/example/archive/file.txt'];
+  const encoded = [mac.replaceAll('/', '\\/'), mac.replaceAll('/', '\\u002f'),
+    mac.replaceAll('/', '\\x2f'), encodeURIComponent(mac), encodeURIComponent(encodeURIComponent(mac)),
+    'file://' + encodeURI(mac), encodeURIComponent(mac).replaceAll('%', '\\u0025')];
+  for (const value of [...paths, ...encoded, Buffer.from(mac, 'utf16le')]) {
+    assert.deepEqual(inspect(value), ['mounted-volume']);
+  }
+  assert.deepEqual(inspect('https://example.com/docs/volumes and relative/project/file.txt'), []);
+  assert.deepEqual(inspect('malformed %zz remains harmless'), []);
 });
 test('missing and empty private list fail closed', () => {
   const dir=mkdtempSync(join(tmpdir(),'privacy-fixture-')); try {

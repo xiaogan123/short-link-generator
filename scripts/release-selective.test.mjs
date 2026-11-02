@@ -143,6 +143,13 @@ test('strict assembly checks source and artifact hashes and includes latest.json
     put(windowsUpgradeEvidence, passedWindowsUpgrade);
     const windowsEvidence = join(dir, 'candidates', 'candidate-x86_64-pc-windows-msvc', 'native-smoke.json');
     const passedWindowsEvidence = readFileSync(windowsEvidence, 'utf8');
+    const toolchain = { node: '24.10.0', npm: '11.6.0',
+      rustc: 'rustc 1.90.0 (123456789 2025-09-18)', cargo: 'cargo 1.90.0 (abcdef123 2025-09-18)' };
+    put(windowsEvidence, JSON.stringify({ ...JSON.parse(passedWindowsEvidence), toolchain }));
+    assert.equal(run().status, 0);
+    put(windowsEvidence, JSON.stringify({ ...JSON.parse(passedWindowsEvidence),
+      toolchain: { ...toolchain, npm: '11.6.0\nsynthetic-private-diagnostic' } }));
+    assert.match(run().stderr, /Invalid npm version evidence/);
     rmSync(windowsEvidence);
     assert.match(run().stderr, /Missing unique native startup evidence/);
     put(windowsEvidence, JSON.stringify({ ...JSON.parse(passedWindowsEvidence), windowObserved: false }));

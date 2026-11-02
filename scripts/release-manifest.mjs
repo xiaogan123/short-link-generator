@@ -8,6 +8,7 @@ import { validateMacSigningEvidence } from './macos-signature.mjs';
 import { readMacUpdater, validateMacArtifactEvidence } from './macos-artifact.mjs';
 import { helperPinForTarget } from './macos-credential-helper-bytes.mjs';
 import { readWindowsUpgradeEvidence, validateWindowsUpgradeEvidence } from './windows-upgrade-evidence.mjs';
+import { validateToolchainEvidence } from './toolchain-evidence.mjs';
 const version=JSON.parse(readFileSync('package.json','utf8')).version;
 const repository=process.env.GITHUB_REPOSITORY;
 if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repository??''))throw new Error('Invalid repository.');
@@ -90,6 +91,9 @@ if(requireEvidence){
     const matches=files.filter(file=>file===join(candidateRoot,'native-smoke.json'));
     if(matches.length!==1||lstatSync(matches[0]).isSymbolicLink())throw new Error(`Missing unique native startup evidence for ${target}.`);
     const evidence=JSON.parse(readFileSync(matches[0],'utf8'));
+    // Historical candidates can lack this informational field; new native
+    // checks always collect it. A supplied field must be exact and path-free.
+    if(evidence.toolchain!==undefined)validateToolchainEvidence(evidence.toolchain);
     if(evidence.tag!==tag||evidence.target!==target||evidence.host!==config.host||
        evidence.processAlive!==true||evidence.updaterSignaturePresent!==true||
        evidence.updaterSignatureVerified!==true||evidence.architectureVerified!==true){

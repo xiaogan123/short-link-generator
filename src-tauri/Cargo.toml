@@ -1,6 +1,6 @@
 [package]
 name = "short-link-generator"
-version = "0.1.24"
+version = "0.1.25"
 description = "短连接生成器"
 authors = ["Contributors"]
 edition = "2021"
@@ -20,11 +20,11 @@ tauri-plugin-opener = "2"
 tauri-plugin-clipboard-manager = "2"
 tauri-plugin-dialog = "2"
 tauri-plugin-fs = "2"
-tauri-plugin-updater = "2"
+tauri-plugin-updater = "2.14.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["time", "sync", "macros", "rt-multi-thread", "net"] }
-reqwest = { version = "0.12", features = ["json", "multipart"] }
+tokio = { version = "1", features = ["time", "sync", "macros", "rt-multi-thread", "net", "io-util"] }
+reqwest = { version = "0.12", features = ["json", "multipart", "stream"] }
 keyring = { version = "3", features = ["apple-native", "windows-native"] }
 url = "2"
 idna = "1"
@@ -42,6 +42,8 @@ security-framework = "=3.7.0"
 libc = "=0.2.189"
 
 [dev-dependencies]
+tauri = { version = "2", features = ["test"] }
+base64 = "0.22"
 tempfile = "3"
 wiremock = "0.6"
 

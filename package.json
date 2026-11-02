@@ -1,8 +1,11 @@
 {
   "name": "short-link-generator",
-  "version": "0.1.24",
+  "version": "0.1.25",
   "private": true,
   "type": "module",
+  "engines": {
+    "node": "^22.13.0 || ^24.0.0 || >=26.0.0"
+  },
   "scripts": {
     "dev": "vite --host 127.0.0.1 --port 1420 --strictPort",
     "build": "tsc -b && vite build",
@@ -22,7 +25,7 @@
     "@tauri-apps/plugin-dialog": "^2.6.0",
     "@tauri-apps/plugin-fs": "^2.4.5",
     "@tauri-apps/plugin-opener": "^2.5.3",
-    "@tauri-apps/plugin-updater": "^2.10.0",
+    "@tauri-apps/plugin-updater": "2.14.1",
     "react": "19.3.0",
     "react-dom": "19.3.0"
   },
@@ -35,8 +38,8 @@
     "@vitejs/plugin-react": "^6.0.0",
     "jsdom": "^29.0.0",
     "typescript": "^6.0.2",
-    "vite": "8.3.1",
-    "vitest": "5.0.2",
+    "vite": "8.3.5",
+    "vitest": "5.0.5",
     "yaml": "^2.8.3"
   }
 }

@@ -33,3 +33,20 @@ it('reads protection only on request and prepares a scoped, cancellable plan',as
   fireEvent.click(within(review).getByRole('button',{name:'返回'}));
   expect(control.calls.some(call=>call.action==='apply_plan')).toBe(false);
 });
+
+
+it('describes the per-location approximate limit and fail-open behavior without a global or cost guarantee',async()=>{
+  const manager=await openManager();
+  expect(manager.textContent).toContain('每个 Cloudflare 节点的近似阈值为 100 次 / 10 秒');
+  expect(manager.textContent).toContain('跨节点计数不合并');
+  expect(manager.textContent).toContain('保护服务异常时放行');
+  expect(manager.textContent).toContain('不保证全球总次数或费用上限');
+  expect(manager.textContent).not.toContain('每 10 秒最多 100 次');
+  fireEvent.click(within(manager).getByRole('button',{name:'启用访问保护'}));
+  const plan=await screen.findByRole('dialog',{name:'启用访问保护'});
+  fireEvent.click(within(plan).getByRole('button',{name:'确认并执行'}));
+  await screen.findByText(/访问保护已启用：同一 IP/);
+  expect(screen.getByText(/访问保护已启用：同一 IP/).textContent).toContain('每个节点');
+  expect(screen.getByText(/访问保护已启用：同一 IP/).textContent).toContain('服务异常时放行');
+  expect(screen.getByText(/访问保护已启用：同一 IP/).textContent).toContain('不保证全球总次数或费用上限');
+});

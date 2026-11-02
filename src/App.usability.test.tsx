@@ -1,5 +1,5 @@
 import {act,cleanup,fireEvent,render,screen,waitFor,within} from '@testing-library/react';
-import {afterEach,expect,it,vi} from 'vitest';
+import {afterEach,beforeEach,expect,it,vi} from 'vitest';
 import App from './App';
 import {openUrl} from '@tauri-apps/plugin-opener';
 
@@ -20,7 +20,8 @@ vi.mock('./bridge',()=>({
   },
 }));
 
-afterEach(()=>{cleanup();calls.length=0;vi.clearAllMocks();clipboard.readText.mockReset();clipboard.readText.mockResolvedValue('');});
+beforeEach(()=>{vi.spyOn(HTMLElement.prototype,'getClientRects').mockImplementation(function(this:HTMLElement){return (this.hidden||getComputedStyle(this).display==='none'?[]:[new DOMRect(12,12,120,32)]) as unknown as DOMRectList;});});
+afterEach(()=>{cleanup();calls.length=0;vi.restoreAllMocks();vi.clearAllMocks();clipboard.readText.mockReset();clipboard.readText.mockResolvedValue('');});
 
 it('uses a root account dialog and returns focus after Escape',async()=>{
   render(<App/>);
@@ -39,10 +40,10 @@ it('separates account facts, management groups, and the two import steps',async(
   render(<App/>);
   await screen.findByText('/manual');
   fireEvent.click(screen.getByRole('button',{name:/^Cloudflare 账户$/}));
-  const card=screen.getByRole('article',{name:'Example organization 账户'});
+  const card=screen.getByRole('article',{name:'本机备注 账户'});
   const facts=card.querySelector('.account-facts') as HTMLElement;
-  expect(facts.querySelector('dt')?.textContent).toBe('本机备注');
-  expect(facts.querySelector('dd')?.textContent).toBe('本机备注');
+  expect(facts.querySelector('dt')?.textContent).toBe('Cloudflare 名称');
+  expect(facts.querySelector('dd')?.textContent).toBe('Example organization');
   expect(within(facts).getByText('账户 ID').nextElementSibling?.textContent).toContain('…');
   expect(within(facts).getByText('接入域名').nextElementSibling?.textContent).toBe('1 个域名');
   expect(within(card).getByText(/检测服务：未启用/)).toBeTruthy();

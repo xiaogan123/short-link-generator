@@ -26,6 +26,22 @@ pub(super) fn valid_binding(value: &Value, namespace: &str) -> bool {
     binding(namespace).is_ok_and(|expected| value == &expected)
 }
 
+const READ_SESSION_TTL: Duration = Duration::from_secs(60);
+const MAX_READ_SESSIONS: usize = 16;
+#[derive(Clone)]
+pub(super) struct ReadSession {
+    id: String,
+    account_id: String,
+    domain_id: Option<String>,
+    days: u64,
+    state_hash: String,
+    expires_at: Instant,
+    window_end: i64,
+    queried_at: String,
+    totals: Option<Totals>,
+}
+const SESSION_EXPIRED: &str = "统计读取会话已过期或范围发生变化，请刷新后重新读取";
+
 #[derive(Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct Totals {
@@ -189,7 +205,12 @@ fn bounded_sql(query: String) -> Result<String, String> {
     }
 }
 
-fn summary_sql(dataset: &str, domains: &[ScopeDomain], days: u64) -> Result<String, String> {
+fn summary_sql(
+    dataset: &str,
+    domains: &[ScopeDomain],
+    days: u64,
+    window_end: i64,
+) -> Result<String, String> {
     let allowlist = domains
         .iter()
         .map(|domain| {
@@ -206,13 +227,18 @@ fn summary_sql(dataset: &str, domains: &[ScopeDomain], days: u64) -> Result<Stri
         SUM(_sample_interval) AS count, SUM(_sample_interval * double2) AS first_count, \
         SUM(_sample_interval * double3) AS repeat_count \
         FROM {dataset} WHERE blob1 = 'v1' AND ({allowlist}) \
-        AND timestamp > NOW() - INTERVAL '{days}' DAY AND timestamp <= NOW() \
+        AND timestamp > toDateTime({window_end}) - INTERVAL '{days}' DAY AND timestamp <= toDateTime({window_end}) \
         GROUP BY blob5, blob6, blob7 LIMIT {} FORMAT JSON",
         MAX_GROUPS + 1
     ))
 }
 
-fn page_sql(dataset: &str, links: &[PageLink], days: u64) -> Result<String, String> {
+fn page_sql(
+    dataset: &str,
+    links: &[PageLink],
+    days: u64,
+    window_end: i64,
+) -> Result<String, String> {
     let allowlist = links
         .iter()
         .map(|link| {
@@ -231,7 +257,7 @@ fn page_sql(dataset: &str, links: &[PageLink], days: u64) -> Result<String, Stri
         SUM(_sample_interval) AS count, SUM(_sample_interval * double2) AS first_count, \
         SUM(_sample_interval * double3) AS repeat_count FROM {dataset} \
         WHERE blob1 = 'v1' AND ({allowlist}) \
-        AND timestamp > NOW() - INTERVAL '{days}' DAY AND timestamp <= NOW() \
+        AND timestamp > toDateTime({window_end}) - INTERVAL '{days}' DAY AND timestamp <= toDateTime({window_end}) \
         GROUP BY blob2, blob3, blob4, blob5, blob6, blob7 LIMIT {} FORMAT JSON",
         links.len() * MAX_GROUPS + 1
     ))
@@ -506,7 +532,13 @@ fn zero_rows(links: &[PageLink]) -> Vec<StatsCenterRow> {
 }
 
 impl Backend {
-    pub(super) async fn get_stats_center(&self, payload: &Value) -> Result<Value, String> {
+    #[cfg(test)]
+    pub(super) fn expire_read_sessions(&mut self) {
+        for session in &mut self.stats_sessions {
+            session.expires_at = Instant::now() - Duration::from_secs(1);
+        }
+    }
+    pub(super) async fn get_stats_center(&mut self, payload: &Value) -> Result<Value, String> {
         let account_id = field(payload, "accountId")?;
         if !valid_id(account_id) {
             return Err("账号标识无效".into());
@@ -540,6 +572,33 @@ impl Backend {
         if payload["pageSize"].as_u64() != Some(STATS_CENTER_PAGE_SIZE as u64) {
             return Err("统计中心每页固定显示 25 条链接".into());
         }
+        self.stats_sessions
+            .retain(|session| session.expires_at > Instant::now());
+        let state_hash = self.database_snapshot();
+        let session = match payload.get("readSessionId") {
+            None => None,
+            Some(Value::String(id))
+                if id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit()) =>
+            {
+                Some(
+                    self.stats_sessions
+                        .iter()
+                        .find(|session| {
+                            session.id == *id
+                                && session.account_id == account_id
+                                && session.domain_id.as_deref() == domain_id
+                                && session.days == days
+                                && session.state_hash == state_hash
+                        })
+                        .cloned()
+                        .ok_or(SESSION_EXPIRED)?,
+                )
+            }
+            _ => return Err(SESSION_EXPIRED.into()),
+        };
+        let window_end = session
+            .as_ref()
+            .map_or_else(|| Utc::now().timestamp(), |s| s.window_end);
         let offset = page
             .checked_sub(1)
             .and_then(|page| page.checked_mul(STATS_CENTER_PAGE_SIZE as u64))
@@ -680,11 +739,11 @@ impl Backend {
             );
         };
         let dataset = dataset_name(&resources.namespace)?;
-        let summary_query = summary_sql(&dataset, &scope, days)?;
+        let summary_query = summary_sql(&dataset, &scope, days, window_end)?;
         let page_query = if page_links.is_empty() {
             None
         } else {
-            Some(page_sql(&dataset, &page_links, days)?)
+            Some(page_sql(&dataset, &page_links, days, window_end)?)
         };
         if self.require_no_worker_upgrade(account_id).is_err() {
             return center_response(
@@ -704,30 +763,45 @@ impl Backend {
         // bounds are resolved before the selected account credential is read.
         self.require_credentials(account_id)?;
         let token = Zeroizing::new(keyring_get(account_id, "token")?);
-        if self
-            .verify_resource_source(&token, account_id, resources)
-            .await
-            .is_err()
-        {
-            return center_response(
-                Status::Unavailable,
-                "尚未确认此账户的转发程序归属与配置，暂时不能查询统计",
-                account_id,
-                domain_id,
-                days,
-                page,
-                total_links,
-                None,
-                None,
-            );
-        }
-        let settings = match self
-            .cloud
-            .script_settings(&token, account_id, &resources.script)
-            .await
-        {
-            Ok(value) => value,
-            Err(_) => {
+        if session.is_none() {
+            if self
+                .verify_resource_source(&token, account_id, resources)
+                .await
+                .is_err()
+            {
+                return center_response(
+                    Status::Unavailable,
+                    "尚未确认此账户的转发程序归属与配置，暂时不能查询统计",
+                    account_id,
+                    domain_id,
+                    days,
+                    page,
+                    total_links,
+                    None,
+                    None,
+                );
+            }
+            let settings = match self
+                .cloud
+                .script_settings(&token, account_id, &resources.script)
+                .await
+            {
+                Ok(value) => value,
+                Err(_) => {
+                    return center_response(
+                        Status::Unavailable,
+                        AnalyticsError::Unavailable.message(),
+                        account_id,
+                        domain_id,
+                        days,
+                        page,
+                        total_links,
+                        None,
+                        None,
+                    )
+                }
+            };
+            let Some(bindings) = settings["result"]["bindings"].as_array() else {
                 return center_response(
                     Status::Unavailable,
                     AnalyticsError::Unavailable.message(),
@@ -738,74 +812,54 @@ impl Backend {
                     total_links,
                     None,
                     None,
-                )
-            }
-        };
-        let Some(bindings) = settings["result"]["bindings"].as_array() else {
-            return center_response(
-                Status::Unavailable,
-                AnalyticsError::Unavailable.message(),
-                account_id,
-                domain_id,
-                days,
-                page,
-                total_links,
-                None,
-                None,
-            );
-        };
-        let analytics: Vec<_> = bindings
-            .iter()
-            .filter(|binding| binding["name"] == "CLICK_EVENTS")
-            .collect();
-        if analytics.is_empty() {
-            return center_response(
-                Status::Disabled,
-                "此账户尚未启用点击统计；启用后才会开始采集",
-                account_id,
-                domain_id,
-                days,
-                page,
-                total_links,
-                None,
-                None,
-            );
-        }
-        if analytics.len() != 1 || !valid_binding(analytics[0], &resources.namespace) {
-            return center_response(
-                Status::Unavailable,
-                "统计绑定与此账户的资源不一致，请核对配置",
-                account_id,
-                domain_id,
-                days,
-                page,
-                total_links,
-                None,
-                None,
-            );
-        }
-
-        let summary = self
-            .cloud
-            .analytics_sql(&token, account_id, &summary_query)
-            .await
-            .and_then(|value| aggregate(&value));
-        let totals = match summary {
-            Ok(Some(totals)) => totals,
-            Ok(None) => {
+                );
+            };
+            let analytics: Vec<_> = bindings
+                .iter()
+                .filter(|binding| binding["name"] == "CLICK_EVENTS")
+                .collect();
+            if analytics.is_empty() {
                 return center_response(
-                    Status::NoData,
-                    "所选域名范围在该时段未返回任何事件；本页按零展示，但不能据此确认没有访问",
+                    Status::Disabled,
+                    "此账户尚未启用点击统计；启用后才会开始采集",
                     account_id,
                     domain_id,
                     days,
                     page,
                     total_links,
                     None,
-                    Some(zero_rows(&page_links)),
-                )
+                    None,
+                );
             }
+            if analytics.len() != 1 || !valid_binding(analytics[0], &resources.namespace) {
+                return center_response(
+                    Status::Unavailable,
+                    "统计绑定与此账户的资源不一致，请核对配置",
+                    account_id,
+                    domain_id,
+                    days,
+                    page,
+                    total_links,
+                    None,
+                    None,
+                );
+            }
+        }
+        let verified_at = Instant::now();
+        let summary = if let Some(session) = &session {
+            Ok(session.totals.clone())
+        } else {
+            self.cloud
+                .analytics_sql(&token, account_id, &summary_query)
+                .await
+                .and_then(|value| aggregate(&value))
+        };
+        let totals = match summary {
+            Ok(totals) => totals,
             Err(error) => {
+                if let Some(session) = &session {
+                    self.stats_sessions.retain(|s| s.id != session.id);
+                }
                 return center_response(
                     if error == AnalyticsError::PermissionDenied {
                         Status::PermissionDenied
@@ -820,11 +874,13 @@ impl Backend {
                     total_links,
                     None,
                     None,
-                )
+                );
             }
         };
 
-        let rows = if let Some(query) = page_query {
+        let rows = if totals.is_none() {
+            zero_rows(&page_links)
+        } else if let Some(query) = page_query {
             match self
                 .cloud
                 .analytics_sql_center_page(&token, account_id, &query)
@@ -833,6 +889,9 @@ impl Backend {
             {
                 Ok(rows) => rows,
                 Err(error) => {
+                    if let Some(session) = &session {
+                        self.stats_sessions.retain(|s| s.id != session.id);
+                    }
                     return center_response(
                         if error == AnalyticsError::PermissionDenied {
                             Status::PermissionDenied
@@ -847,23 +906,51 @@ impl Backend {
                         total_links,
                         None,
                         None,
-                    )
+                    );
                 }
             }
         } else {
             Vec::new()
         };
-        center_response(
-            Status::Ready,
-            "汇总覆盖所选域名范围内的全部统计事件，包括已删除链接的历史事件；列表仅显示本页当前本机链接。次数按采样权重估计，可能延迟",
+        let read_session = session.unwrap_or_else(|| ReadSession {
+            id: random_id(),
+            account_id: account_id.into(),
+            domain_id: domain_id.map(str::to_owned),
+            days,
+            state_hash,
+            expires_at: verified_at + READ_SESSION_TTL,
+            window_end,
+            queried_at: now(),
+            totals: totals.clone(),
+        });
+        let mut response = center_response(
+            if totals.is_some() {
+                Status::Ready
+            } else {
+                Status::NoData
+            },
+            if totals.is_some() {
+                "汇总覆盖所选域名范围内的全部统计事件，包括已删除链接的历史事件；列表仅显示本页当前本机链接。分页复用短时读取会话，数据可能延迟，并非原子快照"
+            } else {
+                "所选域名范围在该时段未返回任何事件；本页按零展示，但不能据此确认没有访问"
+            },
             account_id,
             domain_id,
             days,
             page,
             total_links,
-            Some(totals),
+            totals,
             Some(rows),
-        )
+        )?;
+        response["readSessionId"] = json!(read_session.id);
+        response["queriedAt"] = json!(read_session.queried_at);
+        if !self.stats_sessions.iter().any(|s| s.id == read_session.id) {
+            if self.stats_sessions.len() >= MAX_READ_SESSIONS {
+                self.stats_sessions.remove(0);
+            }
+            self.stats_sessions.push(read_session);
+        }
+        Ok(response)
     }
 
     pub(super) async fn get_link_stats(&self, payload: &Value) -> Result<Value, String> {

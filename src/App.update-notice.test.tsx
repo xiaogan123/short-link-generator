@@ -1,6 +1,7 @@
-import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, renderHook, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import App from "./App";
+import {useUpdateCheck} from "./useUpdateCheck";
 import type { UpdateStatus } from "./types";
 
 const c = vi.hoisted(() => ({
@@ -143,15 +144,30 @@ it("cleans up automatic work after unmount", async () => {
   expect(c.calls).toEqual(["get_state"]);
 });
 
-it("ignores stale background availability after a confirmed installation", async () => {
+it("waits for an outstanding background check before starting installation", async () => {
   await start(); await advance(5000);
   let finish!: (result: UpdateStatus) => void;
   c.deferred = new Promise(resolve => { finish = resolve; });
   await advance(6 * 3600_000);
-  await click("查看更新"); await click("确认安装更新");
-  expect(screen.getByRole("status", { name: "更新已安装" })).toBeTruthy();
+  await click("查看更新");
+  expect((screen.getByRole("button", {name:"确认安装更新"}) as HTMLButtonElement).disabled).toBe(true);
+  expect(c.calls).not.toContain("install_update");
   await act(async () => { finish(c.result); });
+  await click("确认安装更新");
+  expect(screen.getByRole("status", { name: "更新已安装" })).toBeTruthy();
   expect(screen.queryByRole("region", { name: "新版本提醒" })).toBeNull();
   expect(screen.queryByRole("button", { name: /发现新版本/ })).toBeNull();
   expect(screen.getByRole("dialog", { name: "应用更新" }).textContent).toContain("已安装");
+});
+
+it("discards a metadata response superseded by an accepted installation result", async () => {
+  let finish!: (result: UpdateStatus) => void;
+  c.deferred = new Promise(resolve => { finish = resolve; });
+  const hook = renderHook(() => useUpdateCheck(false));
+  let pending!: Promise<UpdateStatus>;
+  act(() => { pending = hook.result.current.check(); });
+  act(() => { hook.result.current.accept(c.installResult); });
+  await act(async () => { finish(c.result); await pending; });
+  expect(hook.result.current.available).toBeNull();
+  expect(hook.result.current.checking).toBe(false);
 });

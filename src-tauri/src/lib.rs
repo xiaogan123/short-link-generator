@@ -4,6 +4,8 @@ mod click_stats_tests;
 mod cloud;
 #[cfg(test)]
 mod credential_cleanup_tests;
+#[cfg(test)]
+mod credential_import_tests;
 #[cfg(any(target_os = "macos", target_os = "windows", test))]
 mod credential_migration;
 #[cfg(all(test, target_os = "macos"))]
@@ -25,6 +27,7 @@ mod secret_store;
 #[cfg(test)]
 mod selftest_resource_recovery_tests;
 mod traffic_guard;
+mod updater_service;
 #[cfg(target_os = "windows")]
 mod windows_configuration;
 #[cfg(all(test, target_os = "windows"))]
@@ -54,7 +57,6 @@ use std::{
     time::{Duration, Instant},
 };
 use tauri::Manager;
-use tauri_plugin_updater::UpdaterExt;
 use tokio::sync::Mutex;
 use zeroize::Zeroizing;
 
@@ -105,6 +107,7 @@ struct Backend {
     db: Database,
     path: PathBuf,
     plans: Vec<Plan>,
+    stats_sessions: Vec<click_stats::ReadSession>,
     cloud: Cloud,
     #[cfg(target_os = "macos")]
     _credential_lease: Option<mac_credentials::ConfigurationLease>,
@@ -201,10 +204,19 @@ fn keyring_set(id: &str, kind: &str, value: &str) -> Result<(), String> {
         {
             return Err("测试注入：系统凭据保存失败".into());
         }
+        let stored = if mock_key_set_failures()
+            .lock()
+            .unwrap()
+            .contains(&format!("readback-mismatch:{kind}:{id}"))
+        {
+            "synthetic-conflicting-readback"
+        } else {
+            value
+        };
         mock_keys()
             .lock()
             .expect("test key store")
-            .insert(format!("{kind}:{id}"), value.to_string());
+            .insert(format!("{kind}:{id}"), stored.to_string());
         Ok(())
     }
     #[cfg(not(test))]
@@ -765,6 +777,7 @@ impl Backend {
             db,
             path,
             plans: Vec::new(),
+            stats_sessions: Vec::new(),
             cloud: Cloud::new()?,
             #[cfg(test)]
             persist_count: std::sync::atomic::AtomicUsize::new(0),
@@ -798,7 +811,12 @@ impl Backend {
         let bytes =
             serde_json::to_vec_pretty(&self.db).map_err(|_| "无法序列化配置".to_string())?;
         let tmp = self.path.with_extension("json.tmp");
-        fs::write(&tmp, bytes).map_err(|_| "无法保存配置".to_string())?;
+        use std::io::Write;
+        let mut file = fs::File::create(&tmp).map_err(|_| "无法保存配置".to_string())?;
+        file.write_all(&bytes)
+            .and_then(|_| file.sync_all())
+            .map_err(|_| "无法保存配置".to_string())?;
+        drop(file);
         fs::rename(&tmp, &self.path).map_err(|_| "无法提交配置".to_string())
     }
     fn state(&self) -> Value {
@@ -820,6 +838,9 @@ impl Backend {
 
     fn require_credentials(&self, id: &str) -> Result<(), String> {
         let account = self.account(id)?;
+        if account.token_import_pending {
+            return Err("此账号的令牌导入尚未完成，请重试原令牌或明确更新该账号令牌".into());
+        }
         if cfg!(target_os = "macos") && account.mac_credential_schema != 2 {
             return Err(secret_store::SecretError::MigrationRequired.to_string());
         }
@@ -1113,7 +1134,13 @@ impl Backend {
             if cloudflare_name.is_empty() || cloudflare_name.chars().count() > 256 {
                 return Err("云端账号名称无效".into());
             }
-            if self.db.accounts.iter().any(|a| a.id == id) && !replace {
+            if self
+                .db
+                .accounts
+                .iter()
+                .any(|a| a.id == id && !a.token_import_pending)
+                && !replace
+            {
                 return Err("这个账号已经导入过；若要换令牌，请确认替换".into());
             }
             self.cloud
@@ -1134,25 +1161,31 @@ impl Backend {
             imported.push((id, cloudflare_name, zones));
         }
         let before_import = self.db.clone();
-        // Validate every account before changing credentials or local state.
+        // Commit a visible, credential-gated account before any secret write.
+        // A crash, denied/readback failure, or final commit failure can then be
+        // recovered with a same-token retry or an explicitly scoped replacement.
+        // No token or token-derived digest is stored in local configuration.
+        let mut writes = Vec::new();
         for (id, cloudflare_name, zones) in imported {
-            let existing_account = self.db.accounts.iter().any(|a| a.id == id);
-            if let Err(error) = write_explicit_token(&id, token, replace && existing_account).await
-            {
-                self.db = before_import;
-                return Err(error);
-            }
+            let previous = before_import.accounts.iter().find(|a| a.id == id);
+            let allow_replace = replace
+                && previous.is_some_and(|a| {
+                    !a.token_import_pending || expected_account_id == Some(id.as_str())
+                });
+            writes.push((id.clone(), allow_replace));
             if let Some(account) = self.db.accounts.iter_mut().find(|a| a.id == id) {
                 account.cloudflare_name = Some(cloudflare_name);
                 account.zone_count = zones.len();
                 account.zones = zones;
                 account.checked_at = Some(now());
+                account.token_import_pending = true;
             } else {
                 let label: String = cloudflare_name.chars().take(64).collect();
                 self.db.accounts.push(Account {
                     id,
                     label,
                     mac_credential_schema: if cfg!(target_os = "macos") { 2 } else { 0 },
+                    token_import_pending: true,
                     cloudflare_name: Some(cloudflare_name),
                     zone_count: zones.len(),
                     checked_at: Some(now()),
@@ -1169,6 +1202,28 @@ impl Backend {
         if let Err(error) = self.persist() {
             self.db = before_import;
             return Err(error);
+        }
+        self.publish_credential_routes();
+        let staged = self.db.clone();
+        // Existing unknown entries still use create-only. A pending account can
+        // only replace a different token through its explicit account update UI.
+        for (id, allow_replace) in &writes {
+            if let Err(error) = write_explicit_token(id, token, *allow_replace).await {
+                return Err(format!(
+                    "{error}；账号导入未完成，可重试原令牌，或在该账号中明确更新令牌"
+                ));
+            }
+        }
+        for (id, _) in writes {
+            if let Some(account) = self.db.accounts.iter_mut().find(|a| a.id == id) {
+                account.token_import_pending = false;
+            }
+        }
+        if let Err(error) = self.persist() {
+            self.db = staged;
+            return Err(format!(
+                "{error}；令牌已保存，账号仍待恢复，请重试或明确更新该账号令牌"
+            ));
         }
         self.publish_credential_routes();
         Ok(self.state())
@@ -2239,7 +2294,11 @@ impl Backend {
                         ),
                         format!("删除此前缀配置和 {count} 条链接记录"),
                     ],
-                    vec!["边缘节点可能暂时保留已缓存的配置".into()],
+                    vec![
+                        "同名链接即使已在其他设备更新，也会一并删除；请确认这些短链接不再需要"
+                            .into(),
+                        "边缘节点可能暂时保留已缓存的配置".into(),
+                    ],
                     PlanKind::RemoveDomain { domain_id: id },
                 )
             }
@@ -2405,13 +2464,18 @@ impl Backend {
                 if label.is_empty() || label.chars().count() > 64 {
                     return Err("备注名需为 1–64 个字符".into());
                 }
-                self.db
+                let index = self
+                    .db
                     .accounts
-                    .iter_mut()
-                    .find(|a| a.id == id)
-                    .ok_or("找不到此账号")?
-                    .label = label.to_owned();
-                self.persist()?;
+                    .iter()
+                    .position(|a| a.id == id)
+                    .ok_or("找不到此账号")?;
+                let previous =
+                    std::mem::replace(&mut self.db.accounts[index].label, label.to_owned());
+                if let Err(error) = self.persist() {
+                    self.db.accounts[index].label = previous;
+                    return Err(error);
+                }
                 Ok(self.state())
             }
             "remove_account" => {
@@ -6231,64 +6295,16 @@ fn requested_dns_mode(payload: &Value) -> Result<local_check::DnsMode, String> {
 enum UpdateAction {
     Check,
     Install,
+    Cancel,
 }
 
 fn update_action(action: &str) -> Option<UpdateAction> {
     match action {
         "check_update" => Some(UpdateAction::Check),
         "install_update" => Some(UpdateAction::Install),
+        "cancel_update" => Some(UpdateAction::Cancel),
         _ => None,
     }
-}
-
-async fn check_update(app: &tauri::AppHandle, install: bool) -> Result<Value, String> {
-    let (Some(pubkey), Some(endpoint)) = (
-        option_env!("SLG_UPDATER_PUBLIC_KEY"),
-        option_env!("SLG_UPDATER_ENDPOINT"),
-    ) else {
-        return Ok(
-            json!({"status":"unavailable","currentVersion":env!("CARGO_PKG_VERSION"),"message":"此版本未配置更新通道"}),
-        );
-    };
-    if pubkey.is_empty() {
-        return Ok(
-            json!({"status":"unavailable","currentVersion":env!("CARGO_PKG_VERSION"),"message":"此版本未配置更新通道"}),
-        );
-    }
-    let url = url::Url::parse(endpoint).map_err(|_| "更新地址配置无效".to_string())?;
-    if url.scheme() != "https" {
-        return Err("更新地址必须使用 HTTPS".into());
-    }
-    let updater = app
-        .updater_builder()
-        .endpoints(vec![url])
-        .map_err(|_| "更新通道配置无效".to_string())?
-        .timeout(Duration::from_secs(30))
-        .build()
-        .map_err(|_| "更新服务不可用".to_string())?;
-    let available = updater
-        .check()
-        .await
-        .map_err(|_| "无法检查更新，请稍后再试".to_string())?;
-    let Some(update) = available else {
-        return Ok(
-            json!({"status":"up_to_date","currentVersion":env!("CARGO_PKG_VERSION"),"message":"当前已是最新版本"}),
-        );
-    };
-    if !install {
-        return Ok(
-            json!({"status":"available","currentVersion":env!("CARGO_PKG_VERSION"),"version":update.version,
-            "notes":update.body,"message":"发现新版本"}),
-        );
-    }
-    update
-        .download_and_install(|_, _| {}, || {})
-        .await
-        .map_err(|_| "更新下载或安装失败".to_string())?;
-    Ok(
-        json!({"status":"installed","currentVersion":env!("CARGO_PKG_VERSION"),"version":update.version,
-        "message":"更新已安装，请重新启动应用"}),
-    )
 }
 
 #[tauri::command]
@@ -6300,11 +6316,9 @@ async fn dispatch(
     let action = field(&request, "action")?.to_string();
     let payload = request.get("payload").cloned().unwrap_or_else(|| json!({}));
     match update_action(&action) {
-        Some(UpdateAction::Check) => return check_update(&app, false).await,
-        Some(UpdateAction::Install) => {
-            let _backend_guard = lock_backend(&state, &action).await?;
-            return check_update(&app, true).await;
-        }
+        Some(UpdateAction::Check) => return updater_service::check(&app).await,
+        Some(UpdateAction::Install) => return updater_service::install(&app, &state).await,
+        Some(UpdateAction::Cancel) => return app.state::<updater_service::Service>().cancel(),
         None => {}
     }
     if action == "check_pool_health" {
@@ -6399,6 +6413,7 @@ pub fn run() {
             let dir = app.path().app_data_dir()?;
             let backend = Backend::load(dir.join("state.json")).map_err(std::io::Error::other)?;
             app.manage(AppState(Mutex::new(backend)));
+            app.manage(updater_service::Service::default());
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 let mut timer = tokio::time::interval(Duration::from_secs(30));
@@ -6584,6 +6599,7 @@ mod tests {
             id: "acct1".into(),
             label: "账号 1".into(),
             mac_credential_schema: 2,
+            token_import_pending: false,
             cloudflare_name: Some("Example Account".into()),
             zone_count: 1,
             checked_at: Some(now()),
@@ -6617,6 +6633,7 @@ mod tests {
             },
             path: dir.path().join("state.json"),
             plans: vec![],
+            stats_sessions: Vec::new(),
             cloud: Cloud::for_test(&format!("{}/client/v4/", server.uri())),
             #[cfg(target_os = "macos")]
             _credential_lease: None,

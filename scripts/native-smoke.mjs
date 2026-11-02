@@ -10,6 +10,7 @@ import {
 import { observeWindowsWindow } from './windows-window-observer.mjs';
 import { bundleManifest, verifyMacArtifactSet } from './macos-artifact.mjs';
 import { helperPinForTarget } from './macos-credential-helper-bytes.mjs';
+import { collectToolchainEvidence } from './toolchain-evidence.mjs';
 
 const targets = {
   'aarch64-apple-darwin': { host: 'darwin', arch: 'arm64', binaryArch: 'arm64', updater: '.app.tar.gz' },
@@ -223,13 +224,14 @@ export async function main(args = process.argv.slice(2)) {
   if (!updaterPublicKey) throw new Error('Configured updater public key is required.');
   verifyUpdaterSignatureFile(updater, signature, updaterPublicKey, tag);
   const publicKeySha256 = updaterPublicKeySha256(updaterPublicKey);
+  const toolchain = collectToolchainEvidence();
   const temp = mkdtempSync(join(process.env.RUNNER_TEMP ?? tmpdir(), 'slg-native-smoke-'));
   try {
     const result = config.host === 'darwin'
       ? await smokeMac(installer, updater, bundle, config, temp, target)
       : await smokeWindows(installer, temp);
     const evidence = { schema: 1, tag, sha, target,
-      host: `${process.platform}-${process.arch}`, checkedAt: new Date().toISOString(),
+      host: `${process.platform}-${process.arch}`, checkedAt: new Date().toISOString(), toolchain,
       installer: basename(installer), installerSha256: digest(installer),
       updater: basename(updater), updaterSha256: digest(updater),
       updaterSignature: basename(signature), updaterSignatureSha256: digest(signature),

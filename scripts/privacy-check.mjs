@@ -11,15 +11,33 @@ const builtins = [
   ['private-key', /-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----/g],
   ['cloud-credential', /(?:Bearer\s+)[A-Za-z0-9_-]{32,}/g],
   ['environment-secret', /(?:CLOUDFLARE_API_TOKEN|SELFTEST_KEY)\s*=\s*["']?[A-Za-z0-9_-]{32,}/g],
+  ['mounted-volume', new RegExp(`/(?:${['Vol' + 'umes', 'm' + 'nt', 'me' + 'dia', 'run/m' + 'edia'].join('|')})/[^/\\\\\x00-\x1f"'<>]+(?:/|$|["'\r\n])`, 'g')],
 ];
+function decodedText(source) {
+  // Two bounded passes cover JSON escaping and percent-encoded file URLs,
+  // including a URL embedded in JSON. This is text inspection, never execution.
+  for (let pass = 0; pass < 2; pass++) {
+    const next = source.replace(/\\u([0-9a-f]{4})|\\x([0-9a-f]{2})/gi,
+      (_, unicode, byte) => String.fromCharCode(parseInt(unicode ?? byte, 16)))
+      .replace(/\\\//g, '/')
+      .replace(/(?:%[0-9a-f]{2})+/gi, encoded => {
+        try { return decodeURIComponent(encoded); } catch { return encoded; }
+      });
+    if (next === source) break;
+    source = next;
+  }
+  return source;
+}
 export function inspect(data, words = []) {
   const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
   const texts = [buf.toString('utf8'), buf.toString('utf16le')];
   const hits = new Set();
-  for (const source of texts) {
-    for (const [label, pattern] of builtins) { pattern.lastIndex = 0; if (pattern.test(source)) hits.add(label); }
-    const lower = source.toLocaleLowerCase('en-US');
-    words.forEach((word, index) => { if (lower.includes(word.toLocaleLowerCase('en-US'))) hits.add(`private-term-${index + 1}`); });
+  for (const original of texts) {
+    for (const source of new Set([original, decodedText(original)])) {
+      for (const [label, pattern] of builtins) { pattern.lastIndex = 0; if (pattern.test(source)) hits.add(label); }
+      const lower = source.toLocaleLowerCase('en-US');
+      words.forEach((word, index) => { if (lower.includes(word.toLocaleLowerCase('en-US'))) hits.add(`private-term-${index + 1}`); });
+    }
   }
   return [...hits];
 }

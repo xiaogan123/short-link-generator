@@ -296,3 +296,111 @@ it.each(['paused','offline'])('retries after the last in-flight check completes 
   expect(result.current.lastCompletion).not.toBeNull();
   online.mockRestore();
 });
+
+it('keeps the 48-hour deadline and result age safe when the wall clock moves backwards',async()=>{
+  const check=vi.fn(()=>Promise.resolve(report('passed')));
+  const {result,rerender}=renderHook(({paused})=>useRedirectMonitor({state:base,paused,ready:true,check}),{initialProps:{paused:false}});
+  act(()=>result.current.setEnabled(true));await tick();
+  vi.setSystemTime(new Date('2026-10-10T00:00:00Z'));
+  act(()=>window.dispatchEvent(new Event('focus')));await tick();
+  expect(result.current.getRecord(base.links[0])?.stale).toBe(true);
+  await tick(MONITOR_INTERVAL_MS);
+  expect(check).toHaveBeenCalledTimes(2);
+  rerender({paused:true});
+  await tick(STALE_AFTER_MS+60_000);
+  expect(result.current.getRecord(base.links[0])?.stale).toBe(true);
+});
+
+it('confirms a failure after one elapsed minute even after a seven-day rollback',async()=>{
+  const check=vi.fn(()=>Promise.resolve(report('failed')));
+  const {result}=renderHook(()=>useRedirectMonitor({state:base,paused:false,ready:true,check}));
+  act(()=>result.current.setEnabled(true));await tick();
+  vi.setSystemTime(new Date('2026-10-10T00:00:00Z'));
+  await tick(CONFIRM_DELAY_MS);
+  expect(check).toHaveBeenCalledTimes(2);
+  expect(result.current.getRecord(base.links[0])?.phase).toBe('alert');
+});
+
+it('catches sleep up once on focus even when the monotonic clock did not advance',async()=>{
+  const monotonic=vi.spyOn(performance,'now').mockReturnValue(0);
+  const check=vi.fn(()=>Promise.resolve(report('passed')));
+  const {result}=renderHook(()=>useRedirectMonitor({state:base,paused:false,ready:true,check}));
+  act(()=>result.current.setEnabled(true));await tick();
+  vi.setSystemTime(new Date('2026-10-20T00:00:00Z'));
+  act(()=>window.dispatchEvent(new Event('focus')));await tick();
+  expect(check).toHaveBeenCalledTimes(2);
+  act(()=>{window.dispatchEvent(new Event('focus'));document.dispatchEvent(new Event('visibilitychange'));});await tick();
+  expect(check).toHaveBeenCalledTimes(2);
+  monotonic.mockRestore();
+});
+
+it('does not complete an empty round and checks the first added link promptly',async()=>{
+  const check=vi.fn(()=>Promise.resolve(report('passed')));
+  const {result,rerender}=renderHook(({state})=>useRedirectMonitor({state,paused:false,ready:true,check}),{initialProps:{state:{...base,links:[]} as State}});
+  act(()=>result.current.setEnabled(true));await tick();
+  expect(result.current.lastCompletion).toBeNull();
+  expect(localStorage.getItem('redirect-monitor-preview-enabled-completed-at')).toBeNull();
+  rerender({state:base});await tick();
+  expect(check).toHaveBeenCalledTimes(1);
+  expect(result.current.lastCompletion).not.toBeNull();
+});
+
+it('checks only changed or added identities without postponing the regular full round',async()=>{
+  const initial={...base,links:[base.links[0],{...base.links[0],slug:'two'}]};
+  const check=vi.fn(()=>Promise.resolve(report('passed')));
+  const {result,rerender}=renderHook(({state})=>useRedirectMonitor({state,paused:false,ready:true,check}),{initialProps:{state:initial}});
+  act(()=>result.current.setEnabled(true));await tick(250);
+  const fullCompletion=result.current.lastCompletion;
+  await tick(24*60*60_000);
+  const edited={...initial,links:[{...initial.links[0],updated:'u2',defaultUrl:'https://example.org/new'},initial.links[1]]};
+  rerender({state:edited});await tick();
+  expect(check.mock.calls).toHaveLength(3);
+  expect(check).toHaveBeenLastCalledWith('d','one');
+  expect(result.current.lastCompletion).toBe(fullCompletion);
+  expect(localStorage.getItem('redirect-monitor-preview-enabled-completed-at')).toBeNull();
+  await tick(24*60*60_000+60_000);
+  expect(check).toHaveBeenCalledTimes(5);
+});
+
+it('queues an edited identity behind its old in-flight request and never accepts the old result',async()=>{
+  const releases:Array<(result:RedirectCheck)=>void>=[];
+  let inFlight=0,maxInFlight=0;
+  const check=vi.fn(()=>{inFlight++;maxInFlight=Math.max(maxInFlight,inFlight);return new Promise<RedirectCheck>(resolve=>releases.push(value=>{inFlight--;resolve(value);}));});
+  const {result,rerender}=renderHook(({state})=>useRedirectMonitor({state,paused:false,ready:true,check}),{initialProps:{state:base}});
+  act(()=>result.current.setEnabled(true));await tick();
+  const edited={...base,links:[{...base.links[0],updated:'changed'}]};
+  rerender({state:edited});await tick();
+  expect(check).toHaveBeenCalledTimes(1);
+  await act(async()=>releases.shift()!(report('failed')));await tick();
+  expect(result.current.getRecord(edited.links[0])).toBeNull();
+  expect(check).toHaveBeenCalledTimes(2);
+  await act(async()=>releases.shift()!(report('passed')));
+  expect(result.current.getRecord(edited.links[0])?.phase).toBe('healthy');
+  expect(maxInFlight).toBe(1);
+});
+
+it('holds incremental checks while offline or paused and removes deleted queued identities',async()=>{
+  const check=vi.fn(()=>Promise.resolve(report('passed')));
+  const online=vi.spyOn(window.navigator,'onLine','get').mockReturnValue(true);
+  const {result,rerender}=renderHook(({state,paused})=>useRedirectMonitor({state,paused,ready:true,check}),{initialProps:{state:base,paused:false}});
+  act(()=>result.current.setEnabled(true));await tick();
+  online.mockReturnValue(false);
+  const added={...base,links:[...base.links,{...base.links[0],slug:'two'}]};
+  rerender({state:added,paused:true});await tick();
+  expect(check).toHaveBeenCalledTimes(1);
+  rerender({state:base,paused:true});
+  online.mockReturnValue(true);act(()=>window.dispatchEvent(new Event('online')));await tick();
+  rerender({state:base,paused:false});await tick();
+  expect(check).toHaveBeenCalledTimes(1);
+  expect(result.current.pendingChanges).toBe(0);
+  online.mockRestore();
+});
+
+it('hydrates the initial workspace without treating every existing link as a new addition',async()=>{
+  localStorage.setItem('redirect-monitor-preview-enabled','true');
+  localStorage.setItem('redirect-monitor-preview-enabled-completed-at','2026-10-17T00:00:00Z');
+  const check=vi.fn(()=>Promise.resolve(report('passed')));
+  const {rerender}=renderHook(({state,ready})=>useRedirectMonitor({state,paused:false,ready,check}),{initialProps:{state:{...base,links:[]} as State,ready:false}});
+  rerender({state:base,ready:true});await tick();
+  expect(check).not.toHaveBeenCalled();
+});

@@ -26,6 +26,26 @@ const demoState: State = {
 };
 let local: State = structuredClone(demoState);
 const previewStatsAccounts = new Set<string>();
+const previewReadSessions = new Map<string,{scope:string;createdAt:number;queriedAt:string}>();
+let previewUpdatePending: {timer:number;cancel:()=>void}|null = null;
+if (preview && new URLSearchParams(window.location.search).get('tokenRecoveryPreview') === '1') {
+  local.accounts[0] = {...local.accounts[0],needsTokenRecovery:true};
+}
+function delayedPreviewUpdate(download:boolean) {
+  if (previewUpdatePending) throw new Error('已有示例更新请求正在进行。');
+  return new Promise((resolve,reject) => {
+    const timer = window.setTimeout(() => {
+      previewUpdatePending = null;
+      resolve(download ? {status:'unavailable',currentVersion:local.appVersion}
+        : {status:'available',currentVersion:local.appVersion,version:'0.0.1-preview',notes:'本地延迟示例，不会下载或安装软件。'});
+    },15000);
+    previewUpdatePending = {timer,cancel:() => {
+      window.clearTimeout(timer);
+      previewUpdatePending = null;
+      reject(new Error(download ? '示例更新下载已取消；未安装更新。' : '示例更新检查已取消。'));
+    }};
+  });
+}
 const previewProtectionOptOut = new Set<string>();
 const previewProtectionUpgraded = new Set<string>();
 if (preview && new URLSearchParams(window.location.search).get('clickStats') === '1') previewStatsAccounts.add('demo-a');
@@ -86,7 +106,21 @@ function previewDispatch(action: Action, payload: Record<string, unknown>): unkn
     const matchingLinks = local.links
       .filter((item) => domainIds.has(item.domainId))
       .sort((left, right) => compare(left.domainId, right.domainId) || compare(left.slug, right.slug));
-    const base = {accountId,domainId:requestedDomainId,days,page,pageSize:25 as const,totalLinks:matchingLinks.length,queriedAt:now(),estimated:true as const};
+    const sessionScope = JSON.stringify([accountId,requestedDomainId,days,25,local,[...previewStatsAccounts].sort()]);
+    const requestedSession = payload.readSessionId;
+    if (requestedSession !== undefined && (typeof requestedSession !== 'string' || !requestedSession)) throw new Error('统计读取会话无效，请刷新统计。');
+    let readSessionId = requestedSession as string|undefined;
+    let session = readSessionId ? previewReadSessions.get(readSessionId) : undefined;
+    if (readSessionId && (!session || session.scope !== sessionScope || Date.now() < session.createdAt || Date.now()-session.createdAt >= 60000)) {
+      throw new Error('统计读取会话已过期或范围已变化，请刷新统计。');
+    }
+    if (!session) {
+      readSessionId = crypto.randomUUID();
+      session = {scope:sessionScope,createdAt:Date.now(),queriedAt:now()};
+      previewReadSessions.set(readSessionId,session);
+      while (previewReadSessions.size > 16) previewReadSessions.delete(previewReadSessions.keys().next().value!);
+    }
+    const base = {accountId,domainId:requestedDomainId,days,page,pageSize:25 as const,totalLinks:matchingLinks.length,queriedAt:session.queriedAt,estimated:true as const,readSessionId};
     if (matchingLinks.length === 0) return {status:'no_data',message:'当前账户尚无本机短链接。此状态不代表历史统计为零。',...base,rows:[]} satisfies StatsCenterReport;
     if (!previewStatsAccounts.has(accountId)) return {status:'disabled',message:'本地预览：此示例账户尚未启用统计。',...base} satisfies StatsCenterReport;
     const sampleTotals = (item: Link, index: number): ClickStatsTotals => {
@@ -132,6 +166,12 @@ function previewDispatch(action: Action, payload: Record<string, unknown>): unkn
   if (action === 'import_token') {
     const token = String(payload.token || '').trim();
     if (!token) throw new Error('请先粘贴令牌。');
+    if (payload.expectedAccountId !== undefined) {
+      const account = local.accounts.find(item => item.id === payload.expectedAccountId);
+      if (!account || payload.replace !== true) throw new Error('请选择已有示例账户并明确确认更新令牌。');
+      local.accounts = local.accounts.map(item => item.id === account.id ? {...item,needsTokenRecovery:false} : item);
+      return clone();
+    }
     const existing = local.accounts.find(a => a.id === 'demo-imported');
     if (existing && !payload.replace) throw new Error('该账户已经存在。请确认是否替换本机保存的令牌。');
     if (!existing) local.accounts.push({ id: 'demo-imported', label: '导入的示例账户', zoneCount: 1, checkedAt: now(), hasResources: false, needsSelftestKey: false, needsCredentialMigration: false });
@@ -277,14 +317,27 @@ function previewDispatch(action: Action, payload: Record<string, unknown>): unkn
   if (action === 'resume_monitor') return makePlan('继续处理检测服务',['复核待处理的检测配置并继续'],['本地预览不会连接云服务。'],'resume_monitor',{accountId:payload.accountId});
   if (action === 'export_config') return JSON.stringify({ version: 1, domains: local.domains.map(d => ({ host: d.host, prefix: d.prefix })), links: local.links }, null, 2);
   if (action === 'import_config') throw new Error('本地预览无法验证远端归属，请在桌面应用中导入备份。');
-  if (action === 'check_update') return new URLSearchParams(window.location.search).get('updatePreview') === '1'
+  if (action === 'cancel_update') {
+    if (!previewUpdatePending) throw new Error('当前没有可取消的示例更新请求。');
+    previewUpdatePending.cancel();
+    return {status:'cancel_requested',message:'已请求取消示例更新，未执行安装。'};
+  }
+  const updateDelay = new URLSearchParams(window.location.search).get('updateDelayPreview');
+  if (action === 'check_update' && (updateDelay === '1' || updateDelay === 'check')) return delayedPreviewUpdate(false);
+  if (action === 'install_update' && updateDelay === 'download') return delayedPreviewUpdate(true);
+  if (action === 'check_update') return (new URLSearchParams(window.location.search).get('updatePreview') === '1' || updateDelay === 'download')
     ? { status: 'available', currentVersion: local.appVersion, version: '0.0.1-preview', notes: '更新提醒效果预览。这里只使用示例数据，不会下载或安装软件。' }
     : { status: 'unavailable', currentVersion: local.appVersion };
   if (action === 'install_update') throw new Error('本地预览无法安装更新。');
   throw new Error('未知操作。');
 }
 export async function dispatch<T>(action: Action, payload: Record<string, unknown> = {}): Promise<T> {
-  if (preview) return previewDispatch(action, payload) as T;
+  if (preview) {
+    if (action === 'apply_plan' && new URLSearchParams(window.location.search).get('applyDelayPreview') === '1') {
+      await new Promise<void>(resolve => window.setTimeout(resolve,15000));
+    }
+    return previewDispatch(action, payload) as T;
+  }
   return invoke<T>('dispatch', { request: { action, payload } });
 }
 export function errorMessage(error: unknown): string { return typeof error === 'string' ? error : error instanceof Error ? error.message : '操作未完成，请重试。'; }

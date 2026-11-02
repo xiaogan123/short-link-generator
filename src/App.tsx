@@ -53,6 +53,8 @@ import type {
 } from "./types";
 import "./styles.css";
 import Dialog from "./Dialog";
+import LinkEditor, { type LinkDraft } from "./LinkEditor";
+import { FieldError, fieldProps, focusFirstError, type FieldErrors } from "./FormFeedback";
 import Pools from "./Pools";
 import LinkGroups from "./LinkGroups";
 import ClickStatsDialog from "./ClickStats";
@@ -62,14 +64,6 @@ import RedirectMonitor, {monitorBannerText} from './RedirectMonitor';
 import { useRedirectMonitor } from './useRedirectMonitor';
 
 type Page = "links" | "stats" | "pools" | "domains" | "accounts";
-type LinkDraft = {
-  domainId: string;
-  slug: string;
-  cnUrl: string;
-  defaultUrl: string;
-  poolId: string;
-  code: string;
-};
 type Detection = {
   fingerprint: string;
   selftest: Selftest;
@@ -209,6 +203,14 @@ export default function App() {
   const [notice, setNotice] = useState("");
   const [domainSuccessId, setDomainSuccessId] = useState("");
   const [search, setSearch] = useState("");
+  const [domainSearch, setDomainSearch] = useState("");
+  const [accountSearch, setAccountSearch] = useState("");
+  const [formErrors, setFormErrors] = useState<FieldErrors>({});
+  const loadSequence = useRef(0);
+  function rejectFields(fields: FieldErrors) {
+    setFormErrors(fields);
+    focusFirstError(fields);
+  }
   const [filter, setFilter] = useState("all");
   const [attentionOnly, setAttentionOnly] = useState(false);
   const [linkDraft, setLinkDraft] = useState<LinkDraft | null>(null);
@@ -252,6 +254,7 @@ export default function App() {
     setClipboardOffer("");
   }
   function setTokenOpen(open: boolean) {
+    setFormErrors({});
     tokenDialogOpen.current = open;
     clearClipboardOffer();
     setTokenOpenState(open);
@@ -284,6 +287,13 @@ export default function App() {
   const [testingLink, setTestingLink] = useState("");
   const [testingAutomaticDns, setTestingAutomaticDns] = useState(false);
   const [updateStatus, setUpdateStatus] = useState<UpdateStatus | null>(null);
+  const [updateOpen, setUpdateOpen] = useState(false);
+  const [updatePhase, setUpdatePhase] = useState<"checking" | "downloading" | "verifying" | "installing" | null>(null);
+  const [cancellingUpdate, setCancellingUpdate] = useState(false);
+  const [updateCancelMessage, setUpdateCancelMessage] = useState("");
+  const updateCancellationInFlight = useRef(false);
+  const updateOperationSequence = useRef(0);
+  const updateCheckingInFlight = useRef(false);
   const [updateError, setUpdateError] = useState("");
   const [installedUpdate, setInstalledUpdate] = useState<UpdateStatus | null>(null);
   const [dismissedUpdate, setDismissedUpdate] = useState<string | null>(null);
@@ -338,23 +348,36 @@ export default function App() {
     ]);
   }
 
+  function publishState(next: State) {
+    loadSequence.current += 1;
+    stateRef.current = next;
+    setState(next);
+    setLoading(false);
+    setLoadFailed(false);
+  }
   async function load() {
+    const sequence = ++loadSequence.current;
     setLoading(true);
     setLoadFailed(false);
     setError("");
     try {
-      setState(await dispatch<State>("get_state"));
+      const next = await dispatch<State>("get_state");
+      if (sequence !== loadSequence.current) return;
+      stateRef.current = next;
+      setState(next);
       setPoolHealth({});
     } catch (e) {
+      if (sequence !== loadSequence.current) return;
       setLoadFailed(true);
       setError(errorMessage(e));
     } finally {
-      setLoading(false);
+      if (sequence === loadSequence.current) setLoading(false);
     }
   }
   useEffect(() => {
     void load();
     return () => {
+      loadSequence.current += 1;
       detectionSequence.current++;
       targetRetrySequence.current++;
       domainCheckSequence.current++;
@@ -432,13 +455,15 @@ export default function App() {
     onFailure?: (message: string) => void,
   ) {
     const account = stateRef.current.accounts.find(
-      (item) => accountIds.includes(item.id) && item.needsCredentialMigration,
+      (item) => accountIds.includes(item.id) && (item.needsTokenRecovery || item.needsCredentialMigration),
     );
     if (!account) {
       setMigrationAccountId(null);
       return true;
     }
-    const message = `「${account.label}」需要先更新本机授权。请使用“更新本机授权”，完成后再重试当前操作。`;
+    const message = account.needsTokenRecovery
+      ? `「${account.label}」的令牌保存未完成。请使用“恢复账户令牌”，验证并保存此账户的令牌后重试。`
+      : `「${account.label}」需要先更新本机授权。请使用“更新本机授权”，完成后再重试当前操作。`;
     setMigrationAccountId(account.id);
     setDomainFeedback(null);
     setError(message);
@@ -477,6 +502,10 @@ export default function App() {
   }
   function migrationAction(accountId = migrationAccountId) {
     const account = state.accounts.find((item) => item.id === accountId);
+    if (account?.needsTokenRecovery) return (
+      <button type="button" className="button secondary" disabled={busy || domainBusy}
+        onClick={() => openTokenRecovery(account)}>恢复账户令牌</button>
+    );
     if (!account?.needsCredentialMigration) return null;
     return (
       <button
@@ -488,6 +517,18 @@ export default function App() {
         更新本机授权
       </button>
     );
+  }
+  function openTokenRecovery(account: Account) {
+    // Keep the visible target aligned with the request that owns the mutation lock.
+    // The ref also covers a second click before React renders the disabled button.
+    if (mutationRef.current || busy || domainOperation.current.inflight) return;
+    setUpdateTokenAccount(account);
+    setToken("");
+    setReplaceToken(true);
+    setFormErrors({});
+    setError("");
+    setManageAccount(null);
+    setTokenOpen(true);
   }
   async function prepare(
     kind: string,
@@ -513,7 +554,7 @@ export default function App() {
     if (next && shouldAccept()) {
       setPlanKind(kind);
       if (kind === "save_link") {
-        const domain = state.domains.find((d) => d.id === fields.domainId);
+        const domain = domainById.get(String(fields.domainId));
         const pool = state.pools?.find((p) => p.id === fields.poolId);
         const code = encodeURIComponent(String(fields.code));
         const linkDetails = fields.poolId
@@ -567,13 +608,15 @@ export default function App() {
           `平台地址：${state.pools?.find((p) => p.id === fields.poolId)?.name || String(fields.poolId)}`,
         ]);
       else if (kind === "delete_link") {
-        const domain = state.domains.find((d) => d.id === fields.domainId);
+        const domain = domainById.get(String(fields.domainId));
         setPlanDetails([
           `删除：${domain ? shortUrl(domain.host, domain.prefix, String(fields.slug)) : String(fields.slug)}`,
+          "确认后，此地址将不再按当前配置跳转。请先保存目标地址；删除不会移除平台地址或其他短链接。",
         ]);
       } else if (kind === "remove_domain")
         setPlanDetails([
-          `域名：${state.domains.find((d) => d.id === fields.domainId)?.host || String(fields.domainId)}`,
+          `域名：${domainById.get(String(fields.domainId))?.host || String(fields.domainId)}`,
+          `此域名关联 ${linksByDomain.get(String(fields.domainId))?.length || 0} 条短链接。移除将影响这些短链接；如需保留配置，请先导出备份。`,
         ]);
       else
         setPlanDetails([
@@ -659,7 +702,7 @@ export default function App() {
           : appliedKind === "disable_click_stats"
             ? "点击统计已停用。跳转保持不变，已有统计按服务保留期处理。"
           : appliedKind === "enable_click_protection"
-            ? "访问保护已启用：同一 IP 对同一短链接 10 秒内最多 100 次请求。"
+            ? "访问保护已启用：同一 IP 对同一短链接的近似阈值为每个节点 100 次 / 10 秒；服务异常时放行，不保证全球总次数或费用上限。"
           : appliedKind === "disable_click_protection"
             ? "访问保护已停用。"
           : appliedKind === "add_domain"
@@ -681,7 +724,7 @@ export default function App() {
           setProtectionRead(null);
         }
         stateRef.current = next;
-        setState(next);
+        publishState(next);
         if (["enable_click_stats", "disable_click_stats", "upgrade_worker", "resume_worker_upgrade"].includes(appliedKind)) {
           setStatsRevision((n) => n + 1);
           setStatsConfigurationError(null);
@@ -733,7 +776,7 @@ export default function App() {
         try {
           const latest = await dispatch<State>("get_state");
           stateRef.current = latest;
-          setState(latest);
+          publishState(latest);
         } catch {
           /* Preserve the original operation error. */
         }
@@ -750,6 +793,7 @@ export default function App() {
     }, "已复制短链接。");
   }
   function openLink(link?: Link, usePlatform = false, preferredDomainId?: string) {
+    setFormErrors({});
     linkPrepareSequence.current += 1;
     setError("");
     setCopySource(null);
@@ -779,6 +823,7 @@ export default function App() {
     );
   }
   function updateLinkDraft(fields: Partial<LinkDraft>) {
+    setFormErrors({});
     linkPrepareSequence.current += 1;
     setError("");
     setMigrationAccountId(null);
@@ -804,34 +849,25 @@ export default function App() {
   async function saveLink(event: FormEvent) {
     event.preventDefault();
     if (!linkDraft || mutationRef.current) return;
-    const validation =
-      validateSlug(linkDraft.slug) ||
-      (linkDraft.poolId
-        ? !state.pools?.some((p) => p.id === linkDraft.poolId)
-          ? "请选择可用平台地址。"
-          : !/^[A-Za-z0-9_-]{1,128}$/.test(linkDraft.code)
-            ? "邀请码须为 1–128 位字母、数字、下划线或连字符。"
-            : ""
-        : validateTarget(linkDraft.cnUrl) ||
-          validateTarget(linkDraft.defaultUrl));
-    if (validation) {
-      setError(validation);
-      return;
+    const fields: FieldErrors = {};
+    if (!state.domains.some((domain) => domain.id === linkDraft.domainId)) fields["link-domain"] = "请先选择可用域名。";
+    const slugError = validateSlug(linkDraft.slug);
+    if (slugError) fields["link-slug"] = slugError;
+    if (linkDraft.poolId) {
+      if (!state.pools?.some((pool) => pool.id === linkDraft.poolId)) fields["link-pool"] = "请选择可用平台地址。";
+      if (!/^[A-Za-z0-9_-]{1,128}$/.test(linkDraft.code)) fields["link-code"] = "邀请码须为 1–128 位字母、数字、下划线或连字符。";
+    } else {
+      const cnError = validateTarget(linkDraft.cnUrl);
+      const defaultError = validateTarget(linkDraft.defaultUrl);
+      if (cnError) fields["link-cn"] = cnError;
+      if (defaultError) fields["link-default"] = defaultError;
     }
-    if (!linkDraft.domainId) {
-      setError("请先选择域名。");
-      return;
+    if (originalSlug && originalSlug !== linkDraft.slug) fields["link-slug"] = "请点击“换一个名称”，填写新名称后创建链接。";
+    if (!originalSlug && state.links.some((link) => link.domainId === linkDraft.domainId && link.slug.toLowerCase() === linkDraft.slug.toLowerCase())) {
+      fields["link-slug"] = "这个名称已被使用，请换一个名称。现有链接不会被覆盖。";
     }
-    if (originalSlug && originalSlug !== linkDraft.slug) {
-      setError("请点击“换一个名称”，填写新名称后创建链接。");
-      return;
-    }
-    if (!originalSlug && state.links.some((link) =>
-      link.domainId === linkDraft.domainId && link.slug.toLowerCase() === linkDraft.slug.toLowerCase()
-    )) {
-      setError("这个名称已被使用，请换一个名称。现有链接不会被覆盖。");
-      return;
-    }
+    if (Object.keys(fields).length) { rejectFields(fields); return; }
+    setFormErrors({});
     const submittedDraft = { ...linkDraft };
     const requestSequence = ++linkPrepareSequence.current;
     await prepare(
@@ -869,6 +905,7 @@ export default function App() {
     return sequence;
   }
   function invalidateDomainPreparation() {
+    setFormErrors({});
     domainOperation.current.sequence += 1;
     domainCheckSequence.current += 1;
     setMigrationAccountId(null);
@@ -940,7 +977,7 @@ export default function App() {
       )
         return false;
       stateRef.current = next;
-      setState(next);
+      publishState(next);
       return true;
     } catch (e) {
       if (
@@ -960,12 +997,11 @@ export default function App() {
       repairAlreadyApplied?: boolean;
     } = {},
   ) {
-    const validation =
-      validateHost(draft.input) || validatePrefix(draft.prefix);
-    if (validation) {
-      setDomainFeedback({ tone: "error", message: validation });
-      return;
-    }
+    const hostError = validateHost(draft.input);
+    const prefixError = validatePrefix(draft.prefix);
+    const validation = hostError || prefixError;
+    if (validation) rejectFields({...(hostError ? {"domain-host": hostError} : {}), ...(prefixError ? {"domain-prefix": prefixError} : {})});
+    if (validation) { setDomainFeedback(null); return; }
     const host = normalizeHost(draft.input);
     const existingDomain = stateRef.current.domains.find((domain) => domain.host === host);
     if (existingDomain) {
@@ -1203,7 +1239,7 @@ export default function App() {
       )
         return;
       stateRef.current = next;
-      setState(next);
+      publishState(next);
       const refreshed = next.accounts.find(
         (item) => item.id === selectedAccountId,
       );
@@ -1397,12 +1433,13 @@ export default function App() {
   }
   async function importToken(event: FormEvent) {
     event.preventDefault();
+    if (!token.trim()) {
+      setError("");
+      rejectFields({"token-value": "请先粘贴令牌。"});
+      return;
+    }
     await withMutation("token", async () => {
       clearClipboardOffer();
-      if (!token.trim()) {
-        setError("请先粘贴令牌。");
-        return;
-      }
       const next = await run(
         () =>
           dispatch<State>("import_token", {
@@ -1419,7 +1456,7 @@ export default function App() {
         resumeDomainAfterToken.current = false;
         setClipboardToClear(await tokenDigest(token.trim()));
         stateRef.current = next;
-        setState(next);
+        publishState(next);
         setToken("");
         setClipboardOffer("");
         setReplaceToken(false);
@@ -1429,6 +1466,14 @@ export default function App() {
           setDomainOpen(true);
           void refreshDomainPreparation(domainDraftRef.current);
         }
+      } else {
+        // A failed first import can leave a recoverable account on disk.
+        // Preserve the original error while exposing that account immediately.
+        try {
+          const latest = await dispatch<State>("get_state");
+          publishState(latest);
+          if (latest.accounts.some((account) => account.needsTokenRecovery)) setPage("accounts");
+        } catch { /* Keep the import failure visible; refresh remains available. */ }
       }
     });
   }
@@ -1477,16 +1522,22 @@ export default function App() {
       () => dispatch<State>("import_config", { json }),
       "备份已导入并验证。",
     );
-    if (next) setState(next);
+    if (next) publishState(next);
   }
   async function refreshAccounts() {
     if (!requireCurrentCredentials(stateRef.current.accounts.map((a) => a.id))) return;
     await withMutation("refresh_accounts", async () => {
       const next = await run(() => dispatch<State>("refresh_accounts"), "账户状态已更新。");
-      if (next) setState(next);
+      if (next) publishState(next);
     });
   }
   async function checkUpdate() {
+    if (updateCheckingInFlight.current) return;
+    updateCheckingInFlight.current = true;
+    const sequence = ++updateOperationSequence.current;
+    setUpdateOpen(true);
+    setUpdateStatus(null);
+    setUpdateCancelMessage("");
     setUpdateError("");
     setError("");
     try {
@@ -1496,10 +1547,36 @@ export default function App() {
         currentVersion: result.currentVersion || stateRef.current.appVersion,
       });
     } catch (e) {
-      setError(errorMessage(e));
+      setUpdateError(errorMessage(e));
+    } finally {
+      if (sequence === updateOperationSequence.current) {
+        updateOperationSequence.current += 1;
+        setUpdateCancelMessage("");
+      }
+      updateCheckingInFlight.current = false;
+    }
+  }
+  async function cancelUpdate() {
+    if (updateCancellationInFlight.current || updatePhase === "installing") return;
+    updateCancellationInFlight.current = true;
+    const sequence = updateOperationSequence.current;
+    setCancellingUpdate(true);
+    setUpdateError("");
+    try {
+      const result = await dispatch<import("./types").UpdateCancellation>("cancel_update");
+      if (sequence !== updateOperationSequence.current) return;
+      if (result?.status !== "cancel_requested") throw new Error("未能确认取消请求，请等待当前操作返回。");
+      setUpdateCancelMessage(result.message || "已请求取消，正在等待本次操作返回。");
+    } catch (e) {
+      if (sequence === updateOperationSequence.current) setUpdateError(errorMessage(e));
+    } finally {
+      updateCancellationInFlight.current = false;
+      setCancellingUpdate(false);
     }
   }
   function openUpdate() {
+    setUpdateOpen(true);
+    setUpdateCancelMessage("");
     setUpdateError("");
     setError("");
     if (installedUpdate || updates.available) {
@@ -1510,8 +1587,21 @@ export default function App() {
   }
   async function installUpdate() {
     await withMutation("update", async () => {
+      const sequence = ++updateOperationSequence.current;
       setUpdateError("");
+      setUpdateCancelMessage("");
+      setUpdatePhase(null);
+      let unlisten: (() => void) | undefined;
+      let acceptingProgress = true;
       try {
+        if (!preview && "__TAURI_INTERNALS__" in window) {
+          const { listen } = await import("@tauri-apps/api/event");
+          unlisten = await listen<{phase: string}>("update-progress", ({payload}) => {
+            if (acceptingProgress && ["checking", "downloading", "verifying", "installing"].includes(payload.phase)) {
+              setUpdatePhase(payload.phase as "checking" | "downloading" | "verifying" | "installing");
+            }
+          });
+        }
         const result = await dispatch<UpdateStatus>("install_update");
         if (!result || !["installed", "up_to_date", "unavailable"].includes(result.status)) {
           throw new Error("未能确认更新是否安装完成，请重新检查更新。");
@@ -1521,13 +1611,20 @@ export default function App() {
         if (result.status === "installed") setInstalledUpdate(result);
       } catch (e) {
         setUpdateError(errorMessage(e));
+      } finally {
+        acceptingProgress = false;
+        if (sequence === updateOperationSequence.current) updateOperationSequence.current += 1;
+        unlisten?.();
+        setUpdatePhase(null);
+        setUpdateCancelMessage("");
       }
     });
   }
   async function doRename(event: FormEvent) {
     event.preventDefault();
+    if (!renameAccount) return;
+    if (!renameValue.trim()) { setError(""); rejectFields({"account-name": "请填写账户名称。"}); return; }
     await withMutation("rename", async () => {
-      if (!renameAccount || !renameValue.trim()) return;
       const next = await run(
         () =>
           dispatch<State>("rename_account", {
@@ -1537,7 +1634,7 @@ export default function App() {
         "账户名称已更新。",
       );
       if (next) {
-        setState(next);
+        publishState(next);
         setRenameAccount(null);
       }
     });
@@ -1550,7 +1647,7 @@ export default function App() {
         "本机账户记录已移除。",
       );
       if (next) {
-        setState(next);
+        publishState(next);
         setRemoveAccount(null);
       }
     });
@@ -1568,11 +1665,11 @@ export default function App() {
       if (url.protocol !== "https:" || url.username || url.password)
         throw Error();
     } catch {
-      setError("检测服务地址必须是无凭据的 HTTPS 网址。");
+      rejectFields({"monitor-endpoint": "检测服务地址必须是无凭据的 HTTPS 网址。"});
       return;
     }
     if (!/^[\x21-\x7e]{32,256}$/.test(monitorSecret)) {
-      setError("服务密钥须为 32–256 个无空白的可打印 ASCII 字符。");
+      rejectFields({"monitor-secret": "服务密钥须为 32–256 个无空白的可打印 ASCII 字符。"});
       return;
     }
     const requestSequence = ++monitorPrepareSequence.current;
@@ -1886,7 +1983,7 @@ export default function App() {
       record.targets.checks.length >= 2 &&
       record.targets.checks.every((c) => c.status === "passed")
     )
-      return { tone: "green", label: "跳转与目标本机检测通过" };
+      return { tone: "green", label: "本机首跳检查通过" };
     return { tone: "amber", label: "暂时无法确认" };
   }
 
@@ -1901,22 +1998,36 @@ export default function App() {
       )
       .map(([id, record]) => [id, record.report]),
   ) as Record<string, PoolHealth>;
-  const filteredDomains = state.domains.filter(
-    (d) => filter === "all" || d.id === filter,
-  );
-  const groups = filteredDomains
-    .map((domain) => ({
-      domain,
-      links: state.links.filter(
-        (link) =>
-          link.domainId === domain.id &&
-          (!attentionOnly || (() => { const item = redirectMonitor.getRecord(link); return item && (item.stale || item.phase !== 'healthy'); })()) &&
-          `${link.slug} ${link.cnUrl} ${link.defaultUrl} ${link.code || ""} ${state.pools?.find((p) => p.id === link.poolId)?.name || ""} ${domain.host}`
-            .toLowerCase()
-            .includes(search.trim().toLowerCase()),
-      ),
-    }))
-    .filter((group) => !search && !attentionOnly || group.links.length);
+  const domainById = useMemo(() => new Map(state.domains.map((domain) => [domain.id, domain])), [state.domains]);
+  const poolById = useMemo(() => new Map((state.pools || []).map((pool) => [pool.id, pool])), [state.pools]);
+  const linksByDomain = useMemo(() => {
+    const result = new Map<string, Link[]>();
+    for (const link of state.links) {
+      const links = result.get(link.domainId);
+      if (links) links.push(link);
+      else result.set(link.domainId, [link]);
+    }
+    return result;
+  }, [state.links]);
+  const domainCountByAccount = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const domain of state.domains) counts.set(domain.accountId, (counts.get(domain.accountId) || 0) + 1);
+    return counts;
+  }, [state.domains]);
+  const linkCountByPool = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const link of state.links) if (link.poolId) counts.set(link.poolId, (counts.get(link.poolId) || 0) + 1);
+    return counts;
+  }, [state.links]);
+  const searchTerm = search.trim().toLowerCase();
+  const groups = state.domains.filter((domain) => filter === "all" || domain.id === filter)
+    .map((domain) => ({domain, links: (linksByDomain.get(domain.id) || []).filter((link) => {
+      const record = attentionOnly ? redirectMonitor.getRecord(link) : null;
+      if (attentionOnly && (!record || !(record.stale || record.phase !== "healthy"))) return false;
+      return `${link.slug} ${link.cnUrl} ${link.defaultUrl} ${link.code || ""} ${poolById.get(link.poolId || "")?.name || ""} ${domain.host}`.toLowerCase().includes(searchTerm);
+    })})).filter((group) => (!searchTerm && !attentionOnly) || group.links.length);
+  const matchingDomains = state.domains.filter((domain) => `${domain.host} ${domain.prefix} ${accountById.get(domain.accountId)?.label || ""}`.toLowerCase().includes(domainSearch.trim().toLowerCase()));
+  const matchingAccounts = state.accounts.filter((account) => `${account.label} ${account.cloudflareName || ""} ${account.id}`.toLowerCase().includes(accountSearch.trim().toLowerCase()));
   const title =
     page === "links"
       ? "短链接"
@@ -1973,6 +2084,7 @@ export default function App() {
               <button
                 key={item.key}
                 className={`nav-item ${page === item.key ? "active" : ""}`}
+                aria-current={page === item.key ? "page" : undefined}
                 onClick={() => {
                   setPage(item.key);
                   setSidebarOpen(false);
@@ -2013,6 +2125,7 @@ export default function App() {
             <span>{updates.checking ? "正在检查更新…" : installedUpdate ? "更新已安装" : updates.available ? "发现新版本" : "检查更新"}</span>
             {updates.available && <small>查看更新</small>}
           </button>
+          {updates.checking && !updateOpen && <button type="button" className="sidebar-update" onClick={() => void checkUpdate()}>查看检查进度 / 取消</button>}
         </div>
       </aside>
       <main className="main" ref={mainRef}>
@@ -2281,7 +2394,7 @@ export default function App() {
             />
           ) : page === "links" ? (
             <>
-              <RedirectMonitor enabled={redirectMonitor.enabled} active={redirectMonitor.active} online={redirectMonitor.online} progress={redirectMonitor.progress} lastCompletion={redirectMonitor.lastCompletion} onEnabled={(value) => {if (!value) setAttentionOnly(false);redirectMonitor.setEnabled(value);}} onRun={redirectMonitor.runNow} disabled={busy || loading || updates.checking || !!updateStatus}/>
+              <RedirectMonitor ready={redirectMonitor.ready} nextCheckAt={redirectMonitor.nextCheckAt} runKind={redirectMonitor.runKind} pendingChanges={redirectMonitor.pendingChanges} totalLinks={redirectMonitor.totalLinks} summary={redirectMonitor.summary} enabled={redirectMonitor.enabled} active={redirectMonitor.active} online={redirectMonitor.online} progress={redirectMonitor.progress} lastCompletion={redirectMonitor.lastCompletion} onEnabled={(value) => {if (!value) setAttentionOnly(false);redirectMonitor.setEnabled(value);}} onRun={redirectMonitor.runNow} disabled={busy || loading || updates.checking || !!updateStatus}/>
               <div className="metric-row">
                 <div className="metric">
                   <span>全部链接</span>
@@ -2294,8 +2407,8 @@ export default function App() {
                   <small>可用于创建短路径</small>
                 </div>
                 <div className="metric">
-                  <span>已连接账户</span>
-                  <strong>{state.accounts.length}</strong>
+                  <span>可用账户</span>
+                  <strong>{state.accounts.filter((account) => !account.needsTokenRecovery && !account.needsCredentialMigration).length}</strong>
                   <small>按账户管理区域</small>
                 </div>
               </div>
@@ -2419,9 +2532,7 @@ export default function App() {
             <Pools
               pools={state.pools || []}
               accounts={state.accounts}
-              linkCount={(id) =>
-                state.links.filter((l) => l.poolId === id).length
-              }
+              linkCount={(id) => linkCountByPool.get(id) || 0}
               onSave={savePool}
               onDelete={(id) => void prepare("delete_pool", { poolId: id })}
               busy={busy}
@@ -2452,8 +2563,9 @@ export default function App() {
                 <div className="panel-head">
                   <div>
                     <p className="eyebrow">YOUR DOMAINS</p>
-                    <h2>已添加的域名</h2>
+                    <h2>已添加的域名 <span className="heading-count">{state.domains.length}</span></h2>
                   </div>
+                  <label className="searchbox resource-search"><MagnifyingGlass size={17} aria-hidden="true" /><input aria-label="搜索域名" placeholder="搜索域名或账户备注" value={domainSearch} onChange={(event) => setDomainSearch(event.target.value)} /></label>
                 </div>
                 {!state.accounts.length ? (
                   <Empty
@@ -2497,7 +2609,8 @@ export default function App() {
                   />
                 ) : (
                   <div className="domain-cards">
-                    {state.domains.map((domain) => (
+                    {!matchingDomains.length && <Empty icon={<MagnifyingGlass size={26} />} title="没有匹配的域名" description="可按域名或账户备注搜索。" action={<button className="button secondary" onClick={() => setDomainSearch("")}>清除搜索</button>} />}
+                    {matchingDomains.map((domain) => (
                       <article className="domain-card" key={domain.id} aria-label={`${domain.host} 域名`}>
                         <div className="domain-symbol">
                           <Globe size={22} />
@@ -2506,7 +2619,7 @@ export default function App() {
                           <h3>{domain.host}</h3>
                           <div className="domain-facts">
                             <span>链接目录 <strong>/{domain.prefix}/</strong></span>
-                            <span>已创建 <strong>{state.links.filter((l) => l.domainId === domain.id).length}</strong> 条链接</span>
+                            <span>已创建 <strong>{(linksByDomain.get(domain.id)?.length || 0)}</strong> 条链接</span>
                             <span>所属账户 <strong>{accountById.get(domain.accountId)?.label || "未知账户"}</strong></span>
                           </div>
                         </div>
@@ -2519,7 +2632,7 @@ export default function App() {
                               openLink(undefined, false, domain.id);
                             }}
                           >
-                            {state.links.some((link) => link.domainId === domain.id)
+                            {Boolean(linksByDomain.get(domain.id)?.length)
                               ? "创建短链接"
                               : "创建第一条短链接"}
                           </button>
@@ -2576,8 +2689,9 @@ export default function App() {
                 <div className="panel-head">
                   <div>
                     <p className="eyebrow">CONNECTED ACCOUNTS</p>
-                    <h2>账户列表</h2>
+                    <h2>账户列表 <span className="heading-count">{state.accounts.length}</span></h2>
                   </div>
+                  <div className="panel-tools resource-tools"><label className="searchbox resource-search"><MagnifyingGlass size={17} aria-hidden="true" /><input aria-label="搜索账户" placeholder="搜索备注、Cloudflare 名称或 ID" value={accountSearch} onChange={(event) => setAccountSearch(event.target.value)} /></label>
                   <button
                     className="button ghost"
                     onClick={() => void refreshAccounts()}
@@ -2585,7 +2699,7 @@ export default function App() {
                   >
                     <ArrowClockwise size={16} />
                     更新状态
-                  </button>
+                  </button></div>
                 </div>
                 {!state.accounts.length ? (
                   <Empty
@@ -2609,22 +2723,24 @@ export default function App() {
                   />
                 ) : (
                   <div className="account-cards">
-                    {state.accounts.map((account) => (
-                      <article className="account-card" key={account.id} aria-label={`${account.cloudflareName || account.label} 账户`}>
+                    {!matchingAccounts.length && <Empty icon={<MagnifyingGlass size={26} />} title="没有匹配的账户" description="可按本机备注、Cloudflare 名称或账户 ID 搜索。" action={<button className="button secondary" onClick={() => setAccountSearch("")}>清除搜索</button>} />}
+                    {matchingAccounts.map((account) => (
+                      <article className="account-card" key={account.id} aria-label={`${account.label} 账户`}>
                         <div className="account-symbol">
                           <Key size={22} />
                         </div>
                         <div className="account-main">
                           <div className="account-card-head">
                             <div className="account-title">
-                              <h3>{account.cloudflareName || account.label}</h3>
-                              {account.needsCredentialMigration && (
+                              <h3>{account.label}</h3>
+                              {account.needsTokenRecovery && <StatusPill tone="amber">令牌待恢复</StatusPill>}
+                              {!account.needsTokenRecovery && account.needsCredentialMigration && (
                                 <StatusPill tone="amber">需要更新本机授权</StatusPill>
                               )}
                               {account.needsSelftestKey ? (
                                 <StatusPill tone="amber">检测密钥待恢复</StatusPill>
                               ) : (
-                                !account.needsCredentialMigration && <StatusPill>已连接</StatusPill>
+                                !account.needsCredentialMigration && !account.needsTokenRecovery && <StatusPill>已连接</StatusPill>
                               )}
                             </div>
                             <div className="account-card-actions">
@@ -2640,10 +2756,10 @@ export default function App() {
                             </div>
                           </div>
                           <dl className="account-facts">
-                            {account.cloudflareName && <div><dt>本机备注</dt><dd>{account.label}</dd></div>}
+                            {account.cloudflareName && <div><dt>Cloudflare 名称</dt><dd>{account.cloudflareName}</dd></div>}
                             <div><dt>账户 ID</dt><dd>…{account.id.slice(-8)}</dd></div>
                             <div><dt>Cloudflare 内</dt><dd>{account.zoneCount} 个站点</dd></div>
-                            <div><dt>接入域名</dt><dd>{state.domains.filter((d) => d.accountId === account.id).length} 个域名</dd></div>
+                            <div><dt>接入域名</dt><dd>{(domainCountByAccount.get(account.id) || 0)} 个域名</dd></div>
                             <div><dt>上次检查</dt><dd>{formatDate(account.checkedAt)}</dd></div>
                           </dl>
                           <div className="account-service">
@@ -2725,143 +2841,9 @@ export default function App() {
             </>
           }
         >
-          <form
-            id="link-form"
-            onSubmit={(e) => void saveLink(e)}
-            className="form-grid"
-          >
-            <label>
-              所属域名
-              <select
-                value={linkDraft.domainId}
-                onChange={(e) => updateLinkDraft({ domainId: e.target.value })}
-                disabled={Boolean(originalSlug)}
-                required
-              >
-                {state.domains.map((d) => (
-                  <option value={d.id} key={d.id}>
-                    {d.host} /{d.prefix}/
-                  </option>
-                ))}
-              </select>
-            </label>
-            <label>
-              短链接名称
-              <input
-                ref={slugInput}
-                value={linkDraft.slug}
-                onChange={(e) => updateLinkDraft({ slug: originalSlug ? e.target.value : e.target.value.toLowerCase() })}
-                placeholder="例如 welcome"
-                maxLength={32}
-                required
-                disabled={Boolean(originalSlug)}
-              />
-              <small>
-                它是网址最后一段，例如
-                /welcome；可用字母、数字、下划线或连字符。新名称自动转为小写，旧链接名称保持原样。
-              </small>
-            </label>
-            {originalSlug && (
-              <div className="form-note">
-                <p>名称是网址的一部分。需要新名称时，可以带上当前设置创建新链接，旧链接继续保留。</p>
-                <button
-                  type="button"
-                  className="button secondary"
-                  disabled={busy}
-                  onClick={useNewLinkName}
-                >
-                  换一个名称
-                </button>
-              </div>
-            )}
-            {copySource && (
-              <div className="form-note" role="status">
-                <strong>旧链接 /{copySource.slug} 会继续保留</strong>
-                <p>跳转设置和邀请码已带入。这次填写的内容只用于新链接；新地址确认可用后，可以按需删除旧链接。</p>
-              </div>
-            )}
-            <div className="form-divider" />
-            <div className="mode-switch" role="group" aria-label="地址来源">
-              <button
-                type="button"
-                className={!linkDraft.poolId ? "selected" : ""}
-                onClick={() => updateLinkDraft({ poolId: "" })}
-              >
-                手动填写
-              </button>
-              <button
-                type="button"
-                className={linkDraft.poolId ? "selected" : ""}
-                disabled={!state.pools?.length}
-                onClick={() =>
-                  updateLinkDraft({
-                    poolId: linkDraft.poolId || state.pools?.[0]?.id || "",
-                  })
-                }
-              >
-                平台地址
-              </button>
-            </div>
-            {!state.pools?.length && (
-              <p className="form-note">
-                如需使用平台地址，请先到「平台地址」添加一组地址。
-              </p>
-            )}
-            {linkDraft.poolId ? (
-              <>
-                <label>
-                  平台地址
-                  <select
-                    value={linkDraft.poolId}
-                    onChange={(e) => updateLinkDraft({ poolId: e.target.value })}
-                  >
-                    {(state.pools || []).map((pool) => (
-                      <option key={pool.id} value={pool.id}>
-                        {pool.name}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-                <label>
-                  此链接的邀请码
-                  <input
-                    value={linkDraft.code}
-                    onChange={(e) => updateLinkDraft({ code: e.target.value })}
-                    maxLength={128}
-                    placeholder="例如 member_01"
-                    required
-                  />
-                </label>
-                <p className="form-note">
-                  创建时会自动把所需平台配置同步到所选域名的账户；这条链接保留自己的邀请码。更改平台链接后，已关联短链接会一起更新。
-                </p>
-              </>
-            ) : (
-              <>
-                <label>
-                  中国大陆打开的网址
-                  <input
-                    type="url"
-                    value={linkDraft.cnUrl}
-                    onChange={(e) => updateLinkDraft({ cnUrl: e.target.value })}
-                    placeholder="https://example.com/zh"
-                    required
-                  />
-                </label>
-                <label>
-                  其他地区打开的网址
-                  <input
-                    type="url"
-                    value={linkDraft.defaultUrl}
-                    onChange={(e) => updateLinkDraft({ defaultUrl: e.target.value })}
-                    placeholder="https://example.com/en"
-                    required
-                  />
-                </label>
-              </>
-            )}
-            <p className="form-note">保存前先核对网址和修改范围。</p>
-          </form>
+          <LinkEditor linkDraft={linkDraft} originalSlug={originalSlug} copySource={copySource}
+            domains={state.domains} pools={state.pools || []} busy={busy} formErrors={formErrors}
+            slugInput={slugInput} saveLink={saveLink} updateLinkDraft={updateLinkDraft} useNewLinkName={useNewLinkName} />
         </Dialog>
       )}
       {domainOpen && !plan && (
@@ -2925,6 +2907,7 @@ export default function App() {
           }
         >
           <form
+            noValidate
             id="domain-form"
             onSubmit={(e) => void checkDomain(e)}
             className="form-grid"
@@ -2965,7 +2948,8 @@ export default function App() {
               <label>
                 域名
                 <input
-                  list="cloudflare-zones"
+                  {...fieldProps("domain-host", formErrors)}
+                list="cloudflare-zones"
                   value={domainDraft.input}
                   onChange={(e) => {
                     const input = e.target.value;
@@ -2989,6 +2973,7 @@ export default function App() {
                   placeholder="go.example.com"
                   required
                 />
+                <FieldError name="domain-host" errors={formErrors} />
                 <datalist id="cloudflare-zones">
                   {state.accounts
                     .filter(
@@ -3016,7 +3001,8 @@ export default function App() {
               <label>
                 链接目录
                 <input
-                  value={domainDraft.prefix}
+                  {...fieldProps("domain-prefix", formErrors)}
+                value={domainDraft.prefix}
                   onChange={(e) => {
                     setDomainDraft({ ...domainDraft, prefix: e.target.value });
                     invalidateDomainPreparation();
@@ -3024,6 +3010,7 @@ export default function App() {
                   maxLength={12}
                   required
                 />
+                <FieldError name="domain-prefix" errors={formErrors} />
                 <small>
                   示例链接：https://{domainExampleHost}/{domainExamplePrefix}
                   /名称
@@ -3340,7 +3327,7 @@ export default function App() {
       )}
       {tokenOpen && (
         <Dialog
-          title={updateTokenAccount ? "更换本机令牌" : "导入访问令牌"}
+          title={updateTokenAccount?.needsTokenRecovery ? "恢复账户令牌" : updateTokenAccount ? "更换本机令牌" : "导入访问令牌"}
           dismissDisabled={mutation === "token"}
           eyebrow="ACCOUNT ACCESS"
           error={error}
@@ -3370,13 +3357,15 @@ export default function App() {
           }
         >
           <form
+            noValidate
             id="token-form"
             className="form-grid"
             onSubmit={(e) => void importToken(e)}
           >
             {updateTokenAccount ? (
               <div className="token-current-account">
-                <strong>正在更新 {updateTokenAccount.cloudflareName || updateTokenAccount.label}</strong>
+                <strong>正在更新 {updateTokenAccount.label}</strong>
+                {updateTokenAccount.cloudflareName && <p className="form-note">Cloudflare 名称：{updateTokenAccount.cloudflareName}</p>}
                 <p className="form-note">
                   将只更新此账户（账户 ID：…{updateTokenAccount.id.slice(-8)}）的本机令牌，其他账户不变。令牌必须包含这个 Cloudflare 账户，否则不会保存。
                 </p>
@@ -3399,7 +3388,9 @@ export default function App() {
                 </div>
               </div>
             )}
-            {updateTokenAccount && (
+            {updateTokenAccount?.needsTokenRecovery && <p className="form-note">上次保存未完成。请重新粘贴属于此账户的令牌并验证；恢复成功后再执行云端操作。</p>}
+            {!updateTokenAccount && state.accounts.some((account) => account.needsTokenRecovery) && <div className="credential-recovery-note"><p>以下账户需要单独恢复令牌，请选择对应账户后继续：</p>{state.accounts.filter((account) => account.needsTokenRecovery).map((account) => <button type="button" className="button secondary" key={account.id} disabled={busy || domainBusy} onClick={() => openTokenRecovery(account)}>恢复 {account.label} 的令牌</button>)}</div>}
+            {updateTokenAccount && !updateTokenAccount.needsTokenRecovery && (
               <div className="token-existing-help">
                 <p className="form-note">
                   只是补充权限或加入新域名？可以直接编辑已有令牌，无需在这里重新粘贴。保存后关闭此窗口，重试刚才的操作。只有创建了新令牌或重新生成了令牌值，才需要在下方替换。
@@ -3438,16 +3429,19 @@ export default function App() {
                   <input
                     type="password"
                     autoComplete="off"
-                    value={token}
+                    {...fieldProps("token-value", formErrors)}
+                value={token}
                     disabled={mutation === "token"}
                     onChange={(e) => {
                       clearClipboardOffer();
                       setToken(e.target.value);
+                      setFormErrors({});
                     }}
                     onFocus={() => void checkClipboard()}
                     placeholder="在此粘贴令牌"
                     required
                   />
+                <FieldError name="token-value" errors={formErrors} />
                 </label>
                 {clipboardOffer && (
                   <div className="clipboard-offer">
@@ -3515,6 +3509,7 @@ export default function App() {
           }
         >
           <form
+            noValidate
             id="rename-form"
             onSubmit={(e) => void doRename(e)}
             className="form-grid"
@@ -3522,12 +3517,14 @@ export default function App() {
             <label>
               账户名称
               <input
+                {...fieldProps("account-name", formErrors)}
                 value={renameValue}
                 disabled={mutation === "rename"}
-                onChange={(e) => setRenameValue(e.target.value)}
+                onChange={(e) => { setRenameValue(e.target.value); setFormErrors({}); }}
                 maxLength={60}
                 required
               />
+                <FieldError name="account-name" errors={formErrors} />
             </label>
             <p className="form-note">名称只用于本机识别，不修改远端账户。</p>
           </form>
@@ -3584,10 +3581,10 @@ export default function App() {
           <div className="account-manager">
             <div className="account-identity">
               <strong>
-                {manageAccount.cloudflareName || manageAccount.label}
+                {manageAccount.label}
               </strong>
               {manageAccount.cloudflareName && (
-                <span>本机备注：{manageAccount.label}</span>
+                <span>Cloudflare 名称：{manageAccount.cloudflareName}</span>
               )}
               <span>账户 ID：…{manageAccount.id.slice(-8)}</span>
               <details>
@@ -3595,6 +3592,7 @@ export default function App() {
                 <code>{manageAccount.id}</code>
               </details>
             </div>
+            {manageAccount.needsTokenRecovery && <p className="credential-recovery-note">令牌保存未完成。请先恢复此账户令牌，再管理云端配置。账户备注和本机移除仍可使用。</p>}
             <section className="manager-section">
               <div className="manager-section-heading">
                 <strong>账户与访问令牌</strong>
@@ -3644,7 +3642,7 @@ export default function App() {
               <div className="manager-actions">
               {!manageAccount.monitorEnabled && (
                 <button
-                  disabled={mutation === "prepare_credentials"}
+                  disabled={mutation === "prepare_credentials" || Boolean(manageAccount.needsTokenRecovery)}
                   className="button secondary"
                   onClick={() => {
                     monitorPrepareSequence.current += 1;
@@ -3660,7 +3658,7 @@ export default function App() {
               )}
               {manageAccount.monitorEnabled && (
                 <button
-                  disabled={mutation === "prepare_credentials"}
+                  disabled={mutation === "prepare_credentials" || Boolean(manageAccount.needsTokenRecovery)}
                   className="button secondary"
                   onClick={() => {
                     void disableMonitor(manageAccount);
@@ -3671,7 +3669,7 @@ export default function App() {
                 </button>
               )}
               <button
-                disabled={mutation === "prepare_credentials"}
+                disabled={mutation === "prepare_credentials" || Boolean(manageAccount.needsTokenRecovery)}
                 className="button secondary"
                 onClick={() => {
                   void prepare("recover_account", {
@@ -3683,7 +3681,7 @@ export default function App() {
                 从 Cloudflare 找回配置
               </button>
               <button
-                disabled={mutation === "prepare_credentials"}
+                disabled={mutation === "prepare_credentials" || Boolean(manageAccount.needsTokenRecovery)}
                 className="button secondary"
                 onClick={() => {
                   void prepare("rotate_selftest", {
@@ -3700,12 +3698,12 @@ export default function App() {
               <section className="manager-section">
                 <div className="manager-section-heading">
                   <strong>短链接访问保护</strong>
-                  <p>默认启用：同一 IP 对同一短链接每 10 秒最多 100 次请求，超出时暂时限制；访客无需验证。此设置作用于本账户的全部短链接域名。</p>
+                  <p>默认启用：同一 IP 对同一短链接在每个 Cloudflare 节点的近似阈值为 100 次 / 10 秒，超出时暂时限制；访客无需验证。跨节点计数不合并，保护服务异常时放行，因此不保证全球总次数或费用上限。此设置作用于本账户的全部短链接域名。</p>
                   <p>状态只在点击读取后查询云端。</p>
-                  {protectionRead?.accountId === manageAccount.id && <p role="status">{protectionRead.loading ? "正在读取访问保护状态…" : protectionRead.error ? `读取失败：${protectionRead.error}` : protectionRead.status ? `当前状态：${protectionRead.status.status === "enabled" ? "已启用" : protectionRead.status.status === "disabled" ? "已停用" : "需要升级云端跳转服务"} · ${protectionRead.status.limit} 次 / ${protectionRead.status.periodSeconds} 秒` : "尚未读取"}</p>}
+                  {protectionRead?.accountId === manageAccount.id && <p role="status">{protectionRead.loading ? "正在读取访问保护状态…" : protectionRead.error ? `读取失败：${protectionRead.error}` : protectionRead.status ? `当前状态：${protectionRead.status.status === "enabled" ? "已启用" : protectionRead.status.status === "disabled" ? "已停用" : "需要升级云端跳转服务"} · 每节点近似阈值 ${protectionRead.status.limit} 次 / ${protectionRead.status.periodSeconds} 秒` : "尚未读取"}</p>}
                 </div>
                 <div className="manager-actions">
-                  <button className="button secondary" disabled={busy || Boolean(protectionRead?.loading) || Boolean(manageAccount.needsCredentialMigration)} onClick={async () => {
+                  <button className="button secondary" disabled={busy || Boolean(protectionRead?.loading) || Boolean(manageAccount.needsCredentialMigration || manageAccount.needsTokenRecovery)} onClick={async () => {
                     const accountId = manageAccount.id;
                     const sequence = ++protectionReadSequence.current;
                     setProtectionRead({accountId,loading:true});
@@ -3718,11 +3716,11 @@ export default function App() {
                       if (sequence === protectionReadSequence.current) setProtectionRead({accountId,error:errorMessage(readError)});
                     }
                   }}>读取保护状态</button>
-                  <button className="button secondary" disabled={busy || Boolean(manageAccount.needsCredentialMigration)} onClick={() => {
+                  <button className="button secondary" disabled={busy || Boolean(manageAccount.needsCredentialMigration || manageAccount.needsTokenRecovery)} onClick={() => {
                     void prepare("enable_click_protection", {accountId:manageAccount.id});
                     setManageAccount(null);
                   }}>启用访问保护</button>
-                  <button className="button secondary" disabled={busy || Boolean(manageAccount.needsCredentialMigration)} onClick={() => {
+                  <button className="button secondary" disabled={busy || Boolean(manageAccount.needsCredentialMigration || manageAccount.needsTokenRecovery)} onClick={() => {
                     void prepare("disable_click_protection", {accountId:manageAccount.id});
                     setManageAccount(null);
                   }}>停用访问保护</button>
@@ -3736,7 +3734,7 @@ export default function App() {
                   <p>升级此账户的云端跳转服务以启用新版功能，包括名称大小写兼容与默认访问保护。旧链接保持原样；已有重名时先匹配原名称，再匹配小写名称。现有密钥和检测设置会保留；此前明确停用的保护设置也会保留。</p>
                 </div>
                 <div className="manager-actions">
-                  <button disabled={busy} className="button secondary" onClick={() => {
+                  <button disabled={busy || Boolean(manageAccount.needsTokenRecovery)} className="button secondary" onClick={() => {
                     void prepare("upgrade_worker", { accountId: manageAccount.id });
                     setManageAccount(null);
                   }}>升级云端跳转服务</button>
@@ -3747,11 +3745,11 @@ export default function App() {
               <strong>危险操作</strong>
               <p>
                 删除云端短链接服务会删除此账户中由本应用管理的
-                Worker、路由和短链接数据；不会删除其他网站或 DNS 记录。
+                Worker、路由和短链接数据；不会删除其他网站或 DNS 记录。此账户关联的 {state.domains.filter((domain) => domain.accountId === manageAccount.id).length} 个域名下的短链接会失效。删除后不能靠刷新恢复；如需重建，请先导出配置并妥善保存。
               </p>
               <div className="danger-actions">
                 <button
-                  disabled={mutation === "prepare_credentials"}
+                  disabled={mutation === "prepare_credentials" || Boolean(manageAccount.needsTokenRecovery)}
                   className="button danger-button"
                   onClick={() => {
                     void prepare("cleanup_account", {
@@ -3806,6 +3804,7 @@ export default function App() {
           }
         >
           <form
+            noValidate
             id="monitor-form"
             className="form-grid"
             onSubmit={(e) => void prepareMonitor(e)}
@@ -3817,27 +3816,33 @@ export default function App() {
               检测服务 HTTPS 地址
               <input
                 type="url"
+                {...fieldProps("monitor-endpoint", formErrors)}
                 value={monitorEndpoint}
                 onChange={(e) => {
                   monitorPrepareSequence.current += 1;
                   setMonitorEndpoint(e.target.value);
+                  setFormErrors({});
                 }}
                 placeholder="https://probe.example.com/check"
                 required
               />
+                <FieldError name="monitor-endpoint" errors={formErrors} />
             </label>
             <label>
               服务密钥
               <input
                 type="password"
                 autoComplete="off"
+                {...fieldProps("monitor-secret", formErrors)}
                 value={monitorSecret}
                 onChange={(e) => {
                   monitorPrepareSequence.current += 1;
                   setMonitorSecret(e.target.value);
+                  setFormErrors({});
                 }}
                 required
               />
+                <FieldError name="monitor-secret" errors={formErrors} />
               <small>32–256 个无空白的可打印 ASCII 字符。</small>
             </label>
             <p className="form-note">
@@ -3938,60 +3943,65 @@ export default function App() {
           </div>
         </Dialog>
       )}
-      {updateStatus && (
+      {updateOpen && (
         <Dialog
           title="应用更新"
-          dismissDisabled={mutation === "update"}
+          dismissDisabled={mutation === "update" || updates.checking}
           eyebrow="DESKTOP UPDATE"
           error={updateError}
-          onClose={() => setUpdateStatus(null)}
+          onClose={() => {setUpdateOpen(false); setUpdateStatus(null);}}
           footer={
             <>
               <button
                 className="button ghost"
-                disabled={mutation === "update"}
-                onClick={() => setUpdateStatus(null)}
+                disabled={mutation === "update" || updates.checking}
+                onClick={() => {setUpdateOpen(false); setUpdateStatus(null);}}
               >
-                {updateStatus.status === "available" ? "稍后再说" : "关闭"}
+                {updateStatus?.status === "available" ? "稍后再说" : "关闭"}
               </button>
-              {updateStatus.status === "available" && (
+              {!updateStatus && !updates.checking && <button type="button" className="button primary" onClick={() => void checkUpdate()}>重新检查更新</button>}
+              {(updates.checking || mutation === "update") && <button type="button" className="button secondary" disabled={cancellingUpdate || Boolean(updateCancelMessage) || updatePhase === "installing"} onClick={() => void cancelUpdate()}>{updatePhase === "installing" ? "安装开始后无法取消" : cancellingUpdate ? "正在请求取消…" : "取消本次更新"}</button>}
+              {updateStatus?.status === "available" && (
                 <button
                   className="button primary"
                   onClick={() => void installUpdate()}
-                  disabled={busy}
+                  disabled={busy || updates.checking}
                 >
-                  {busy ? "正在安装…" : "确认安装更新"}
+                  {mutation === "update" ? "正在处理更新…" : "确认安装更新"}
                 </button>
               )}
             </>
           }
         >
           <div className="update-result">
-            {updateStatus.status === "installed" ? (
-              <p>更新 <strong>{updateStatus.version}</strong> 已安装。请退出并重新打开软件，即可使用新版本。</p>
-            ) : updateStatus.status === "unavailable" ? (
+            {(updates.checking || mutation === "update") && <div className="update-progress" role="status"><span className="update-progress-dot" />{updatePhase === "installing" ? "正在安装，请等待完成。此阶段无法取消。" : updatePhase === "verifying" ? "下载已完成，正在校验更新包。" : updatePhase === "downloading" ? "正在下载更新，可取消本次操作。" : updates.checking || updatePhase === "checking" ? "正在检查更新，可取消本次操作。" : "正在等待更新服务返回，可请求取消。"}</div>}
+            {updateCancelMessage && <p role="status">{updateCancelMessage}</p>}
+            {!updateStatus && !updates.checking && !updateError && <p>本次检查已结束。</p>}
+            {updateStatus?.status === "installed" ? (
+              <p>更新 <strong>{updateStatus?.version}</strong> 已安装。请退出并重新打开软件，即可使用新版本。</p>
+            ) : updateStatus?.status === "unavailable" ? (
               <p>
                 当前版本：<strong>{currentVersion || "未提供"}</strong>
                 。更新渠道尚未启用，请使用正式发行渠道获取新版本。
               </p>
-            ) : updateStatus.status === "up_to_date" ? (
+            ) : updateStatus?.status === "up_to_date" ? (
               <p>
                 当前已是最新版本（
                 <strong>{currentVersion || "版本未提供"}</strong>）。
               </p>
-            ) : (
+            ) : updateStatus ? (
               <>
                 <p>
                   当前版本：<strong>{currentVersion || "未提供"}</strong>
                   ；发现新版本{" "}
-                  <strong>{updateStatus.version || "可用更新"}</strong>
+                  <strong>{updateStatus?.version || "可用更新"}</strong>
                   。安装后应用可能会重启。
                 </p>
-                {updateStatus.notes && (
-                  <div className="update-notes">{updateStatus.notes}</div>
+                {updateStatus?.notes && (
+                  <div className="update-notes">{updateStatus?.notes}</div>
                 )}
               </>
-            )}
+            ) : null}
           </div>
         </Dialog>
       )}

@@ -7,6 +7,8 @@ pub struct Account {
     pub label: String,
     #[serde(default)]
     pub mac_credential_schema: u8,
+    #[serde(default)]
+    pub token_import_pending: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cloudflare_name: Option<String>,
     pub zone_count: usize,
@@ -31,6 +33,7 @@ pub struct AccountView {
     pub id: String,
     pub label: String,
     pub needs_credential_migration: bool,
+    pub needs_token_recovery: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cloudflare_name: Option<String>,
     pub zone_count: usize,
@@ -49,6 +52,7 @@ impl From<&Account> for AccountView {
             id: a.id.clone(),
             label: a.label.clone(),
             needs_credential_migration: cfg!(target_os = "macos") && a.mac_credential_schema != 2,
+            needs_token_recovery: a.token_import_pending,
             cloudflare_name: a.cloudflare_name.clone(),
             zone_count: a.zone_count,
             checked_at: a.checked_at.clone(),

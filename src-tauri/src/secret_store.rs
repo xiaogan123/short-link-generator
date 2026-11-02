@@ -36,9 +36,7 @@ pub(crate) enum SecretError {
     MigrationRequired,
     #[cfg(any(target_os = "macos", test))]
     LegacyTokenMissing,
-    #[cfg(any(target_os = "macos", test))]
     Conflict,
-    #[cfg(any(target_os = "macos", test))]
     ReadbackMismatch,
     #[cfg(any(target_os = "macos", test))]
     LocationUnavailable,
@@ -58,10 +56,8 @@ impl fmt::Display for SecretError {
             }
             #[cfg(any(target_os = "macos", test))]
             Self::LegacyTokenMissing => "旧访问令牌缺失，请先更新此账户的令牌，再继续更新本机授权",
-            #[cfg(any(target_os = "macos", test))]
             Self::Conflict => "本机凭据在更新期间发生冲突，未覆盖任何已有值；请重新核对并确认",
-            #[cfg(any(target_os = "macos", test))]
-            Self::ReadbackMismatch => "新本机凭据读回不一致，未完成授权更新；旧凭据已保留",
+            Self::ReadbackMismatch => "本机凭据读回不一致，尚未确认操作完成；请核对后重试",
             #[cfg(any(target_os = "macos", test))]
             Self::LocationUnavailable => {
                 "系统凭据库位置已变化或无法核对，请重新打开应用后重试；本机账户记录保留"
@@ -736,9 +732,37 @@ pub(crate) fn set_explicit_token(id: &str, value: &str, replace: bool) -> Result
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = replace;
-        store().set(id, "token", value)
+        store().clear_all();
+        let result = set_explicit_verified(&KeyringBackend, id, value, replace);
+        store().clear_all();
+        result
     }
+}
+
+// Windows credential APIs do not expose an atomic create-only write. Preserve
+// any value observed by a direct read, and verify writes directly, never via a
+// possibly stale cache. The configuration lease serializes app processes;
+// external native-store writers still cannot be made atomic by this adapter.
+#[cfg(any(not(target_os = "macos"), test))]
+fn set_explicit_verified(
+    backend: &impl CredentialBackend,
+    id: &str,
+    value: &str,
+    replace: bool,
+) -> Result<(), SecretError> {
+    if !replace {
+        match backend.get(id, "token") {
+            Ok(existing) if existing.as_str() == value => return Ok(()),
+            Ok(_) => return Err(SecretError::Conflict),
+            Err(SecretError::Missing) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    backend.set(id, "token", value)?;
+    if backend.get(id, "token")?.as_str() != value {
+        return Err(SecretError::ReadbackMismatch);
+    }
+    Ok(())
 }
 
 /// Explicit account removal may also clean a partially migrated account.
@@ -1417,5 +1441,79 @@ mod tests {
             Err(SecretError::LocationUnavailable)
         ));
         assert_eq!(backend.delete_count.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[cfg(test)]
+mod explicit_token_tests {
+    use super::*;
+    struct Backend {
+        value: Mutex<Option<String>>,
+        reads_fail: bool,
+        mismatch: bool,
+        writes: std::sync::atomic::AtomicUsize,
+    }
+    impl CredentialBackend for Backend {
+        fn get(&self, _: &str, _: &str) -> Result<Zeroizing<String>, SecretError> {
+            if self.reads_fail {
+                return Err(SecretError::AccessDenied);
+            }
+            lock(&self.value)
+                .clone()
+                .map(Zeroizing::new)
+                .ok_or(SecretError::Missing)
+        }
+        fn set(&self, _: &str, _: &str, value: &str) -> Result<(), SecretError> {
+            self.writes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            *lock(&self.value) = Some(
+                if self.mismatch {
+                    "synthetic-mismatch"
+                } else {
+                    value
+                }
+                .into(),
+            );
+            Ok(())
+        }
+        fn delete(&self, _: &str, _: &str) -> Result<(), SecretError> {
+            unreachable!()
+        }
+    }
+    fn backend(value: Option<&str>) -> Backend {
+        Backend {
+            value: Mutex::new(value.map(str::to_owned)),
+            reads_fail: false,
+            mismatch: false,
+            writes: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+    #[test]
+    fn direct_explicit_import_preserves_unknown_and_accepts_only_confirmed_replacement() {
+        let backend = backend(Some("existing"));
+        assert!(matches!(
+            set_explicit_verified(&backend, "acct1", "new", false),
+            Err(SecretError::Conflict)
+        ));
+        assert!(set_explicit_verified(&backend, "acct1", "existing", false).is_ok());
+        assert_eq!(backend.writes.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(set_explicit_verified(&backend, "acct1", "new", true).is_ok());
+        assert_eq!(lock(&backend.value).as_deref(), Some("new"));
+    }
+    #[test]
+    fn direct_explicit_import_fails_closed_on_denial_and_readback_mismatch() {
+        let mut denied = backend(None);
+        denied.reads_fail = true;
+        assert!(matches!(
+            set_explicit_verified(&denied, "acct1", "new", false),
+            Err(SecretError::AccessDenied)
+        ));
+        assert_eq!(denied.writes.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let mut mismatched = backend(None);
+        mismatched.mismatch = true;
+        assert!(matches!(
+            set_explicit_verified(&mismatched, "acct1", "new", false),
+            Err(SecretError::ReadbackMismatch)
+        ));
     }
 }

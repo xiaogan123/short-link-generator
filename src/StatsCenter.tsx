@@ -22,7 +22,7 @@ const ranges: { value: ClickStatsDays; label: string }[] = [
 ];
 
 type ViewState =
-  | { kind: "idle" }
+  | { kind: "idle"; message?: string }
   | { kind: "loading" }
   | { kind: "report"; report: StatsCenterReport }
   | { kind: "error"; message: string };
@@ -30,8 +30,9 @@ type ViewState =
 type OverviewEntry =
   | { kind: "report"; report: StatsCenterReport; allRows: StatsCenterRow[]; detailError?: string }
   | { kind: "migration" }
+  | { kind: "token-recovery" }
   | { kind: "error"; message: string };
-type OverviewState = { kind: "idle" | "loading" | "complete"; entries: Record<string, OverviewEntry>; completed: number; identity?: string; stopped?: boolean };
+type OverviewState = { kind: "idle" | "loading" | "complete"; entries: Record<string, OverviewEntry>; completed: number; identity?: string; stopped?: boolean; progress?: {accountId:string;page:number;pages:number} };
 
 type Props = {
   accounts: Account[];
@@ -101,7 +102,8 @@ function validReport(
     || !Number.isSafeInteger(report.totalLinks)
     || report.totalLinks < 0
     || typeof report.queriedAt !== "string"
-    || report.estimated !== true) return false;
+    || report.estimated !== true
+    || (report.readSessionId !== undefined && (typeof report.readSessionId !== "string" || !report.readSessionId || report.readSessionId.length > 128))) return false;
 
   if (report.status !== "ready" && report.status !== "no_data") {
     return report.totals === undefined && report.rows === undefined;
@@ -147,7 +149,8 @@ function completeOverviewPage(report: StatsCenterReport, scope: Link[]) {
 }
 
 function overviewEntryStatus(entry?: OverviewEntry) {
-  return entry?.kind === "migration" ? "需迁移授权"
+  return entry?.kind === "token-recovery" ? "令牌导入未完成"
+    : entry?.kind === "migration" ? "需迁移授权"
     : entry?.kind === "error" ? "读取失败"
       : entry?.kind === "report" ? ({ ready: "可汇总", disabled: "未启用", no_data: "无可汇总数据", permission_denied: "权限不足", unavailable: "暂不可用" }[entry.report.status])
         : "未读取";
@@ -212,6 +215,7 @@ export default function StatsCenter({
   const [knownTotalLinks, setKnownTotalLinks] = useState<number | null>(null);
   const [openerError, setOpenerError] = useState("");
   const requestSequence = useRef(0);
+  const readSession = useRef<string|undefined>(undefined);
   const mounted = useRef(false);
   const onScopeInvalidateRef = useRef(onScopeInvalidate);
   onScopeInvalidateRef.current = onScopeInvalidate;
@@ -226,7 +230,7 @@ export default function StatsCenter({
   const effectiveDomainId = currentDomain?.id || "";
   const dataIdentity = useMemo(() => JSON.stringify([
     revision,
-    accounts.map((account) => [account.id, account.label, Boolean(account.needsCredentialMigration)]),
+    accounts.map((account) => [account.id, account.label, Boolean(account.needsCredentialMigration),Boolean(account.needsTokenRecovery)]),
     domains.map((domain) => [domain.id, domain.accountId, domain.host, domain.prefix]),
     links.map((link) => [link.domainId, link.slug]),
   ]), [accounts, domains, links, revision]);
@@ -235,6 +239,7 @@ export default function StatsCenter({
 
   function invalidate(clearCount = true) {
     requestSequence.current += 1;
+    readSession.current = undefined;
     setView({ kind: "idle" });
     setOverview({ kind: "idle", entries: {}, completed: 0 });
     setOpenerError("");
@@ -252,6 +257,7 @@ export default function StatsCenter({
 
   useEffect(() => {
     requestSequence.current += 1;
+    readSession.current = undefined;
     setView({ kind: "idle" });
     setOverview({ kind: "idle", entries: {}, completed: 0 });
     setKnownTotalLinks(null);
@@ -273,6 +279,7 @@ export default function StatsCenter({
     setDomainId("");
     setPage(1);
     if (cached?.kind === "report" && cached.report.domainId === null && cached.report.days === days && cached.report.page === 1) {
+      readSession.current = cached.report.readSessionId;
       setKnownTotalLinks(cached.report.totalLinks);
       setView({ kind: "report", report: cached.report });
     }
@@ -290,8 +297,10 @@ export default function StatsCenter({
     setPage(1);
   };
 
-  const load = async (requestedPage = 1) => {
-    if (!currentAccount || currentAccount.needsCredentialMigration) return;
+  const load = async (requestedPage = 1, continuation = false) => {
+    if (!currentAccount || currentAccount.needsCredentialMigration || currentAccount.needsTokenRecovery) return;
+    const sessionId = continuation ? readSession.current : undefined;
+    if (!continuation) readSession.current = undefined;
     const expected = {
       accountId: currentAccount.id,
       domainId: effectiveDomainId || null,
@@ -310,17 +319,21 @@ export default function StatsCenter({
         days: expected.days,
         page: requestedPage,
         pageSize: PAGE_SIZE,
+        ...(sessionId ? {readSessionId:sessionId} : {}),
       });
       if (!mounted.current || sequence !== requestSequence.current || requestDataIdentity !== latestDataIdentity.current) return;
-      if (!validReport(report, expected, domains, links)) {
+      if (!validReport(report, expected, domains, links) || (sessionId !== undefined && report.readSessionId !== sessionId)) {
+        readSession.current = undefined;
         setKnownTotalLinks(null);
         setView({ kind: "error", message: "返回的统计结果与当前账户、域名、时间或页码不一致，已停止显示。请重试。" });
         return;
       }
+      readSession.current = report.readSessionId;
       setKnownTotalLinks(report.totalLinks);
       setView({ kind: "report", report });
     } catch (error) {
       if (!mounted.current || sequence !== requestSequence.current || requestDataIdentity !== latestDataIdentity.current) return;
+      readSession.current = undefined;
       setKnownTotalLinks(null);
       setView({ kind: "error", message: errorMessage(error) });
     }
@@ -339,17 +352,22 @@ export default function StatsCenter({
     }
     const entries: Record<string, OverviewEntry> = {};
     let completed = 0;
+    let progress:OverviewState["progress"];
     const publishProgress = () => {
-      if (current()) setOverview({ kind: "loading", entries: { ...entries }, completed, identity: requestDataIdentity });
+      if (current()) setOverview({ kind: "loading", entries: { ...entries }, completed, identity: requestDataIdentity, progress });
     };
     for (const account of accounts) {
       if (!current()) return;
       let entry: OverviewEntry;
-      if (account.needsCredentialMigration) {
+      if (account.needsTokenRecovery) {
+        entry = {kind:"token-recovery"};
+      } else if (account.needsCredentialMigration) {
         entry = { kind: "migration" };
       } else {
         const expected = { accountId: account.id, domainId: null, days, page: 1 };
         const scope = overviewScopeLinks(account.id, domains, links);
+        progress = {accountId:account.id,page:1,pages:Math.max(1,Math.ceil(scope.length/PAGE_SIZE))};
+        publishProgress();
         try {
           const report = await dispatch<StatsCenterReport>("get_stats_center", {
             accountId: account.id, days, page: 1, pageSize: PAGE_SIZE,
@@ -365,12 +383,16 @@ export default function StatsCenter({
             const pages = Math.ceil(scope.length / PAGE_SIZE);
             for (let nextPage = 2; nextPage <= pages; nextPage += 1) {
               if (!current()) return;
+              progress = {accountId:account.id,page:nextPage,pages};
+              publishProgress();
               try {
                 const next = await dispatch<StatsCenterReport>("get_stats_center", {
                   accountId: account.id, days, page: nextPage, pageSize: PAGE_SIZE,
+                  ...(report.readSessionId ? {readSessionId:report.readSessionId} : {}),
                 });
                 if (!current()) return;
                 if (!validReport(next, { ...expected, page: nextPage }, domains, links)
+                  || (report.readSessionId !== undefined && next.readSessionId !== report.readSessionId)
                   || !completeOverviewPage(next, scope)
                   || (next.status !== "ready" && next.status !== "no_data")) {
                   throw new Error("部分链接明细未能完整读取，请刷新重试。未读取的链接不显示为零。");
@@ -433,7 +455,7 @@ export default function StatsCenter({
   const pageCount = Math.max(1, Math.ceil((knownTotalLinks || 0) / PAGE_SIZE));
   const visibleConfigurationError = configurationError && configurationError.accountId === currentAccount?.id ? configurationError.message : "";
   const configurationNeedsAnalyticsRead = /AccountAnalyticsRead|Account Analytics Read|账户分析|帐户分析|统计读取权限|analytics.*read/i.test(visibleConfigurationError);
-  const canConfigure = Boolean(currentAccount && !currentAccount.needsCredentialMigration && !busy);
+  const canConfigure = Boolean(currentAccount && !currentAccount.needsCredentialMigration && !currentAccount.needsTokenRecovery && !busy);
   const configurationMode = report?.status === "disabled" ? "enable"
     : report?.status === "no_data" || view.kind === "error" ? "check-disable"
       : report ? "disable"
@@ -468,10 +490,11 @@ export default function StatsCenter({
   const body = (() => {
     if (accounts.length === 0) return <Notice title="还没有可查询的账户" tone="warning">请先导入一个 Cloudflare 账户，再从这里读取访问统计。</Notice>;
     if (!currentAccount) return <AccountsOverview accounts={accounts} domains={domains} links={links} days={days} overview={overview} onSelect={chooseAccount} onOpenLinkStats={onOpenLinkStats} onStop={stopOverview} />;
+    if (currentAccount.needsTokenRecovery) return <Notice title="令牌导入未完成" tone="warning">请到“Cloudflare 账户”重试导入或更新令牌，再读取统计。</Notice>;
     if (currentAccount.needsCredentialMigration) return <Notice title="需要先更新本机授权" tone="warning">请先到“Cloudflare 账户”完成此账户的本机授权迁移，再读取或配置访问统计。</Notice>;
     if (view.kind === "loading") return <div className="scenter-loading" role="status">正在读取所选账户的第 {page} 页统计…</div>;
     if (view.kind === "error") return <Notice title="统计读取失败" tone="error">{view.message || "操作未完成，请重试。"}</Notice>;
-    if (!report) return <Notice title="等待读取">筛选变化会隐藏上一范围的数据。确认范围后点击“读取统计”，不会自动查询其他账户。</Notice>;
+    if (!report) return <Notice title={view.kind === "idle" && view.message ? "已停止等待" : "等待读取"}>{view.kind === "idle" && view.message || "筛选变化会隐藏上一范围的数据。确认范围后点击“读取统计”，不会自动查询其他账户。"}</Notice>;
     if (report.status === "disabled") return (
       <Notice title="此账户的统计采集尚未开启" tone="warning">
         <p>统计采集尚未开启，添加读取权限不会自动启用采集。</p>
@@ -575,9 +598,17 @@ export default function StatsCenter({
             {ranges.map((range) => <option key={range.value} value={range.value}>{range.label}</option>)}
           </select>
         </label>
-        <button type="button" className="button primary scenter-read" disabled={accounts.length === 0 || Boolean(currentAccount?.needsCredentialMigration) || (currentAccount ? view.kind === "loading" : overview.kind === "loading")} onClick={() => void (currentAccount ? load(1) : loadAll())}>
+        <div className="scenter-read-actions">
+        <button type="button" className="button primary scenter-read" disabled={accounts.length === 0 || Boolean(currentAccount?.needsCredentialMigration || currentAccount?.needsTokenRecovery) || (currentAccount ? view.kind === "loading" : overview.kind === "loading")} onClick={() => void (currentAccount ? load(1) : loadAll())}>
           <ArrowClockwise size={15} aria-hidden="true" />{(currentAccount ? view.kind === "loading" : overview.kind === "loading") ? "正在读取…" : (currentAccount ? Boolean(report) : overview.kind === "complete") ? "刷新统计" : "读取统计"}
         </button>
+        {currentAccount && view.kind === "loading" && <button type="button" className="button ghost" onClick={() => {
+          requestSequence.current += 1;
+          readSession.current = undefined;
+          setKnownTotalLinks(null);
+          setView({kind:"idle",message:"已停止等待本次结果；当前网络请求可能仍在完成。重新读取会从第一页开始。"});
+        }}>停止等待</button>}
+        </div>
       </div>
       {visibleConfigurationError && (
         <div className="scenter-config-error" role="alert">
@@ -609,8 +640,8 @@ export default function StatsCenter({
         <div className="scenter-pagination" aria-label="统计结果分页">
           <span>当前本机短链接 {number(knownTotalLinks)} 条 · 第 {page} / {pageCount} 页</span>
           <div>
-            <button type="button" className="button ghost" aria-label="上一页统计" disabled={page <= 1} onClick={() => void load(page - 1)}><CaretLeft size={14} aria-hidden="true" />上一页</button>
-            <button type="button" className="button ghost" aria-label="下一页统计" disabled={page >= pageCount} onClick={() => void load(page + 1)}>下一页<CaretRight size={14} aria-hidden="true" /></button>
+            <button type="button" className="button ghost" aria-label="上一页统计" disabled={page <= 1} onClick={() => void load(page - 1, true)}><CaretLeft size={14} aria-hidden="true" />上一页</button>
+            <button type="button" className="button ghost" aria-label="下一页统计" disabled={page >= pageCount} onClick={() => void load(page + 1, true)}>下一页<CaretRight size={14} aria-hidden="true" /></button>
           </div>
         </div>
       )}
@@ -673,10 +704,11 @@ function AccountsOverview({ accounts, domains, links, days, overview, onSelect, 
   const range = ranges.find((item) => item.value === days)?.label;
   return <>
     {overview.kind === "idle" && <Notice title="选择范围，读取全部链接">点击“读取统计”，将依次读取各账户和全部短链接明细。未读取的数值显示为“—”。</Notice>}
-    {overview.stopped && <Notice title="已停止读取">已读取的数据保留，未读取的链接显示为“—”。点击“刷新统计”可重新读取。</Notice>}
+    {overview.stopped && <Notice title="已停止读取">已停止后续读取，当前网络请求可能仍在完成。已读取的数据保留，未读取的链接显示为“—”。点击“刷新统计”可重新读取。</Notice>}
     {overview.kind !== "idle" && <>
     <div className="scenter-overview-status" role="status">
-      已处理 {overview.completed} / {accounts.length} 个账户 · 可汇总 {ready.length} 个
+      <span>已处理 {overview.completed} / {accounts.length} 个账户 · 可汇总 {ready.length} 个</span>
+      {overview.kind === "loading" && overview.progress && <span>正在读取 {byAccount.get(overview.progress.accountId)?.label || "所选账户"} · 第 {overview.progress.page} / {overview.progress.pages} 页</span>}
       {overview.kind === "loading" && <button type="button" className="button ghost" onClick={onStop}>停止读取</button>}
     </div>
     {ready.length > 0 && aggregate && <section className="scenter-overview-summary" aria-label="全部账户估算汇总">

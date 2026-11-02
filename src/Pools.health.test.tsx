@@ -58,12 +58,12 @@ it('shows sync per account without mistaking saved configuration for a reachable
   const accounts=['a','b','c','d'].map(id=>({id,label:`备注 ${id}`,cloudflareName:`Example ${id}`,zoneCount:1,checkedAt:null,hasResources:true,needsSelftestKey:false}));
   render(<Pools pools={[pool]} accounts={accounts} linkCount={()=>1} onSave={async()=>true} onDelete={()=>{}} busy={false} health={{}} onCheckHealth={()=>{}} planOpen={false} savedRevision={0}/>);
   const sync=screen.getByRole('region',{name:'配置同步'});
-  expect(within(sync).getByText('Example a · 已同步配置')).toBeTruthy();
-  expect(within(sync).getByText(/Example b · 同步失败/)).toBeTruthy();
-  expect(within(sync).getByText('Example c · 同步结果待确认')).toBeTruthy();
-  expect(within(sync).getByText('Example d · 首次使用时自动同步')).toBeTruthy();
+  expect(within(sync).getByText('备注 a · 已同步配置')).toBeTruthy();
+  expect(within(sync).getByText(/备注 b · 同步失败/)).toBeTruthy();
+  expect(within(sync).getByText('备注 c · 同步结果待确认')).toBeTruthy();
+  expect(within(sync).getByText('备注 d · 首次使用时自动同步')).toBeTruthy();
   expect(screen.getByText('状态未知')).toBeTruthy();
   expect(screen.queryByText('各账户检测通过')).toBeNull();
-  expect(screen.queryByText('Example d · 已同步配置')).toBeNull();
+  expect(screen.queryByText('备注 d · 已同步配置')).toBeNull();
   expect(sync.textContent).toContain('配置已同步不代表网址已通过访问检测');
 });

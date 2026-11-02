@@ -34,3 +34,19 @@ it('shows the schedule and network limit, and keeps manual run gated',()=>{
   fireEvent.click(screen.getByRole('button',{name:/立即巡检/}));
   expect(onRun).toHaveBeenCalledTimes(1);
 });
+
+it('explains empty, offline, busy and incremental states and shows schedule, progress and attention',()=>{
+  const props={enabled:true,active:false,online:true,progress:{done:1,total:3},lastCompletion:'2026-10-17T00:00:00Z',onEnabled:vi.fn(),onRun:vi.fn(),disabled:false};
+  const {rerender}=render(<RedirectMonitor {...props} totalLinks={0}/>);
+  expect(screen.getByRole('status').textContent).toBe('等待添加短链接');
+  expect(screen.getByRole('button',{name:/立即巡检/}).hasAttribute('disabled')).toBe(true);
+  rerender(<RedirectMonitor {...props} totalLinks={3} online={false} nextCheckAt="2026-10-19T00:00:00Z"/>);
+  expect(screen.getByRole('status').textContent).toBe('等待网络连接');
+  expect(screen.getByText(/下次预计/).textContent).toContain('条件恢复后执行');
+  rerender(<RedirectMonitor {...props} disabled totalLinks={3}/>);
+  expect(screen.getByRole('status').textContent).toBe('当前操作结束后继续');
+  rerender(<RedirectMonitor {...props} active totalLinks={3} runKind="changed" summary={{alert:1,unresolved:1,attention:1}}/>);
+  expect(screen.getByRole('status').textContent).toContain('正在检查新增或修改的链接 1/3');
+  expect(screen.getByRole('progressbar').getAttribute('value')).toBe('1');
+  expect(screen.getByText('3 条需关注')).toBeTruthy();
+});

@@ -1,5 +1,5 @@
 export type Zone = { id: string; name: string; status: string };
-export type Account = { id: string; label: string; cloudflareName?: string; zones?: Zone[]; zoneCount: number; checkedAt: string | null; hasResources: boolean; needsSelftestKey: boolean; needsCredentialMigration?: boolean; needsMonitorKey?:boolean; monitorEnabled?: boolean; monitorEndpoint?: string };
+export type Account = { id: string; label: string; cloudflareName?: string; zones?: Zone[]; zoneCount: number; checkedAt: string | null; hasResources: boolean; needsSelftestKey: boolean; needsCredentialMigration?: boolean; needsTokenRecovery?: boolean; needsMonitorKey?:boolean; monitorEnabled?: boolean; monitorEndpoint?: string };
 export type Domain = { id: string; accountId: string; zoneId: string; host: string; prefix: string; routeId: string };
 export type Link = { domainId: string; slug: string; cnUrl: string; defaultUrl: string; updated: string; poolId?: string; code?: string };
 export type PendingAction = {kind:'resume_pool_sync'|'delete_pool'|'resume_monitor'|'resume_selftest_rotation'|'recover_selftest_rotation'|'recover_selftest_resources'|'resume_worker_upgrade';poolId:string|null;accountId:string|null;label:string};
@@ -10,8 +10,10 @@ export type DomainCheck = Check & { level?: 'pass' | 'warning' | 'error'; reason
 export type DomainPreparation = { host: string; prefix: string; dnsMode?: 'system' | 'public'; candidates: { accountId: string; label: string; zoneId: string; status: string }[]; checks: DomainCheck[]; canApply: boolean; plan?: Plan };
 export type DomainDnsPreparation = { host: string; candidates: { accountId: string; label: string; zoneId: string; status: string }[]; checks: DomainCheck[]; dnsStatus: 'ready'|'missing'|'dnsOnly'|'unsupported'|'conflict'|'readFailed'; actions: { kind: 'createPlaceholder'|'enableProxy'; recordType: string; name: string }[]; canApply: boolean; plan?: Plan };
 export type Selftest = { status: 'passed' | 'pending' | 'failed' | 'key_missing'; message: string; checks: (Check & {reason?: string})[] };
+export type UpdateProgress = {phase:'checking'|'downloading'|'verifying'|'installing'};
+export type UpdateCancellation = {status:'cancel_requested';message:string};
 export type UpdateStatus = { status: 'unavailable' | 'up_to_date' | 'available' | 'installed'; currentVersion?: string; version?: string; notes?: string };
-export type Action = 'get_state' | 'token_template' | 'import_token' | 'rename_account' | 'remove_account' | 'refresh_accounts' | 'refresh_domains' | 'prepare_domain' | 'prepare_domain_dns' | 'prepare_change' | 'apply_plan' | 'selftest_link' | 'export_config' | 'import_config' | 'check_update' | 'install_update' | 'prepare_monitor' | 'disable_monitor' | 'resume_monitor' | 'check_link_targets' | 'check_pool_health' | 'get_link_stats' | 'get_stats_center' | 'get_click_protection' | 'check_link_redirect';
+export type Action = 'get_state' | 'token_template' | 'import_token' | 'rename_account' | 'remove_account' | 'refresh_accounts' | 'refresh_domains' | 'prepare_domain' | 'prepare_domain_dns' | 'prepare_change' | 'apply_plan' | 'selftest_link' | 'export_config' | 'import_config' | 'check_update' | 'install_update' | 'cancel_update' | 'prepare_monitor' | 'disable_monitor' | 'resume_monitor' | 'check_link_targets' | 'check_pool_health' | 'get_link_stats' | 'get_stats_center' | 'get_click_protection' | 'check_link_redirect';
 export type RedirectCheck = {status:'passed'|'failed'|'unknown';message:string;reason?:string;checkedAt:string;dnsMode:'system'|'public'};
 
 export type ClickStatsDays = 1 | 7 | 30;
@@ -30,6 +32,7 @@ export type ClickStats = {
 };
 export type StatsCenterRow = {domainId: string; slug: string; totals: ClickStatsTotals};
 export type StatsCenterReport = {
+  readSessionId?: string;
   status: ClickStatsStatus;
   message: string;
   accountId: string;
