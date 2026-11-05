@@ -14,6 +14,10 @@
 
 .redirect-monitor-title h2{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
 .redirect-monitor-count{font-size:11px;font-weight:600;color:#8a5b19;background:#fff4df;border-radius:12px;padding:3px 8px}
+.redirect-monitor-result{display:flex;align-items:center;gap:6px;margin:12px 0 0;color:#536b59;font-size:12px;font-weight:600;line-height:1.5}
+.redirect-monitor-result svg{flex-shrink:0}
+.redirect-monitor-result.healthy{color:#237248}
+.redirect-monitor-result.attention,.redirect-monitor-result.stale{color:#8a5b19}
 .redirect-monitor-meta [role="status"]{font-weight:600;color:#355d45}
 .redirect-monitor-progress{display:block;width:100%;height:5px;margin-top:10px;accent-color:#267248;border:0;border-radius:6px;overflow:hidden}
 .redirect-monitor-progress::-webkit-progress-bar{background:#e5eee7}

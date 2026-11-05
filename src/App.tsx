@@ -213,6 +213,8 @@ export default function App() {
   }
   const [filter, setFilter] = useState("all");
   const [attentionOnly, setAttentionOnly] = useState(false);
+  const [attentionViewRequest, setAttentionViewRequest] = useState(0);
+  const linkListHeadingRef = useRef<HTMLHeadingElement>(null);
   const [linkDraft, setLinkDraft] = useState<LinkDraft | null>(null);
   const [originalSlug, setOriginalSlug] = useState<string | null>(null);
   const [copySource, setCopySource] = useState<{domainId: string; slug: string} | null>(null);
@@ -391,6 +393,12 @@ export default function App() {
   useEffect(() => {
     if (mainRef.current) mainRef.current.scrollTop = 0;
   }, [page]);
+  useEffect(() => {
+    if (attentionViewRequest === 0) return;
+    const heading = linkListHeadingRef.current;
+    heading?.focus({preventScroll: true});
+    heading?.scrollIntoView({block: "start"});
+  }, [attentionViewRequest]);
   useEffect(() => {
     const now = Date.now();
     const expiry = Math.min(...[
@@ -2157,7 +2165,7 @@ export default function App() {
           </div>
         </div>
         <div className="content">
-          {redirectMonitor.enabled && monitorBannerText(redirectMonitor.summary) && <section className="update-banner redirect-monitor-banner" aria-label="自动巡检提醒" role="status"><WarningCircle size={22} weight="fill" aria-hidden="true"/><div><strong>{monitorBannerText(redirectMonitor.summary)}</strong><p>打开短链接列表查看每条链接的首跳结果。</p></div><button type="button" className="button secondary" onClick={() => {setPage('links');setAttentionOnly(true);setSearch('');setFilter('all');}}>查看需关注</button></section>}
+          {redirectMonitor.enabled && monitorBannerText(redirectMonitor.summary) && <section className="update-banner redirect-monitor-banner" aria-label="自动巡检提醒" role="status"><WarningCircle size={22} weight="fill" aria-hidden="true"/><div><strong>{monitorBannerText(redirectMonitor.summary)}</strong><p>打开短链接列表查看每条链接的首跳结果。</p></div><button type="button" className="button secondary" onClick={() => {setPage('links');setAttentionOnly(true);setSearch('');setFilter('all');setAttentionViewRequest(value => value + 1);}}>查看需关注</button></section>}
           {updates.available && dismissedUpdate !== updates.available.version && (
             <section className="update-banner" aria-label="新版本提醒">
               <WarningCircle size={22} weight="fill" aria-hidden="true" />
@@ -2394,7 +2402,7 @@ export default function App() {
             />
           ) : page === "links" ? (
             <>
-              <RedirectMonitor ready={redirectMonitor.ready} nextCheckAt={redirectMonitor.nextCheckAt} runKind={redirectMonitor.runKind} pendingChanges={redirectMonitor.pendingChanges} totalLinks={redirectMonitor.totalLinks} summary={redirectMonitor.summary} enabled={redirectMonitor.enabled} active={redirectMonitor.active} online={redirectMonitor.online} progress={redirectMonitor.progress} lastCompletion={redirectMonitor.lastCompletion} onEnabled={(value) => {if (!value) setAttentionOnly(false);redirectMonitor.setEnabled(value);}} onRun={redirectMonitor.runNow} disabled={busy || loading || updates.checking || !!updateStatus}/>
+              <RedirectMonitor ready={redirectMonitor.ready} nextCheckAt={redirectMonitor.nextCheckAt} runKind={redirectMonitor.runKind} pendingChanges={redirectMonitor.pendingChanges} totalLinks={redirectMonitor.totalLinks} summary={redirectMonitor.summary} resultStatus={redirectMonitor.resultStatus} enabled={redirectMonitor.enabled} active={redirectMonitor.active} online={redirectMonitor.online} progress={redirectMonitor.progress} lastCompletion={redirectMonitor.lastCompletion} onEnabled={(value) => {if (!value) setAttentionOnly(false);redirectMonitor.setEnabled(value);}} onRun={redirectMonitor.runNow} disabled={busy || loading || updates.checking || !!updateStatus}/>
               <div className="metric-row">
                 <div className="metric">
                   <span>全部链接</span>
@@ -2416,10 +2424,10 @@ export default function App() {
                 <div className="panel-head">
                   <div>
                     <p className="eyebrow">DESTINATIONS</p>
-                    <h2>
-                      全部链接{" "}
+                    <h2 ref={linkListHeadingRef} tabIndex={-1} className="link-list-heading">
+                      {attentionOnly ? "需关注链接" : "全部链接"}{" "}
                       <span className="heading-count">
-                        {state.links.length}
+                        {attentionOnly ? groups.reduce((count, group) => count + group.links.length, 0) : state.links.length}
                       </span>
                     </h2>
                   </div>

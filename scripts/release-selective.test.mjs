@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import YAML from 'yaml';
@@ -22,12 +22,33 @@ const TEST_SIGNATURE = signer.sign(Buffer.from('test'));
 const TEST_ARCHIVE = pack(bundleEntries());
 const TEST_ARCHIVE_SIGNATURE = signer.sign(TEST_ARCHIVE);
 const TEST_PUBLIC_KEY_SHA256 = updaterPublicKeySha256(TEST_PUBLIC_KEY);
+const MAC_TARGETS = ['aarch64-apple-darwin', 'x86_64-apple-darwin'];
+const WINDOWS_TARGET = 'x86_64-pc-windows-msvc';
 function fixture(version = '0.1.1') {
   const dir = mkdtempSync(join(tmpdir(), 'release-selective-'));
   writeFileSync(join(dir, 'package.json'), JSON.stringify({ version, type: 'module' }));
   return dir;
 }
 function put(path, value) { mkdirSync(resolve(path, '..'), { recursive: true }); writeFileSync(path, value); }
+// Synthetic native records exercise the strict assembler with signed bytes. They are not native verification.
+function putSyntheticHostedCandidate(dir, target, tag, sha) {
+  const base = join(dir, 'candidates', `candidate-${target}`);
+  const mac = MAC_TARGETS.includes(target);
+  const installer = join(base, mac ? 'dmg' : 'nsis', mac ? 'Example.dmg' : 'Example-setup.exe');
+  const updater = mac ? join(base, 'macos', 'Example.app.tar.gz') : installer;
+  put(installer, `installer-${target}`); put(updater, mac ? TEST_ARCHIVE : 'test');
+  put(`${updater}.sig`, mac ? TEST_ARCHIVE_SIGNATURE : TEST_SIGNATURE);
+  put(join(base, 'native-smoke.json'), JSON.stringify({ schema: 1, tag, sha, target,
+    host: target === MAC_TARGETS[0] ? 'darwin-arm64' : target === MAC_TARGETS[1] ? 'darwin-x64' : 'win32-x64',
+    processAlive: true, updaterSignaturePresent: true, updaterSignatureVerified: true,
+    updaterSignature: `${updater.split('/').at(-1)}.sig`, updaterSignatureSha256: digest(`${updater}.sig`),
+    updaterPublicKeySha256: TEST_PUBLIC_KEY_SHA256, architectureVerified: true,
+    signatureVerified: mac ? true : null, windowObserved: mac ? null : true,
+    installer: installer.split('/').at(-1), installerSha256: digest(installer),
+    ...(mac ? { nativeSigning, macArtifacts: artifactEvidence(readMacUpdater(updater).manifest) } : {}),
+    updater: updater.split('/').at(-1), updaterSha256: digest(updater) }));
+  return base;
+}
 // Assembly fixture only: the native checker, not these unit tests, observes Windows.
 function putSyntheticWindowsUpgrade(base, tag, sha, installer) {
   const startup = { processAlive: true, windowObserved: true, startupSeconds: 2,
@@ -54,7 +75,13 @@ test('dispatch selection defaults to Windows and preserves explicit native targe
     const git = (...args) => execFileSync('git', args, { cwd: dir, stdio: 'pipe' });
     git('init', '-q'); git('config', 'user.name', 'Example'); git('config', 'user.email', 'example@example.org');
     git('add', '.'); git('commit', '-qm', 'fixture'); git('tag', 'v0.1.1');
-    for (const [target, expected] of [[undefined, ['x86_64-pc-windows-msvc']], ['mac-arm', ['aarch64-apple-darwin']], ['windows-intel', ['x86_64-pc-windows-msvc', 'x86_64-apple-darwin']], ['all', ['aarch64-apple-darwin', 'x86_64-apple-darwin', 'x86_64-pc-windows-msvc']]]) {
+    const runners = { [MAC_TARGETS[0]]: 'macos-15', [MAC_TARGETS[1]]: 'macos-15-intel', [WINDOWS_TARGET]: 'windows-2022' };
+    for (const [target, expected] of [
+      [undefined, [WINDOWS_TARGET]], ['windows', [WINDOWS_TARGET]],
+      ['mac-arm', [MAC_TARGETS[0]]], ['mac-intel', [MAC_TARGETS[1]]],
+      ['windows-intel', [WINDOWS_TARGET, MAC_TARGETS[1]]], ['mac', MAC_TARGETS],
+      ['all', [...MAC_TARGETS, WINDOWS_TARGET]],
+    ]) {
       const output = join(dir, 'output');
       writeFileSync(output, '');
       const run = spawnSync(process.execPath, [join(root, 'scripts/release-config.mjs'), '--validate-tag'], {
@@ -63,6 +90,7 @@ test('dispatch selection defaults to Windows and preserves explicit native targe
       assert.equal(run.status, 0, run.stderr);
       const builds = JSON.parse(readFileSync(output, 'utf8').match(/^builds=(.+)$/m)[1]);
       assert.deepEqual(builds.map(build => build.target), expected);
+      assert.deepEqual(builds.map(build => build.os), expected.map(item => runners[item]));
       assert.deepEqual(builds.map(build => build.bundles), expected.map(item => item.includes('windows') ? 'nsis' : 'app,dmg'));
     }
     const invalid = spawnSync(process.execPath, [join(root, 'scripts/release-config.mjs'), '--validate-tag'], {
@@ -106,24 +134,9 @@ test('strict assembly checks source and artifact hashes and includes latest.json
     git('init', '-q'); git('config', 'user.name', 'Example'); git('config', 'user.email', 'example@example.org');
     git('add', '.'); git('commit', '-qm', 'fixture'); git('tag', 'v0.1.6');
     const sha = git('rev-parse', 'HEAD');
-    for (const target of ['aarch64-apple-darwin', 'x86_64-apple-darwin', 'x86_64-pc-windows-msvc']) {
-      const base = join(dir, 'candidates', `candidate-${target}`);
-      const mac = target.includes('apple');
-      const installer = join(base, mac ? 'dmg' : 'nsis', mac ? 'Example.dmg' : 'Example-setup.exe');
-      const updater = mac ? join(base, 'macos', 'Example.app.tar.gz') : installer;
-      put(installer, `installer-${target}`); put(updater, mac ? TEST_ARCHIVE : 'test');
-      put(`${updater}.sig`, mac ? TEST_ARCHIVE_SIGNATURE : TEST_SIGNATURE);
-      if (!mac) put(join(base, 'msi', 'Example.msi'), 'unverified alternate installer');
-      put(join(base, 'native-smoke.json'), JSON.stringify({ schema: 1, tag: 'v0.1.6', sha, target,
-        host: target === 'aarch64-apple-darwin' ? 'darwin-arm64' : target === 'x86_64-apple-darwin' ? 'darwin-x64' : 'win32-x64',
-        processAlive: true, updaterSignaturePresent: true, updaterSignatureVerified: true,
-        updaterSignature: `${updater.split('/').at(-1)}.sig`, updaterSignatureSha256: digest(`${updater}.sig`),
-        updaterPublicKeySha256: TEST_PUBLIC_KEY_SHA256, architectureVerified: true,
-        signatureVerified: mac ? true : null, windowObserved: mac ? null : true,
-        installer: installer.split('/').at(-1), installerSha256: digest(installer),
-        ...(mac ? { nativeSigning, macArtifacts: artifactEvidence(readMacUpdater(updater).manifest) } : {}),
-        updater: updater.split('/').at(-1), updaterSha256: digest(updater) }));
-    }
+    for (const target of MAC_TARGETS) putSyntheticHostedCandidate(dir, target, 'v0.1.6', sha);
+    const windowsBase = putSyntheticHostedCandidate(dir, WINDOWS_TARGET, 'v0.1.6', sha);
+    put(join(windowsBase, 'msi', 'Example.msi'), 'unverified alternate installer');
     const run = (extraEnv = {}) => spawnSync(process.execPath, [join(root, 'scripts/release-manifest.mjs'), 'candidates', '--require-evidence'], {
       cwd: dir, encoding: 'utf8', env: { ...process.env, RELEASE_TAG: 'v0.1.6', RELEASE_SHA: sha,
         GITHUB_REPOSITORY: 'sample/short-link-generator', SLG_UPDATER_PUBLIC_KEY: TEST_PUBLIC_KEY, SLG_MACOS_CERT_SHA256: CERT_PIN,
@@ -131,7 +144,6 @@ test('strict assembly checks source and artifact hashes and includes latest.json
     });
     assert.match(run().stderr, /Missing exact Windows upgrade evidence/);
     assert.equal(existsSync(join(dir, 'latest.json')), false);
-    const windowsBase = join(dir, 'candidates', 'candidate-x86_64-pc-windows-msvc');
     putSyntheticWindowsUpgrade(windowsBase, 'v0.1.6', sha, join(windowsBase, 'nsis', 'Example-setup.exe'));
     assert.equal(run().status, 0);
     const windowsUpgradeEvidence = join(windowsBase, 'windows-upgrade-smoke.json');
@@ -221,6 +233,71 @@ test('strict assembly checks source and artifact hashes and includes latest.json
     const bad = join(dir, 'candidates', 'candidate-aarch64-apple-darwin', 'native-smoke.json');
     const evidence = JSON.parse(readFileSync(bad, 'utf8')); evidence.sha = 'b'.repeat(40); put(bad, JSON.stringify(evidence));
     assert.notEqual(run().status, 0);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('Mac-only assembly requires both signed Mac candidates and rejects mixed inputs', () => {
+  const dir = fixture('0.1.6');
+  try {
+    const git = (...args) => execFileSync('git', args, { cwd: dir, stdio: 'pipe', encoding: 'utf8' }).trim();
+    git('init', '-q'); git('config', 'user.name', 'Example'); git('config', 'user.email', 'example@example.org');
+    git('add', '.'); git('commit', '-qm', 'fixture'); git('tag', 'v0.1.6');
+    const sha = git('rev-parse', 'HEAD');
+    const [arm, intel] = MAC_TARGETS.map(target => putSyntheticHostedCandidate(dir, target, 'v0.1.6', sha));
+    const run = (...args) => spawnSync(process.execPath, [join(root, 'scripts/release-manifest.mjs'), 'candidates', ...args], {
+      cwd: dir, encoding: 'utf8', env: { ...process.env, RELEASE_TAG: 'v0.1.6', RELEASE_SHA: sha,
+        GITHUB_REPOSITORY: 'sample/short-link-generator', SLG_UPDATER_PUBLIC_KEY: TEST_PUBLIC_KEY, SLG_MACOS_CERT_SHA256: CERT_PIN,
+        SLG_MACOS_HELPER_TREE_SHA256_ARM64: HELPER_TREE_PIN, SLG_MACOS_HELPER_TREE_SHA256_X64: HELPER_TREE_PIN },
+    });
+    const macOnly = () => run('--require-evidence', '--platforms=macos');
+    assert.match(run('--require-evidence').stderr, /Missing unique native startup evidence for x86_64-pc-windows-msvc/);
+    for (const [base, target] of [[arm, MAC_TARGETS[0]], [intel, MAC_TARGETS[1]]]) {
+      const held = join(dir, 'held');
+      renameSync(base, held);
+      assert.match(macOnly().stderr, new RegExp(`Missing unique native startup evidence for ${target}`));
+      renameSync(held, base);
+    }
+    const windows = putSyntheticHostedCandidate(dir, WINDOWS_TARGET, 'v0.1.6', sha);
+    assert.match(macOnly().stderr, /only the two macOS candidate folders/);
+    rmSync(windows, { recursive: true });
+    const extra = join(arm, 'macos', 'Unexpected.msi');
+    put(extra, 'unreviewed alternate installer');
+    assert.match(macOnly().stderr, /Unreviewed Mac-only candidate file/);
+    rmSync(extra);
+    const signature = join(intel, 'macos', 'Example.app.tar.gz.sig');
+    put(signature, 'broken signature');
+    assert.notEqual(macOnly().status, 0);
+    put(signature, TEST_ARCHIVE_SIGNATURE);
+    for (const args of [
+      ['--platforms=macos'], ['--require-evidence', '--platforms=windows'],
+      ['--require-evidence', '--platforms=macos', '--platforms=all'],
+      ['--require-evidence', '--platforms'], ['--require-evidence', '--platform=macos'],
+      ['--require-evidence', 'second-directory', '--platforms=macos'],
+    ]) assert.notEqual(run(...args).status, 0, args.join(' '));
+    assert.equal(existsSync(join(dir, 'latest.json')), false);
+    assert.equal(existsSync(join(dir, 'release-assets')), false);
+
+    // Real build artifacts include Tauri's staging files; they must not be published.
+    put(join(arm, 'dmg', 'bundle_dmg.sh'), 'fixture support script');
+    put(join(arm, 'dmg', 'icon.icns'), 'fixture icon');
+    put(join(intel, 'share', 'create-dmg', 'support', 'template.applescript'), 'fixture DMG template');
+    put(join(intel, 'macos', 'Example.app', 'Contents', 'Info.plist'), 'fixture build app');
+    const stale = join(dir, 'release-assets', 'previous_windows-x86_64.exe');
+    put(stale, 'stale installer');
+    assert.match(macOnly().stderr, /needs an empty release-assets directory/);
+    rmSync(stale);
+    const result = macOnly();
+    assert.equal(result.status, 0, result.stderr);
+    const manifest = JSON.parse(readFileSync(join(dir, 'latest.json'), 'utf8'));
+    assert.deepEqual(Object.keys(manifest.platforms), ['darwin-aarch64', 'darwin-x86_64']);
+    const expectedAssets = Object.keys(manifest.platforms).flatMap(platform =>
+      ['.dmg', '.app.tar.gz', '.app.tar.gz.sig'].map(suffix => `short-link-generator_0.1.6_${platform}${suffix}`));
+    assert.deepEqual(readdirSync(join(dir, 'release-assets')).sort(), expectedAssets.toSorted());
+    const uploads = JSON.parse(readFileSync(join(dir, 'release-assets.json'), 'utf8'));
+    assert.deepEqual(uploads, [...expectedAssets.map(name => join('release-assets', name)), 'latest.json', 'SHA256SUMS']);
+    const sums = readFileSync(join(dir, 'SHA256SUMS'), 'utf8').trimEnd().split('\n');
+    assert.deepEqual(sums, uploads.filter(path => !path.endsWith('.sig') && path !== 'SHA256SUMS')
+      .map(path => `${digest(join(dir, path))}  ${path.split('/').at(-1)}`));
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
@@ -425,9 +502,12 @@ test('release workflow is manual, selective, and scans before one-day upload', (
   const release = YAML.parse(readFileSync('.github/workflows/release.yml', 'utf8'));
   assert.deepEqual(Object.keys(release.on), ['workflow_dispatch']);
   assert.equal(release.on.workflow_dispatch.inputs.target.default, 'windows');
-  assert.deepEqual(release.on.workflow_dispatch.inputs.target.options, ['windows', 'mac-arm', 'mac-intel', 'windows-intel', 'all']);
+  const targets = release.on.workflow_dispatch.inputs.target.options;
+  assert.deepEqual(targets, ['windows', 'mac-arm', 'mac-intel', 'windows-intel', 'mac', 'all']);
   assert.match(release.jobs.build.strategy.matrix.include, /fromJSON\(needs.prepare.outputs.builds\)/);
-  assert.equal(release.jobs.draft.if, "inputs.target == 'all'");
+  const drafts = Function('inputs', `return (${release.jobs.draft.if})`);
+  assert.deepEqual(targets.filter(target => drafts({ target })), ['mac', 'all']);
+  assert.deepEqual(release.jobs.draft.needs, ['prepare', 'build']);
   const steps = release.jobs.build.steps;
   const smoke = steps.findIndex(step => step.name?.includes('startup') || step.name?.includes('Install and launch'));
   const scan = steps.findIndex(step => step.name?.includes('Inspect candidate'));
@@ -480,5 +560,8 @@ test('release workflow is manual, selective, and scans before one-day upload', (
   assert.equal(assemble.env.SLG_MACOS_CERT_SHA256, '${{ vars.MACOS_SIGNING_CERT_SHA256 }}');
   assert.equal(assemble.env.SLG_MACOS_HELPER_TREE_SHA256_ARM64, '${{ vars.MACOS_HELPER_TREE_SHA256_ARM64 }}');
   assert.equal(assemble.env.SLG_MACOS_HELPER_TREE_SHA256_X64, '${{ vars.MACOS_HELPER_TREE_SHA256_X64 }}');
+  assert.equal(assemble.run, "node scripts/release-manifest.mjs candidates --require-evidence ${{ inputs.target == 'mac' && '--platforms=macos' || '' }}");
+  assert.equal(release.jobs.draft.steps.at(-1).run, 'node scripts/publish-draft.mjs');
+  assert.match(readFileSync(join(root, 'scripts/publish-draft.mjs'), 'utf8'), /'--verify-tag','--draft'/);
   assert.equal(existsSync('.github/workflows/release.yml'), true);
 });

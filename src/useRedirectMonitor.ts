@@ -13,6 +13,7 @@ type Phase = 'healthy' | 'pending' | 'alert' | 'attention';
 export type MonitorRecord = { identity:string; phase:Phase; checkedAt:string; message:string; dnsMode:'system'|'public'; failures:number; unresolvedAlert:boolean };
 export type VisibleMonitorRecord = MonitorRecord & { stale:boolean };
 export type MonitorSummary = {alert:number;unresolved:number;attention:number};
+export type MonitorResultStatus = 'healthy' | 'attention' | 'stale' | 'unverified';
 type CheckFn = (domainId:string, slug:string) => Promise<RedirectCheck>;
 type Options = {state:State; paused:boolean; ready:boolean; check?:CheckFn};
 type RunKind = 'full' | 'changed' | 'confirm';
@@ -71,6 +72,11 @@ export function useRedirectMonitor({state,paused,ready,check = defaultCheck}:Opt
   const [runKind,setRunKind] = useState<RunKind>('full');
   const [progress,setProgress] = useState({done:0,total:0});
   const [lastCompletion,setLastCompletion] = useState<string|null>(readCompletion);
+  const restoredSuccess = useRef(lastCompletion);
+  const restoredAge = useRef(lastCompletion ? Math.max(0,Date.now() - Date.parse(lastCompletion)) : Infinity);
+  const incompleteRound = useRef(false);
+  const roundRemaining = useRef(new Map<string,string>());
+  const busyResults = useRef(new Set<string>());
   const [clockView,setClockView] = useState({elapsed:0,wall:Date.now()});
   const clock = useRef({elapsed:0,wall:Date.now(),monotonic:performance.now()});
   const indexed = useMemo(() => indexState(state),[state.links,state.domains,state.pools]);
@@ -146,8 +152,9 @@ export function useRedirectMonitor({state,paused,ready,check = defaultCheck}:Opt
     }
     if (!mounted.current || !gateRef.current.enabled || revision.current !== runRevision || requestSequence.current[key] !== seq || currentIdentity(key) !== expectedIdentity) return null;
     if (!validReport(result)) result = {status:'unknown',message:'巡检返回内容无效。',reason:'invalid_report',checkedAt:new Date().toISOString(),dnsMode:'system'};
-    if (result.status !== 'passed') writeCompletion(null);
+    if (result.status !== 'passed') { writeCompletion(null); restoredSuccess.current = null; }
     if (result.reason === 'busy') {
+      busyResults.current.add(key);
       clearConfirmation(key);
       if ((busyRetries.current[key] || 0) < 1) {
         busyRetries.current[key] = 1;
@@ -155,6 +162,7 @@ export function useRedirectMonitor({state,paused,ready,check = defaultCheck}:Opt
       }
       return false;
     }
+    busyResults.current.delete(key);
     busyRetries.current[key] = 0;
     const previous = recordsRef.current[key];
     const same = previous?.identity === expectedIdentity ? previous : undefined;
@@ -201,6 +209,9 @@ export function useRedirectMonitor({state,paused,ready,check = defaultCheck}:Opt
       const items = full ? [...indexRef.current].map(([key,item]) => [key,item.identity] as const) : [...changed.current];
       if (!items.length) return;
       if (full) {
+        incompleteRound.current = true;
+        roundRemaining.current = new Map(items);
+        restoredSuccess.current = null;
         dueAt.current = sampleClock().elapsed + MONITOR_INTERVAL_MS;
         writeCompletion(null);
         busyRetries.current = {};
@@ -217,6 +228,7 @@ export function useRedirectMonitor({state,paused,ready,check = defaultCheck}:Opt
         if (!canStart() || revision.current !== cycleRevision) { if (full) dueAt.current = 0; break; }
         setRunKind(full ? 'full' : 'changed');
         const passed = await checkOne(key,identity,false);
+        if (passed !== null && currentIdentity(key) === identity && roundRemaining.current.get(key) === identity) roundRemaining.current.delete(key);
         allPassed = allPassed && passed === true;
         if (changed.current.get(key) === identity && (passed !== null || currentIdentity(key) !== identity)) changed.current.delete(key);
         if (!canStart() || revision.current !== cycleRevision) { if (full) dueAt.current = 0; break; }
@@ -225,15 +237,23 @@ export function useRedirectMonitor({state,paused,ready,check = defaultCheck}:Opt
         if (done < items.length) await new Promise<void>(resolve => window.setTimeout(resolve,SPACING_MS));
       }
       if (full && done === items.length && canStart() && revision.current === cycleRevision && scopeRevision.current === cycleScope) {
+        incompleteRound.current = false;
         const completedAt = new Date().toISOString();
         setLastCompletion(completedAt);
         dueAt.current = sampleClock().elapsed + MONITOR_INTERVAL_MS;
         const allHealthy = allPassed && confirmations.current.size === 0 && changed.current.size === 0 && items.every(([key,identity]) => {
           const record = recordsRef.current[key];
-          return currentIdentity(key) === identity && record?.identity === identity && record.phase === 'healthy';
+          const time = recordTimes.current.get(key);
+          const now = sampleClock();
+          return currentIdentity(key) === identity && record?.identity === identity && record.phase === 'healthy' &&
+            Date.parse(record.checkedAt) <= now.wall && !!time && time.age + Math.max(0,now.elapsed - time.at) <= STALE_AFTER_MS;
         });
         writeCompletion(allHealthy ? completedAt : null);
       }
+      if (done === items.length && canStart() && revision.current === cycleRevision &&
+          roundRemaining.current.size === 0 && changed.current.size === 0 &&
+          previousScope.current?.size === indexRef.current.size &&
+          [...indexRef.current].every(([key,item]) => previousScope.current?.get(key)?.identity === item.identity)) incompleteRound.current = false;
     } finally {
       running.current = false;
       if (mounted.current) { setActive(false); setClockView(sampleClock()); }
@@ -244,6 +264,10 @@ export function useRedirectMonitor({state,paused,ready,check = defaultCheck}:Opt
   const setEnabled = useCallback((value:boolean) => {
     writePreference(value);
     if (!value) {
+      restoredSuccess.current = null;
+      incompleteRound.current = false;
+      roundRemaining.current.clear();
+      busyResults.current.clear();
       writeCompletion(null);
       revision.current++;
       for (const key of [...confirmations.current.keys()]) clearConfirmation(key);
@@ -288,14 +312,20 @@ export function useRedirectMonitor({state,paused,ready,check = defaultCheck}:Opt
     if (previous) {
       scopeChanged = previous.size !== indexed.size || [...indexed].some(([key,item]) => previous.get(key)?.identity !== item.identity);
       if (scopeChanged) {
+        restoredSuccess.current = null;
         scopeRevision.current++;
         writeCompletion(null);
+        if (incompleteRound.current) {
+          for (const [key,identity] of roundRemaining.current) if (indexed.get(key)?.identity !== identity) roundRemaining.current.delete(key);
+          for (const [key,item] of indexed) if (previous.get(key)?.identity !== item.identity) roundRemaining.current.set(key,item.identity);
+        }
         if (enabled) for (const [key,item] of indexed) if (previous.get(key)?.identity !== item.identity) changed.current.set(key,item.identity);
       }
     }
     for (const [key,item] of confirmations.current) if (currentIdentity(key) !== item.identity) clearConfirmation(key);
     for (const [key,identity] of changed.current) if (currentIdentity(key) !== identity) changed.current.delete(key);
     for (const [key,item] of recordTimes.current) if (currentIdentity(key) !== item.identity) recordTimes.current.delete(key);
+    for (const key of busyResults.current) if (!indexed.has(key) || previous?.get(key)?.identity !== indexed.get(key)?.identity) busyResults.current.delete(key);
     const next = Object.fromEntries(Object.entries(recordsRef.current).filter(([key,item]) => currentIdentity(key) === item.identity));
     if (Object.keys(next).length !== Object.keys(recordsRef.current).length) { recordsRef.current = next; setRecords(next); }
     if (scopeChanged && enabled) void drainRef.current();
@@ -325,7 +355,20 @@ export function useRedirectMonitor({state,paused,ready,check = defaultCheck}:Opt
     }
     return sum;
   },[records,indexed,enabled,clockView]);
+  const scopePending = previousScope.current !== null && (previousScope.current.size !== indexed.size ||
+    [...indexed].some(([key,item]) => previousScope.current?.get(key)?.identity !== item.identity));
+  let resultStatus:MonitorResultStatus = 'unverified';
+  if (enabled && ready && indexed.size && !active && !running.current && !scopePending && !changed.current.size && !incompleteRound.current) {
+    const current = [...indexed].map(([key,item]) => ({key,item,record:records[key],time:recordTimes.current.get(key)}));
+    if (current.some(({record,item}) => record?.identity === item.identity && record.phase !== 'healthy')) resultStatus = 'attention';
+    else if (!busyResults.current.size && current.every(({record,item}) => record?.identity === item.identity && record.phase === 'healthy')) {
+      resultStatus = current.some(({record,time}) => !time || Date.parse(record!.checkedAt) > clockView.wall || time.age + Math.max(0,clockView.elapsed - time.at) > STALE_AFTER_MS) ? 'stale' : 'healthy';
+    } else if (!busyResults.current.size && !current.some(({record}) => record) && restoredSuccess.current && !confirmations.current.size) {
+      const timestamp = Date.parse(restoredSuccess.current);
+      resultStatus = timestamp > clockView.wall ? 'unverified' : Math.max(clockView.wall - timestamp,restoredAge.current + clockView.elapsed) > STALE_AFTER_MS ? 'stale' : 'healthy';
+    }
+  }
   const nextDue = Math.min(changed.current.size ? clockView.elapsed : Infinity,dueAt.current,...[...confirmations.current.values()].map(item => item.due));
   const nextCheckAt = enabled && indexed.size > 0 ? new Date(clockView.wall + Math.max(0,nextDue - clockView.elapsed)).toISOString() : null;
-  return {enabled,setEnabled,runNow,active,runKind,progress,lastCompletion,nextCheckAt,getRecord,summary,online:isOnline(),ready,pendingChanges:changed.current.size,totalLinks:indexed.size};
+  return {enabled,setEnabled,runNow,active,runKind,progress,lastCompletion,nextCheckAt,getRecord,summary,resultStatus,online:isOnline(),ready,pendingChanges:changed.current.size,totalLinks:indexed.size};
 }

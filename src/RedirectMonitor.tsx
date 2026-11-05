@@ -1,5 +1,5 @@
-import { ArrowClockwise, WarningCircle } from '@phosphor-icons/react';
-import type { MonitorSummary, VisibleMonitorRecord } from './useRedirectMonitor';
+import { ArrowClockwise, CheckCircle, WarningCircle } from '@phosphor-icons/react';
+import type { MonitorResultStatus, MonitorSummary, VisibleMonitorRecord } from './useRedirectMonitor';
 import './RedirectMonitor.css';
 
 export function monitorDisplay(record:VisibleMonitorRecord|null) {
@@ -36,6 +36,7 @@ type Props = {
   pendingChanges?:number;
   totalLinks?:number;
   summary?:MonitorSummary;
+  resultStatus?:MonitorResultStatus;
 };
 function formatDate(value:string|null) {
   if (!value) return '尚未完成';
@@ -43,8 +44,12 @@ function formatDate(value:string|null) {
   return Number.isFinite(date.getTime()) ? new Intl.DateTimeFormat('zh-CN',{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'}).format(date) : '尚未完成';
 }
 
-export default function RedirectMonitor({enabled,active,online,progress,lastCompletion,onEnabled,onRun,disabled,ready=true,nextCheckAt,runKind='full',pendingChanges=0,totalLinks,summary}:Props) {
+export default function RedirectMonitor({enabled,active,online,progress,lastCompletion,onEnabled,onRun,disabled,ready=true,nextCheckAt,runKind='full',pendingChanges=0,totalLinks,summary,resultStatus='unverified'}:Props) {
   const attention = summary ? summary.alert + summary.unresolved + summary.attention : 0;
+  const resultText = resultStatus === 'healthy' ? '上次巡检：全部首跳符合预期'
+    : resultStatus === 'attention' ? `上次巡检：${attention > 0 ? `${attention} 条链接需关注` : '有链接需关注'}`
+      : resultStatus === 'stale' ? '上次巡检结果已过期，等待重新检查'
+        : '巡检结果：尚未完成有效巡检';
   const waiting = !enabled ? '开启后自动开始'
     : !ready ? '等待读取本机配置'
       : totalLinks === 0 ? '等待添加短链接'
@@ -62,6 +67,7 @@ export default function RedirectMonitor({enabled,active,online,progress,lastComp
         <button type="button" className="button secondary" onClick={onRun} disabled={!enabled || active || disabled || !ready || !online || totalLinks === 0}><ArrowClockwise size={15} aria-hidden="true"/>立即巡检</button>
       </div>
     </div>
+    {enabled && ready && !active && (totalLinks ?? 0) > 0 && <p className={`redirect-monitor-result ${resultStatus}`} aria-live="polite">{resultStatus === 'healthy' ? <CheckCircle size={16} weight="fill" aria-hidden="true"/> : <WarningCircle size={16} aria-hidden="true"/>}{resultText}</p>}
     <div className="redirect-monitor-meta"><span role={enabled ? "status" : undefined}>{active ? activity : waiting}</span><span>上次整轮完成：{formatDate(lastCompletion)}</span>{enabled && nextCheckAt && <span>下次预计：{formatDate(nextCheckAt)}{(!online || disabled || !ready) && ' · 条件恢复后执行'}</span>}</div>
     {active && runKind !== 'confirm' && progress.total > 0 && <progress className="redirect-monitor-progress" aria-label="本次巡检进度" value={progress.done} max={progress.total}/>}
     <p className="redirect-monitor-note">仅检查本机网络看到的首跳及预期地址；不代表大陆网络或目标网站可达。巡检会产生正常的短链接请求，巡检请求不计入点击统计。</p>

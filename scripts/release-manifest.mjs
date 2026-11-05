@@ -1,7 +1,8 @@
 import { readdirSync, readFileSync, writeFileSync, mkdirSync, copyFileSync, lstatSync } from 'node:fs';
-import { join, basename, dirname } from 'node:path';
+import { join, basename, dirname, sep } from 'node:path';
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
+import { parseArgs } from 'node:util';
 import { matchingAppInputs } from './release-app-inputs.mjs';
 import { updaterPublicKeySha256, verifyUpdaterSignatureFile } from './updater-signature.mjs';
 import { validateMacSigningEvidence } from './macos-signature.mjs';
@@ -9,17 +10,25 @@ import { readMacUpdater, validateMacArtifactEvidence } from './macos-artifact.mj
 import { helperPinForTarget } from './macos-credential-helper-bytes.mjs';
 import { readWindowsUpgradeEvidence, validateWindowsUpgradeEvidence } from './windows-upgrade-evidence.mjs';
 import { validateToolchainEvidence } from './toolchain-evidence.mjs';
+const { values, positionals, tokens }=parseArgs({
+  options:{'require-evidence':{type:'boolean'},platforms:{type:'string'}},
+  allowPositionals:true,tokens:true,
+});
+const optionNames=tokens.filter(token=>token.kind==='option').map(token=>token.name);
+if(positionals.length>1||new Set(optionNames).size!==optionNames.length){
+  throw new Error('Specify one candidate directory and each option at most once.');
+}
+const root=positionals[0]??'candidates';
+const requireEvidence=values['require-evidence']===true;
+const macOnly=values.platforms==='macos';
+if(values.platforms!==undefined&&!macOnly)throw new Error('The supported platform selection is --platforms=macos; omit it for all platforms.');
+if(macOnly&&!requireEvidence)throw new Error('--platforms=macos requires --require-evidence.');
 const version=JSON.parse(readFileSync('package.json','utf8')).version;
 const repository=process.env.GITHUB_REPOSITORY;
 if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repository??''))throw new Error('Invalid repository.');
 const updaterPublicKey=process.env.SLG_UPDATER_PUBLIC_KEY;
 if(!updaterPublicKey)throw new Error('Configured updater public key is required.');
 const publicKeySha256=updaterPublicKeySha256(updaterPublicKey);
-const root=process.argv[2]??'candidates';
-const requireEvidence=process.argv.includes('--require-evidence');
-const files=[];
-function walk(p){for(const e of readdirSync(p,{withFileTypes:true})){const x=join(p,e.name);if(e.isDirectory())walk(x);else files.push(x);}}
-walk(root);
 const sha256=path=>createHash('sha256').update(readFileSync(path)).digest('hex');
 const hex=value=>typeof value==='string'&&/^[0-9a-f]{64}$/.test(value);
 const targets={
@@ -27,8 +36,20 @@ const targets={
   'x86_64-apple-darwin':{host:'darwin-x64',platform:'darwin-x86_64',installerDir:'dmg',installerSuffix:'.dmg',updaterDir:'macos',updaterSuffix:'.app.tar.gz'},
   'x86_64-pc-windows-msvc':{host:'win32-x64',platform:'windows-x86_64',installerDir:'nsis',installerSuffix:'-setup.exe',updaterDir:'nsis',updaterSuffix:'-setup.exe'},
 };
+const requiredTargets=Object.entries(targets).filter(([,config])=>!macOnly||config.platform.startsWith('darwin-'));
+if(macOnly){
+  const expected=new Set(requiredTargets.map(([target])=>`candidate-${target}`));
+  if(!lstatSync(root).isDirectory()||readdirSync(root,{withFileTypes:true}).some(entry=>!entry.isDirectory()||!expected.has(entry.name))){
+    throw new Error('Mac-only assembly requires a candidate directory containing only the two macOS candidate folders.');
+  }
+}
+const files=[];
+function walk(p){for(const e of readdirSync(p,{withFileTypes:true})){const x=join(p,e.name);if(e.isDirectory())walk(x);else files.push(x);}}
+walk(root);
 const verified=new Map();
 const verifiedSignatures=new Set();
+const macBuildSupportFiles=new Set();
+const macBuildAppDirs=[];
 function exactArtifact(candidateRoot,subdir,name,suffix,digest){
   if(typeof name!=='string'||basename(name)!==name||!name.endsWith(suffix)||!hex(digest))throw new Error('Invalid native artifact name or digest.');
   const matches=files.filter(file=>dirname(file)===join(candidateRoot,subdir)&&basename(file)===name);
@@ -86,7 +107,7 @@ if(requireEvidence){
   const head=execFileSync('git',['rev-parse','HEAD'],{encoding:'utf8'}).trim();
   const tagged=execFileSync('git',['rev-parse','--verify',`refs/tags/${tag}^{commit}`],{encoding:'utf8'}).trim();
   if(head!==sha||tagged!==sha)throw new Error('Candidate source does not match the checked-out reviewed tag.');
-  for(const [target,config] of Object.entries(targets)){
+  for(const [target,config] of requiredTargets){
     const candidateRoot=join(root,`candidate-${target}`);
     const matches=files.filter(file=>file===join(candidateRoot,'native-smoke.json'));
     if(matches.length!==1||lstatSync(matches[0]).isSymbolicLink())throw new Error(`Missing unique native startup evidence for ${target}.`);
@@ -116,6 +137,15 @@ if(requireEvidence){
     if(target.includes('apple')){
       validateMacArtifactEvidence(evidence.macArtifacts,process.env.SLG_MACOS_CERT_SHA256,readMacUpdater(updater).manifest,evidence.nativeSigning,helperPinForTarget(target,process.env));
       if(evidence.method!=='manual-local'&&evidence.macArtifacts.buildBundleCompared!==true)throw new Error('Native macOS build comparison evidence is required.');
+      if(macOnly){
+        // The downloaded artifact also contains the build app and Tauri's DMG support files.
+        // They were scanned on the native runner and are never Release assets.
+        macBuildAppDirs.push(updater.slice(0,-'.tar.gz'.length)+sep);
+        for(const path of ['native-smoke.json','dmg/icon.icns','dmg/bundle_dmg.sh',
+          'share/create-dmg/support/template.applescript','share/create-dmg/support/eula-resources-template.xml']){
+          macBuildSupportFiles.add(join(candidateRoot,path));
+        }
+      }
     }
     verifiedSignatures.add(signature);
     if(evidence.method!=='manual-local'&&(
@@ -132,9 +162,19 @@ if(requireEvidence){
   for(const file of files){
     if((file.endsWith('.app.tar.gz')||/\.(dmg|exe)$/.test(file))&&!verified.has(file))throw new Error(`Unreviewed publishable artifact: ${basename(file)}`);
     if(file.endsWith('.sig')&&!signatures.has(file))throw new Error(`Unreviewed updater signature: ${basename(file)}`);
+    if(macOnly&&!verified.has(file)&&!signatures.has(file)&&!macBuildSupportFiles.has(file)&&
+       (!macBuildAppDirs.some(dir=>file.startsWith(dir))||/\.(?:app\.tar\.gz|dmg|exe|msi|pkg|zip|tgz|cab|7z|sig)$/i.test(file))){
+      throw new Error(`Unreviewed Mac-only candidate file: ${basename(file)}`);
+    }
   }
 }
 const platforms={};const uploads=[];const names=new Set();
+if(macOnly){
+  const existing=lstatSync('release-assets',{throwIfNoEntry:false});
+  if(existing&&(!existing.isDirectory()||readdirSync('release-assets').length)){
+    throw new Error('Mac-only assembly needs an empty release-assets directory.');
+  }
+}
 mkdirSync('release-assets',{recursive:true});
 const publishFiles=requireEvidence?[...verified.keys()]:files;
 for(const file of publishFiles){
@@ -161,7 +201,7 @@ for(const file of publishFiles){
     if(suffix==='.app.tar.gz'||(platform==='windows-x86_64'&&suffix==='.exe'))platforms[platform]={signature,url:`https://github.com/${repository}/releases/download/v${version}/${name}`};
   }
 }
-for(const p of ['darwin-aarch64','darwin-x86_64','windows-x86_64'])if(!platforms[p])throw new Error(`Missing signed updater artifact: ${p}`);
+for(const [, {platform}] of requiredTargets)if(!platforms[platform])throw new Error(`Missing signed updater artifact: ${platform}`);
 writeFileSync('latest.json',JSON.stringify({version,notes:'See the release notes for changes and installation details.',pub_date:new Date().toISOString(),platforms},null,2)+'\n');
 writeFileSync('SHA256SUMS',[...uploads.filter(x=>!x.endsWith('.sig')),'latest.json'].map(x=>`${sha256(x)}  ${basename(x)}`).join('\n')+'\n');
 writeFileSync('release-assets.json',JSON.stringify([...uploads,'latest.json','SHA256SUMS']));

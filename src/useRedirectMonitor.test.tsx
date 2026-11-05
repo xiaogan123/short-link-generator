@@ -137,6 +137,7 @@ it('retains a confirmed alert through unknown and another failure until passed',
   act(()=>result.current.runNow());await tick();
   expect(result.current.getRecord(base.links[0])).toMatchObject({phase:'healthy',unresolvedAlert:false});
   expect(result.current.summary).toEqual({alert:0,unresolved:0,attention:0});
+  expect(result.current.resultStatus).toBe('healthy');
 });
 
 it('keeps an expired confirmed alert in the unresolved count rather than claiming no confirmed issue',async()=>{
@@ -403,4 +404,117 @@ it('hydrates the initial workspace without treating every existing link as a new
   const {rerender}=renderHook(({state,ready})=>useRedirectMonitor({state,paused:false,ready,check}),{initialProps:{state:{...base,links:[]} as State,ready:false}});
   rerender({state:base,ready:true});await tick();
   expect(check).not.toHaveBeenCalled();
+});
+
+it('reports success only after every current link has passed and no round is active',async()=>{
+  const state={...base,links:[base.links[0],{...base.links[0],slug:'two'}]};
+  let finish!:(value:RedirectCheck)=>void;
+  const check=vi.fn().mockImplementationOnce(()=>Promise.resolve(report('passed')))
+    .mockImplementationOnce(()=>new Promise<RedirectCheck>(resolve=>{finish=resolve;}));
+  const {result}=renderHook(()=>useRedirectMonitor({state,paused:false,ready:true,check}));
+  expect(result.current.resultStatus).toBe('unverified');
+  act(()=>result.current.setEnabled(true));await tick(250);
+  expect(result.current.active).toBe(true);
+  expect(result.current.resultStatus).toBe('unverified');
+  await act(async()=>finish(report('passed')));
+  expect(result.current.resultStatus).toBe('healthy');
+});
+
+it('does not reuse success after busy or unknown, and recovers after a pass',async()=>{
+  const check=vi.fn().mockImplementationOnce(()=>Promise.resolve(report('passed')))
+    .mockImplementationOnce(()=>Promise.resolve(report('unknown','busy')))
+    .mockImplementationOnce(()=>Promise.resolve(report('unknown')))
+    .mockImplementation(()=>Promise.resolve(report('passed')));
+  const {result}=renderHook(()=>useRedirectMonitor({state:base,paused:false,ready:true,check}));
+  act(()=>result.current.setEnabled(true));await tick();
+  expect(result.current.resultStatus).toBe('healthy');
+  act(()=>result.current.runNow());await tick();
+  expect(result.current.resultStatus).toBe('unverified');
+  await tick(CONFIRM_DELAY_MS);
+  expect(result.current.resultStatus).toBe('attention');
+  act(()=>result.current.runNow());await tick();
+  expect(result.current.resultStatus).toBe('healthy');
+});
+
+it('restores only a saved success and marks it stale or future-dated safely',async()=>{
+  localStorage.setItem('redirect-monitor-preview-enabled','true');
+  localStorage.setItem('redirect-monitor-preview-enabled-completed-at',new Date().toISOString());
+  const check=vi.fn(()=>Promise.resolve(report('passed')));
+  const first=renderHook(()=>useRedirectMonitor({state:base,paused:true,ready:true,check}));
+  expect(first.result.current.resultStatus).toBe('healthy');
+  await tick(STALE_AFTER_MS+60_000);
+  expect(first.result.current.resultStatus).toBe('stale');
+  first.unmount();
+  localStorage.setItem('redirect-monitor-preview-enabled-completed-at','2027-01-01T00:00:00Z');
+  const second=renderHook(()=>useRedirectMonitor({state:base,paused:true,ready:true,check}));
+  expect(second.result.current.resultStatus).toBe('unverified');
+});
+
+it('invalidates success when configuration changes until the new identity passes',async()=>{
+  let finish!:(value:RedirectCheck)=>void;
+  const check=vi.fn().mockImplementationOnce(()=>Promise.resolve(report('passed')))
+    .mockImplementationOnce(()=>new Promise<RedirectCheck>(resolve=>{finish=resolve;}));
+  const {result,rerender}=renderHook(({state})=>useRedirectMonitor({state,paused:false,ready:true,check}),{initialProps:{state:base}});
+  act(()=>result.current.setEnabled(true));await tick();
+  expect(result.current.resultStatus).toBe('healthy');
+  rerender({state:{...base,links:[{...base.links[0],updated:'changed'}]}});await tick();
+  expect(result.current.resultStatus).toBe('unverified');
+  await act(async()=>finish(report('passed')));
+  expect(result.current.resultStatus).toBe('healthy');
+});
+
+it('does not persist a pass whose check time is in the future',async()=>{
+  const check=vi.fn(()=>Promise.resolve({...report('passed'),checkedAt:'2027-01-01T00:00:00Z'}));
+  const {result}=renderHook(()=>useRedirectMonitor({state:base,paused:false,ready:true,check}));
+  act(()=>result.current.setEnabled(true));await tick();
+  expect(result.current.resultStatus).toBe('stale');
+  expect(localStorage.getItem('redirect-monitor-preview-enabled-completed-at')).toBeNull();
+});
+
+it('becomes healthy after a changed link replaces an obsolete first-round response',async()=>{
+  const releases:Array<(value:RedirectCheck)=>void>=[];
+  const check=vi.fn(()=>new Promise<RedirectCheck>(resolve=>releases.push(resolve)));
+  const {result,rerender}=renderHook(({state})=>useRedirectMonitor({state,paused:false,ready:true,check}),{initialProps:{state:base}});
+  act(()=>result.current.setEnabled(true));await tick();
+  const edited={...base,links:[{...base.links[0],updated:'new'}]};
+  rerender({state:edited});
+  await act(async()=>releases.shift()!(report('passed')));await tick();
+  expect(result.current.resultStatus).toBe('unverified');
+  await act(async()=>releases.shift()!(report('passed')));
+  expect(result.current.pendingChanges).toBe(0);
+  expect(result.current.resultStatus).toBe('healthy');
+});
+
+it('becomes healthy when an unchecked link is removed during the first round',async()=>{
+  const state={...base,links:[base.links[0],{...base.links[0],slug:'two'}]};
+  let finish!:(value:RedirectCheck)=>void;
+  const check=vi.fn(()=>new Promise<RedirectCheck>(resolve=>{finish=resolve;}));
+  const {result,rerender}=renderHook(({snapshot})=>useRedirectMonitor({state:snapshot,paused:false,ready:true,check}),{initialProps:{snapshot:state}});
+  act(()=>result.current.setEnabled(true));await tick();
+  rerender({snapshot:base});
+  await act(async()=>finish(report('passed')));await tick(250);
+  expect(check).toHaveBeenCalledTimes(1);
+  expect(result.current.active).toBe(false);
+  expect(result.current.pendingChanges).toBe(0);
+  expect(result.current.resultStatus).toBe('healthy');
+  expect(result.current.lastCompletion).toBeNull();
+  expect(localStorage.getItem('redirect-monitor-preview-enabled-completed-at')).toBeNull();
+});
+
+it('does not fill an interrupted new round with old healthy records after an edit',async()=>{
+  const state={...base,links:[base.links[0],{...base.links[0],slug:'two'}]};
+  let finish!:(value:RedirectCheck)=>void;
+  const check=vi.fn().mockImplementationOnce(()=>Promise.resolve(report('passed')))
+    .mockImplementationOnce(()=>Promise.resolve(report('passed')))
+    .mockImplementationOnce(()=>new Promise<RedirectCheck>(resolve=>{finish=resolve;}));
+  const {result,rerender}=renderHook(({snapshot,paused})=>useRedirectMonitor({state:snapshot,paused,ready:true,check}),{initialProps:{snapshot:state,paused:false}});
+  act(()=>result.current.setEnabled(true));await tick(250);
+  expect(result.current.resultStatus).toBe('healthy');
+  act(()=>result.current.runNow());await tick();
+  const edited={...state,links:[{...state.links[0],updated:'new'},state.links[1]]};
+  rerender({snapshot:edited,paused:true});
+  await act(async()=>finish(report('passed')));await tick();
+  expect(result.current.active).toBe(false);
+  expect(result.current.getRecord(state.links[1])?.phase).toBe('healthy');
+  expect(result.current.resultStatus).toBe('unverified');
 });

@@ -88,6 +88,7 @@ h1,h2,h3,p{margin-top:0;}
 .select-wrap select{appearance:none;border:0;outline:0;background:none;color:#52675b;font-size:11px;padding-right:14px;max-width:150px;}
 .select-wrap svg{pointer-events:none;position:absolute;right:8px;}
 .link-groups{padding-bottom:6px;}
+.link-list-heading{scroll-margin-top:24px;}
 .domain-group{border-top:1px solid #e7e9e0;}
 .group-heading{padding:13px 24px;background:#f7f7f1;display:flex;justify-content:space-between;align-items:center;}
 .group-heading > div{display:flex;align-items:center;gap:8px;color:#5a7765;font-size:12px;}

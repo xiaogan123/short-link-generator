@@ -50,3 +50,29 @@ it('explains empty, offline, busy and incremental states and shows schedule, pro
   expect(screen.getByRole('progressbar').getAttribute('value')).toBe('1');
   expect(screen.getByText('3 条需关注')).toBeTruthy();
 });
+
+it('shows an explicit healthy result only when verified, with separate attention and expired messages',()=>{
+  const props={enabled:true,active:false,online:true,progress:{done:2,total:2},lastCompletion:'2026-10-17T00:00:00Z',onEnabled:vi.fn(),onRun:vi.fn(),disabled:false,totalLinks:2,summary:{alert:0,unresolved:0,attention:0}};
+  const {rerender}=render(<RedirectMonitor {...props}/>);
+  expect(screen.getByText('巡检结果：尚未完成有效巡检')).toBeTruthy();
+  expect(screen.queryByText('上次巡检：全部首跳符合预期')).toBeNull();
+  rerender(<RedirectMonitor {...props} resultStatus="healthy"/>);
+  expect(screen.getByText('上次巡检：全部首跳符合预期').classList.contains('healthy')).toBe(true);
+  expect(screen.getByText(/上次整轮完成/)).toBeTruthy();
+  rerender(<RedirectMonitor {...props} resultStatus="attention" summary={{alert:0,unresolved:1,attention:1}}/>);
+  expect(screen.getByText('上次巡检：2 条链接需关注')).toBeTruthy();
+  expect(screen.queryByText('上次巡检：全部首跳符合预期')).toBeNull();
+  rerender(<RedirectMonitor {...props} resultStatus="stale"/>);
+  expect(screen.getByText('上次巡检结果已过期，等待重新检查')).toBeTruthy();
+});
+
+it('hides previous result claims while checking, disabled, loading or empty',()=>{
+  const props={enabled:true,active:false,online:true,progress:{done:1,total:2},lastCompletion:'2026-10-17T00:00:00Z',onEnabled:vi.fn(),onRun:vi.fn(),disabled:false,totalLinks:2,resultStatus:'healthy' as const};
+  const {rerender}=render(<RedirectMonitor {...props} active/>);
+  expect(screen.getByRole('status').textContent).toBe('正在巡检 1/2');
+  expect(screen.queryByText('上次巡检：全部首跳符合预期')).toBeNull();
+  for(const override of [{enabled:false},{ready:false},{totalLinks:0}]){
+    rerender(<RedirectMonitor {...props} {...override}/>);
+    expect(screen.queryByText('上次巡检：全部首跳符合预期')).toBeNull();
+  }
+});

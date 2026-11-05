@@ -1,6 +1,6 @@
 # 发版候选包工作流
 
-`.github/workflows/release.yml` 只接受手动运行。输入必须是已存在、版本号一致、指向已审查提交的 `v*` tag。`target` 默认 `windows`，还可选 `mac-arm`、`mac-intel`、`windows-intel`；最后一项只在 Windows 和 Intel Mac 上分别原生构建，适合复用已经在本机验证的 Apple 芯片候选包。只有显式选择 `all` 才会构建三个平台并建立草稿 Release。推送 tag 不触发构建。
+`.github/workflows/release.yml` 只接受手动运行。输入必须是已存在、版本号一致、指向已审查提交的 `v*` tag。`target` 默认 `windows`，还可选 `mac-arm`、`mac-intel`、`windows-intel`、`mac` 和 `all`。`windows-intel` 只在 Windows 和 Intel Mac 上分别原生构建，适合复用已经在本机验证的 Apple 芯片候选包。`mac` 只在 Apple 芯片和 Intel Mac 上分别原生构建，`all` 构建全部三个平台；只有这两个选项会在所需平台全部通过后建立草稿 Release。推送 tag 不触发构建，工作流不会公开草稿。
 
 运行前先检查本月 Actions 额度、预算、进行中与排队任务，估算本次所选 runner 的分钟数。本机能完成的检查应先通过；公共问题先在本机解决，再按需运行单平台。完整 `all` 矩阵只用于准备好公开发行的最终候选版本。此文档描述流程，不代表平台验收已经通过。
 
@@ -18,7 +18,15 @@
 
 每个原生候选包在启动前，先用正式更新公钥对更新包和签名做密码学验证，同时检查包签名、签名说明和密钥标识。失败时不启动候选包。候选包随后经过解包隐私扫描；构建成功且任务未取消时，原生验收失败仍执行隐私扫描，但只有原生验收与隐私扫描都通过才上传 artifact。每个平台的证据记录 tag、来源 SHA、安装包、更新包和签名文件的 SHA-256、更新公钥散列、原生架构与启动结果；不包含 runner 路径或用户数据。临时 Actions artifact 只保留 1 天，应及时下载或汇总。
 
-三个平台齐备时，汇总脚本再次核对来源 SHA、原生证据和文件散列，并对每个更新包用正式公钥重新验签，再生成 `latest.json`、`SHA256SUMS` 和草稿资源。缺少公钥、签名损坏、签名公钥不匹配或更新包被替换都会拒绝汇总。校验和覆盖安装包、更新包及 `latest.json`。
+汇总脚本默认要求三个平台齐备，再次核对来源 SHA、原生证据和文件散列，并对每个更新包用正式公钥重新验签，再生成 `latest.json`、`SHA256SUMS` 和草稿资源。缺少公钥、签名损坏、签名公钥不匹配或更新包被替换都会拒绝汇总。校验和覆盖安装包、更新包及 `latest.json`。
+
+## 只发布 macOS
+
+选择 `target: mac` 时，Apple 芯片使用 `macos-15`，Intel 使用 `macos-15-intel`。两个候选均通过原生验收、签名及隐私检查后，工作流严格汇总并建立草稿。草稿资产包含两种架构的 DMG、更新包和对应签名，以及 `latest.json` 与 `SHA256SUMS`。Mac 专版只缩小平台范围；保留相同的 tag、提交 SHA、原生证据、包内文件、固定签名身份和 helper 字节校验。
+
+也可分别下载两种架构的候选 artifact。在检出已审查 tag、已配置相同汇总变量且 `release-assets/` 为空的工作目录运行 `node scripts/release-manifest.mjs candidates --require-evidence --platforms=macos`。`candidates/` 只能有这两个 `candidate-<target>/` 目录。缺少任一架构、混入 Windows 候选或其他未经核验的制品均会拒绝汇总。
+
+如果将通过验收的 Mac 草稿公开并设为 GitHub 的 Latest，已安装的 Mac 版可以收到签名更新。旧 Windows 版访问同一份更新清单，手动检查更新会提示错误，因为清单没有 Windows 更新包。它不会安装此版本，现有功能可继续使用；后续全平台版本设为 Latest 后，Windows 恢复正常检查更新。公开草稿和设为 Latest 仍是单独的发布操作。
 
 ## 复用三次单平台运行
 
