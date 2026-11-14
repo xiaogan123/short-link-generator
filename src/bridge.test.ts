@@ -153,3 +153,21 @@ it('adds 100 neutral links across domains only with explicit preview manyLinks m
   const normal=await import('./bridge');
   expect((await normal.dispatch<import('./types').State>('get_state')).links).toHaveLength(3);
 });
+
+it('keeps an edited preview link in place and appends only new links', async () => {
+  const {dispatch} = await import('./bridge');
+  const before = await dispatch<import('./types').State>('get_state');
+  const edit = await dispatch<{id:string}>('prepare_change',{kind:'save_link',domainId:'demo-d1',slug:'welcome',cnUrl:'https://example.com/zh/edited',defaultUrl:'https://example.com/en'});
+  const edited = await dispatch<import('./types').State>('apply_plan',{planId:edit.id});
+  expect(edited.links.map(l=>l.slug)).toEqual(before.links.map(l=>l.slug));
+  expect(edited.links[0].cnUrl).toBe('https://example.com/zh/edited');
+  const create = await dispatch<{id:string}>('prepare_change',{kind:'save_link',domainId:'demo-d1',slug:'added',cnUrl:'https://example.com/zh',defaultUrl:'https://example.com/en',createOnly:true});
+  const added = await dispatch<import('./types').State>('apply_plan',{planId:create.id});
+  expect(added.links.map(l=>l.slug)).toEqual([...before.links.map(l=>l.slug),'added']);
+});
+
+it('refuses to prepare a preview service cleanup while the account still has domains', async () => {
+  const {dispatch} = await import('./bridge');
+  await expect(dispatch('prepare_change',{kind:'cleanup_account',accountId:'demo-a'})).rejects.toThrow('此账号还有域名，请先移除域名');
+  await expect(dispatch('prepare_change',{kind:'cleanup_account',accountId:'demo-b'})).resolves.toMatchObject({title:'清理远端资源'});
+});

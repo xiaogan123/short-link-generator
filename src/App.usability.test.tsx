@@ -61,7 +61,8 @@ it('separates account facts, management groups, and the two import steps',async(
   expect(steps).toHaveLength(2);
   expect(steps[0].textContent).toContain('在 Cloudflare 准备令牌');
   expect(steps[1].textContent).toContain('粘贴并验证');
-  expect((within(imported).getByRole('checkbox') as HTMLInputElement).checked).toBe(false);
+  expect(within(imported).queryByRole('checkbox')).toBeNull();
+  expect(steps[1].textContent).toContain('已导入的账户会自动跳过');
 });
 
 it('keeps the selected account visible while updating its token',async()=>{
@@ -114,9 +115,8 @@ it.each(['取消','关闭','Escape','遮罩'])('dismisses an unsubmitted token u
   fireEvent.click(screen.getByRole('button',{name:'导入账户'}));
   const imported=screen.getByRole('dialog',{name:'导入访问令牌'});
   expect((within(imported).getByPlaceholderText('在此粘贴令牌') as HTMLInputElement).value).toBe('');
-  const replacement=within(imported).getByRole('checkbox') as HTMLInputElement;
-  expect(replacement.checked).toBe(false);
-  expect(replacement.disabled).toBe(false);
+  expect(within(imported).queryByRole('checkbox')).toBeNull();
+  expect(screen.queryByRole('dialog',{name:'更换本机令牌'})).toBeNull();
 });
 
 async function openTokenEditor(){

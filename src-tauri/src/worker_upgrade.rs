@@ -220,10 +220,15 @@ impl Backend {
             .iter()
             .any(|p| p.account_id == account_id)
         {
-            Err(
-                "此账户的 Worker 升级尚未核对，请从待处理操作恢复；云端未确认前不会执行其他变更"
-                    .into(),
-            )
+            let label = self
+                .db
+                .accounts
+                .iter()
+                .find(|a| a.id == account_id)
+                .map_or(account_id, |a| a.label.as_str());
+            Err(format!(
+                "账户「{label}」：此账户的 Worker 升级尚未核对，请从待处理操作恢复；云端未确认前不会执行其他变更"
+            ))
         } else {
             Ok(())
         }
@@ -268,12 +273,42 @@ impl Backend {
         self.require_no_worker_upgrade(account_id)?;
         // Unknown and legacy journals are blockers too. A fresh upgrade must not
         // overlap any unfinished operation that may change remote settings.
-        if !self.db.pending_operations.is_empty()
-            || !self.db.pending_pool_changes.is_empty()
-            || !self.db.pending_monitor_changes.is_empty()
-            || !self.db.pending_selftest_rotations.is_empty()
-        {
-            return Err("请先完成其他待处理操作，再升级 Worker".into());
+        let label = |id: &str| {
+            self.db
+                .accounts
+                .iter()
+                .find(|a| a.id == id)
+                .map_or_else(|| id.to_owned(), |a| format!("「{}」", a.label))
+        };
+        let blocker = if let Some(first) = self.db.pending_operations.first() {
+            Some(format!(
+                "{first}（共 {} 项）",
+                self.db.pending_operations.len()
+            ))
+        } else if !self.db.pending_pool_changes.is_empty() {
+            Some(format!(
+                "平台地址同步（共 {} 项）",
+                self.db.pending_pool_changes.len()
+            ))
+        } else if let Some(first) = self.db.pending_monitor_changes.first() {
+            Some(format!(
+                "账户{}的监测名单同步（共 {} 项）",
+                label(&first.account_id),
+                self.db.pending_monitor_changes.len()
+            ))
+        } else {
+            self.db.pending_selftest_rotations.first().map(|first| {
+                format!(
+                    "账户{}的检测密钥轮换（共 {} 项）",
+                    label(&first.account_id),
+                    self.db.pending_selftest_rotations.len()
+                )
+            })
+        };
+        if let Some(blocker) = blocker {
+            return Err(format!(
+                "请先在待处理操作中完成：{blocker}，再升级此账户的 Worker"
+            ));
         }
         Ok(())
     }
@@ -582,6 +617,33 @@ impl Backend {
             )
             .await
         {
+            // A definite refusal (4xx other than 429, or success:false) means the
+            // upload was not applied: drop this upgrade's record in one commit.
+            // 429 and uncertain outcomes keep the record for verification.
+            if !error.uncertain && !error.message.contains("HTTP 429") {
+                let journal = self.local_worker_upgrade_pending(account_id)?.journal;
+                if let Err(persist_error) = self.persist_rotation_mutation(|db| {
+                    db.pending_worker_upgrades
+                        .retain(|v| v.account_id != account_id);
+                    clear_journal(&mut db.pending_operations, &journal)
+                }) {
+                    return Err(format!(
+                        "{}；{persist_error}，升级记录未清除，请从待处理操作核对",
+                        error.message
+                    ));
+                }
+                // Local snapshot checks fail before anything is sent.
+                let sent = error.message.contains("HTTP") || error.message.contains("云端拒绝");
+                return Err(format!(
+                    "{}（{}），云端未改变，可稍后重新操作",
+                    if sent {
+                        "Cloudflare 拒绝了这次上传"
+                    } else {
+                        "这次上传没有发出"
+                    },
+                    error.message
+                ));
+            }
             self.upgrade_note(
                 account_id,
                 if error.uncertain {

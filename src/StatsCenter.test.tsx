@@ -673,3 +673,50 @@ it('does not read credentials for an account with incomplete token import',async
   expect((screen.getByRole('button',{name:'读取统计'}) as HTMLButtonElement).disabled).toBe(true);
   expect(mockedDispatch).not.toHaveBeenCalled();
 });
+
+const expiredSession = '统计读取会话已过期或范围发生变化，请刷新后重新读取';
+
+it('rereads the same page once without the expired session and keeps paging',async()=>{
+  mockedDispatch.mockImplementation((_action,payload)=>{
+    if(payload?.page===2&&payload?.readSessionId) return Promise.reject(Error(expiredSession));
+    return Promise.resolve(response({page:Number(payload?.page),totalLinks:30,rows:aPageRows(Number(payload?.page)),readSessionId:payload?.page===2?'session-new':'session-a'}));
+  });
+  render(view());chooseAccount();
+  fireEvent.click(screen.getByRole('button',{name:'读取统计'}));await expectSummary('120');
+  fireEvent.click(screen.getByRole('button',{name:'下一页统计'}));
+  await screen.findByText(/第 2 \/ 2 页/);
+  const calls=mockedDispatch.mock.calls.filter((call)=>call[0]==='get_stats_center');
+  expect(calls).toHaveLength(3);
+  expect(calls[1][1]).toEqual(expect.objectContaining({page:2,readSessionId:'session-a'}));
+  expect(calls[2][1]).toEqual({accountId:'account-a',days:7,page:2,pageSize:25});
+  expect(screen.queryByText(expiredSession)).toBeNull();
+  expect(screen.getByLabelText('估算总访问')).toBeTruthy();
+  fireEvent.click(screen.getByRole('button',{name:'上一页统计'}));await screen.findByText(/第 1 \/ 2 页/);
+  expect(mockedDispatch).toHaveBeenLastCalledWith('get_stats_center',expect.objectContaining({page:1,readSessionId:'session-new'}));
+});
+
+it('retries an expired continuation only once and then shows the error',async()=>{
+  mockedDispatch.mockImplementation((_action,payload)=>{
+    if(payload?.page===2) return Promise.reject(Error(expiredSession));
+    return Promise.resolve(response({totalLinks:30,rows:aPageRows(1),readSessionId:'session-a'}));
+  });
+  render(view());chooseAccount();
+  fireEvent.click(screen.getByRole('button',{name:'读取统计'}));await expectSummary('120');
+  fireEvent.click(screen.getByRole('button',{name:'下一页统计'}));
+  expect(await screen.findByText(expiredSession)).toBeTruthy();
+  const pageTwo=mockedDispatch.mock.calls.filter((call)=>call[0]==='get_stats_center'&&call[1]?.page===2);
+  expect(pageTwo).toHaveLength(2);
+  expect(pageTwo[1][1]).not.toHaveProperty('readSessionId');
+});
+
+it('does not retry a continuation that failed for another reason',async()=>{
+  mockedDispatch.mockImplementation((_action,payload)=>{
+    if(payload?.page===2) return Promise.reject(Error('网络连接失败'));
+    return Promise.resolve(response({totalLinks:30,rows:aPageRows(1),readSessionId:'session-a'}));
+  });
+  render(view());chooseAccount();
+  fireEvent.click(screen.getByRole('button',{name:'读取统计'}));await expectSummary('120');
+  fireEvent.click(screen.getByRole('button',{name:'下一页统计'}));
+  expect(await screen.findByText('网络连接失败')).toBeTruthy();
+  expect(mockedDispatch.mock.calls.filter((call)=>call[1]?.page===2)).toHaveLength(1);
+});

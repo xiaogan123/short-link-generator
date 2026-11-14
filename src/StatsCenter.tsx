@@ -15,6 +15,8 @@ import { dedupLabel, dedupNote, sumDedup, validDedup } from "./clickDedup";
 import "./StatsCenter.css";
 
 const PAGE_SIZE = 25 as const;
+/** Mirrors SESSION_EXPIRED in src-tauri/src/click_stats.rs; sessions expire 60s after the first page. */
+const SESSION_EXPIRED = "统计读取会话已过期或范围发生变化，请刷新后重新读取";
 const ranges: { value: ClickStatsDays; label: string }[] = [
   { value: 1, label: "近 24 小时" },
   { value: 7, label: "近 7 天" },
@@ -334,6 +336,10 @@ export default function StatsCenter({
     } catch (error) {
       if (!mounted.current || sequence !== requestSequence.current || requestDataIdentity !== latestDataIdentity.current) return;
       readSession.current = undefined;
+      // An expired session only ends the snapshot; the contract allows reading
+      // the same page again without an ID. Retry once, then report errors.
+      if (continuation && sessionId && errorMessage(error).includes(SESSION_EXPIRED))
+        return void load(requestedPage, false);
       setKnownTotalLinks(null);
       setView({ kind: "error", message: errorMessage(error) });
     }

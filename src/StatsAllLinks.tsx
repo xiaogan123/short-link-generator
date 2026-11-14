@@ -95,7 +95,7 @@ export default function StatsAllLinks({ items, loading, onOpenLinkStats }: Props
         </select>
       </label>
     </div>
-    {loading && <p className="sall-loading" role="status">正在读取统计；当前排序只基于已读取结果，尚不是全部链接的最终排名。</p>}
+    {loading && <p className="sall-loading" role="status">正在读取统计；当前排序只基于已读取结果，尚不是全部链接的最终排名。读取完成后可查看详细统计。</p>}
     {!loading && readCount < items.length && <p className="sall-loading" role="status">部分链接尚无可用统计，显示为“—”；当前排序只比较已读取结果。</p>}
     <div className="sall-scroll">
       <table className="sall-table" aria-label="全部短链接统计">
@@ -107,7 +107,7 @@ export default function StatsAllLinks({ items, loading, onOpenLinkStats }: Props
           <td>{formatCount(item.totals?.likelyHuman)}</td>
           <td>{formatCount(item.totals?.likelyBot)}</td>
           <td>{formatCount(item.totals?.unknown)}</td>
-          <td><button className="button bordered sall-detail" type="button" onClick={() => onOpenLinkStats(item.link, item.domain)}>详细统计</button></td>
+          <td><button className="button bordered sall-detail" type="button" disabled={loading} title={loading ? "读取完成后可查看详细统计" : undefined} onClick={() => onOpenLinkStats(item.link, item.domain)}>详细统计</button></td>
         </tr>) : <tr><td className="sall-empty" colSpan={7}>{items.length ? "没有匹配的短链接" : "暂无短链接"}</td></tr>}</tbody>
       </table>
     </div>

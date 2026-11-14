@@ -199,3 +199,16 @@ it('keeps size controls for 26 links even when size 50 produces one page, and re
   fireEvent.change(within(group).getByRole('combobox',{name:`${domain.host} 每页条数`}),{target:{value:'25'}});
   expect(within(group).getByText('第 1 / 2 页')).toBeTruthy();
 });
+it('keeps the page and open details when an edited link only moves within the same set',()=>{
+  const links=Array.from({length:61},(_,index)=>({...manual,slug:`item-${String(index+1).padStart(2,'0')}`}));
+  const {rerender}=render(view([{domain,links}]));
+  const group=groupFor(domain.host);
+  fireEvent.click(within(group).getByRole('button',{name:`${domain.host} 顶部下一页`}));
+  fireEvent.click(within(rowFor(domain.host,'item-27')).getByRole('button',{name:'详情 item-27'}));
+  const edited={...links[29],cnUrl:'https://example.com/cn/edited',updated:'2026-10-01T00:00:00Z'};
+  rerender(view([{domain,links:[...links.slice(0,29),...links.slice(30),edited]}]));
+  expect(within(group).getByText('显示 26–50 / 共 61 条')).toBeTruthy();
+  expect(within(rowFor(domain.host,'item-27')).getByRole('button',{name:'详情 item-27'}).getAttribute('aria-expanded')).toBe('true');
+  rerender(view([{domain,links:[...links,{...manual,slug:'item-62'}]}]));
+  expect(within(group).getByText('显示 1–25 / 共 62 条')).toBeTruthy();
+});

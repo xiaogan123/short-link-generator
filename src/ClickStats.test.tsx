@@ -229,3 +229,16 @@ it("does not read or configure through a missing or migration-pending account", 
   expect(await screen.findByText("需要先更新本机授权")).toBeTruthy();
   expect(mockedDispatch).not.toHaveBeenCalled();
 });
+
+it("points an account with incomplete token import to recovery without reading or offering configuration", async () => {
+  mockedDispatch.mockResolvedValue(response("ready", 7, { totals: { total: 1, likelyHuman: 1, likelyBot: 0, unknown: 0, previews: 0, prefetches: 0 } }));
+  const { rerender } = render(view({ account: { ...account, needsTokenRecovery: true } }));
+  expect(await screen.findByText("令牌导入未完成")).toBeTruthy();
+  expect(screen.getByText(/恢复此账户的令牌/)).toBeTruthy();
+  expect(screen.queryByRole("button", { name: /账户统计/ })).toBeNull();
+  expect(mockedDispatch).not.toHaveBeenCalled();
+
+  rerender(view({ account: { ...account, needsTokenRecovery: false } }));
+  await waitFor(() => expect(mockedDispatch).toHaveBeenCalledTimes(1));
+  expect(screen.queryByText("令牌导入未完成")).toBeNull();
+});

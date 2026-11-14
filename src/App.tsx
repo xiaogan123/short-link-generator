@@ -41,6 +41,8 @@ import type {
   Domain,
   DomainDnsPreparation,
   DomainPreparation,
+  ConfigImportReport,
+  ImportReport,
   Link,
   PendingAction,
   Plan,
@@ -184,6 +186,47 @@ function hasOnlyVirtualDnsBlocker(preparation: DomainPreparation) {
   return !preparation.canApply && errors.length > 0 &&
     errors.every((check) => check.reason === "virtual_dns_address");
 }
+const IMPORT_SUMMARY_PREFIX = "导入完成：";
+/** Tells the user which accounts a shared token added, skipped or left out. */
+function importNotice(report?: ImportReport) {
+  const skipped = report?.skipped ?? [];
+  const rejected = report?.rejected ?? [];
+  if (!skipped.length && !rejected.length) return "账户已导入。";
+  const imported = report?.imported ?? [];
+  const names = (items: string[]) => items.map((name) => `「${name}」`).join("、");
+  const parts = [
+    `${IMPORT_SUMMARY_PREFIX}已添加 ${imported.length} 个新账户${imported.length ? `（${names(imported.map((item) => item.name))}）` : ""}。`,
+  ];
+  if (skipped.length)
+    parts.push(`已导入过的 ${skipped.length} 个账户（${names(skipped.map((item) => item.label))}）已自动跳过，保存的令牌没有改动。`);
+  if (rejected.length)
+    parts.push(`另有 ${rejected.length} 个账户未导入：${rejected.map((item) => `「${item.name}」${item.reason}`).join("；")}。`);
+  return parts.join("");
+}
+const BACKUP_REVIEW_PREFIX = "备份已导入并验证，但有链接需要核对：";
+/** Summarises what a backup import added; differing links are never changed. */
+function backupImportNotice(report?: ConfigImportReport) {
+  if (!report) return "备份已导入并验证。";
+  const count = (value: unknown) => Number.isSafeInteger(value) && (value as number) > 0 ? value as number : 0;
+  const domains = count(report.domainsAdded);
+  const links = count(report.linksAdded);
+  const pools = count(report.poolsAdded);
+  const existing = count(report.linksExisting);
+  const differing = count(report.linksDiffering);
+  if (!domains && !links && !pools && !differing) return "备份里的内容本机都已存在，没有新增。";
+  const added = [
+    domains ? `${domains} 个域名` : "",
+    links ? `${links} 条链接` : "",
+    pools ? `${pools} 组平台地址` : "",
+  ].filter(Boolean);
+  const parts = [
+    `${differing ? BACKUP_REVIEW_PREFIX : "备份已导入并验证："}${added.length ? `新增 ${added.join("、")}。` : "没有新增内容。"}`,
+  ];
+  if (existing) parts.push(`本机已有的 ${existing} 条链接保持不变。`);
+  if (differing)
+    parts.push(`其中 ${differing} 条本机内容与云端不同，没有改动；如需以云端为准，请在“Cloudflare 账户”页打开该账户的“管理账户”，使用“从 Cloudflare 找回配置”。`);
+  return parts.join("");
+}
 function isSelftestRecovery(kind: PendingAction["kind"]) {
   return kind === "resume_selftest_rotation" || kind === "recover_selftest_rotation" || kind === "recover_selftest_resources";
 }
@@ -248,7 +291,6 @@ export default function App() {
     null,
   );
   const [token, setToken] = useState("");
-  const [replaceToken, setReplaceToken] = useState(false);
   const [clipboardOffer, setClipboardOffer] = useState("");
   const [clipboardToClear, setClipboardToClear] = useState("");
   function clearClipboardOffer() {
@@ -412,7 +454,8 @@ export default function App() {
     return () => window.clearTimeout(timer);
   }, [isDomainPlan, plan?.expiresAt, preflight?.plan?.expiresAt, dnsPreflight?.plan?.expiresAt]);
   useEffect(() => {
-    if (!notice || notice.startsWith("域名已接入。")) return;
+    // Results the user must read in full stay until dismissed.
+    if (!notice || notice.startsWith("域名已接入。") || notice.startsWith(IMPORT_SUMMARY_PREFIX) || notice.startsWith(BACKUP_REVIEW_PREFIX)) return;
     const id = window.setTimeout(() => setNotice(""), 5000);
     return () => clearTimeout(id);
   }, [notice]);
@@ -532,7 +575,6 @@ export default function App() {
     if (mutationRef.current || busy || domainOperation.current.inflight) return;
     setUpdateTokenAccount(account);
     setToken("");
-    setReplaceToken(true);
     setFormErrors({});
     setError("");
     setManageAccount(null);
@@ -624,7 +666,7 @@ export default function App() {
       } else if (kind === "remove_domain")
         setPlanDetails([
           `域名：${domainById.get(String(fields.domainId))?.host || String(fields.domainId)}`,
-          `此域名关联 ${linksByDomain.get(String(fields.domainId))?.length || 0} 条短链接。移除将影响这些短链接；如需保留配置，请先导出备份。`,
+          `此域名关联 ${linksByDomain.get(String(fields.domainId))?.length || 0} 条短链接。确认后会删除云端转发规则和这些短链接，访客将无法跳转。导出的备份只能用来对照手动重建，导入备份无法恢复已删除的链接。`,
         ]);
       else
         setPlanDetails([
@@ -1297,7 +1339,6 @@ export default function App() {
     setError("");
     setUpdateTokenAccount(account);
     setToken("");
-    setReplaceToken(true);
     setClipboardOffer("");
     resumeDomainAfterToken.current = true;
     setTokenOpen(true);
@@ -1436,7 +1477,6 @@ export default function App() {
     setTokenOpen(false);
     setToken("");
     setClipboardOffer("");
-    setReplaceToken(false);
     setUpdateTokenAccount(null);
   }
   async function importToken(event: FormEvent) {
@@ -1448,18 +1488,21 @@ export default function App() {
     }
     await withMutation("token", async () => {
       clearClipboardOffer();
-      const next = await run(
+      const scoped = Boolean(updateTokenAccount);
+      const result = await run(
         () =>
-          dispatch<State>("import_token", {
+          dispatch<State & { importReport?: ImportReport }>("import_token", {
             token: token.trim(),
-            replace: updateTokenAccount ? true : replaceToken,
+            replace: scoped,
             ...(updateTokenAccount
               ? { expectedAccountId: updateTokenAccount.id }
               : {}),
           }),
-        updateTokenAccount ? "账户访问令牌已更新。" : "账户已导入。",
       );
-      if (next) {
+      if (result) {
+        // The report describes this one import; it is not part of the state.
+        const { importReport, ...next } = result;
+        setNotice(scoped ? "账户访问令牌已更新。" : importNotice(importReport));
         const shouldResumeDomain = resumeDomainAfterToken.current;
         resumeDomainAfterToken.current = false;
         setClipboardToClear(await tokenDigest(token.trim()));
@@ -1467,7 +1510,6 @@ export default function App() {
         publishState(next);
         setToken("");
         setClipboardOffer("");
-        setReplaceToken(false);
         setUpdateTokenAccount(null);
         setTokenOpen(false);
         if (shouldResumeDomain) {
@@ -1526,17 +1568,47 @@ export default function App() {
     if (typeof path !== "string") return;
     const json = await run(() => readTextFile(path));
     if (!json) return;
-    const next = await run(
-      () => dispatch<State>("import_config", { json }),
-      "备份已导入并验证。",
+    const result = await run(
+      () => dispatch<State & { configImportReport?: ConfigImportReport }>("import_config", { json }),
     );
-    if (next) publishState(next);
+    if (result) {
+      // The report describes this one import; it is not part of the state.
+      const { configImportReport, ...next } = result;
+      setNotice(backupImportNotice(configImportReport));
+      publishState(next);
+    }
   }
   async function refreshAccounts() {
-    if (!requireCurrentCredentials(stateRef.current.accounts.map((a) => a.id))) return;
     await withMutation("refresh_accounts", async () => {
-      const next = await run(() => dispatch<State>("refresh_accounts"), "账户状态已更新。");
-      if (next) publishState(next);
+      // Refresh one account at a time so one blocked or failing account does
+      // not stop the others; accounts that need recovery are skipped unread.
+      const accounts = stateRef.current.accounts;
+      const blocked = accounts.filter((a) => a.needsTokenRecovery || a.needsCredentialMigration);
+      const failures = blocked.map((a) =>
+        `「${a.label}」${a.needsTokenRecovery ? "需先使用“恢复账户令牌”" : "需先使用“更新本机授权”"}`);
+      let updated = 0;
+      setError("");
+      setMigrationAccountId(blocked[0]?.id ?? null);
+      setWorking(true);
+      try {
+        for (const account of accounts) {
+          if (blocked.includes(account)) continue;
+          try {
+            publishState(await dispatch<State>("refresh_accounts", { accountId: account.id }));
+            updated += 1;
+          } catch (e) {
+            failures.push(`「${account.label}」${errorMessage(e).replace(/。$/, "")}`);
+          }
+        }
+      } finally {
+        setWorking(false);
+      }
+      if (!failures.length) {
+        setNotice("账户状态已更新。");
+        return;
+      }
+      setDomainFeedback(null);
+      setError(`已更新 ${updated} 个账户；以下 ${failures.length} 个账户未更新：${failures.join("；")}。处理后可再次点击“更新状态”。`);
     });
   }
   async function checkUpdate() {
@@ -2027,8 +2099,11 @@ export default function App() {
     for (const link of state.links) if (link.poolId) counts.set(link.poolId, (counts.get(link.poolId) || 0) + 1);
     return counts;
   }, [state.links]);
+  const manageDomainCount = manageAccount ? domainCountByAccount.get(manageAccount.id) || 0 : 0;
+  // A filter for a domain that was removed falls back to all domains.
+  const activeFilter = filter !== "all" && state.domains.some((domain) => domain.id === filter) ? filter : "all";
   const searchTerm = search.trim().toLowerCase();
-  const groups = state.domains.filter((domain) => filter === "all" || domain.id === filter)
+  const groups = state.domains.filter((domain) => activeFilter === "all" || domain.id === activeFilter)
     .map((domain) => ({domain, links: (linksByDomain.get(domain.id) || []).filter((link) => {
       const record = attentionOnly ? redirectMonitor.getRecord(link) : null;
       if (attentionOnly && (!record || !(record.stale || record.phase !== "healthy"))) return false;
@@ -2224,7 +2299,6 @@ export default function App() {
                   onClick={() => {
                     setUpdateTokenAccount(null);
                     setToken("");
-                    setReplaceToken(false);
                     setClipboardOffer("");
                     setTokenOpen(true);
                     void openTemplate();
@@ -2445,7 +2519,7 @@ export default function App() {
                     <label className="select-wrap">
                       <select
                         aria-label="筛选域名"
-                        value={filter}
+                        value={activeFilter}
                         onChange={(e) => setFilter(e.target.value)}
                       >
                         <option value="all">全部域名</option>
@@ -2720,7 +2794,6 @@ export default function App() {
                         onClick={() => {
                           setUpdateTokenAccount(null);
                           setToken("");
-                          setReplaceToken(false);
                           setClipboardOffer("");
                           setTokenOpen(true);
                         }}
@@ -2793,7 +2866,7 @@ export default function App() {
                   <p className="eyebrow">LOCAL BACKUP</p>
                   <h2>配置备份</h2>
                   <p>
-                    导出域名和目标地址，不包含访问令牌或检测密钥。备份中含您的链接信息，请妥善保存。
+                    导出域名和目标地址，不包含访问令牌或检测密钥。备份中含您的链接信息，请妥善保存。导入备份只会登记云端仍存在的域名和链接，不会重新创建云端数据。
                   </p>
                 </div>
                 <div className="backup-actions">
@@ -3475,15 +3548,9 @@ export default function App() {
                   </div>
                 )}
                 {!updateTokenAccount && (
-                  <label className="checkbox-row">
-                    <input
-                      type="checkbox"
-                      checked={replaceToken}
-                      onChange={(e) => setReplaceToken(e.target.checked)}
-                      disabled={mutation === "token"}
-                    />
-                    <span>若账户已存在，确认替换本机保存的令牌</span>
-                  </label>
+                  <p className="form-note">
+                    一个令牌可以包含多个 Cloudflare 账户：这里只添加还没导入的账户，已导入的账户会自动跳过，它们保存的令牌不会改动。要给已有账户换令牌，请在账户列表打开它的“管理账户”，选择“更换本机令牌”。
+                  </p>
                 )}
               </div>
             </div>
@@ -3621,7 +3688,6 @@ export default function App() {
                 onClick={() => {
                   setUpdateTokenAccount(manageAccount);
                   setToken("");
-                  setReplaceToken(true);
                   setClipboardOffer("");
                   setManageAccount(null);
                   setTokenOpen(true);
@@ -3666,7 +3732,7 @@ export default function App() {
               )}
               {manageAccount.monitorEnabled && (
                 <button
-                  disabled={mutation === "prepare_credentials" || Boolean(manageAccount.needsTokenRecovery)}
+                  disabled={busy || mutation === "prepare_credentials" || Boolean(manageAccount.needsTokenRecovery)}
                   className="button secondary"
                   onClick={() => {
                     void disableMonitor(manageAccount);
@@ -3677,7 +3743,7 @@ export default function App() {
                 </button>
               )}
               <button
-                disabled={mutation === "prepare_credentials" || Boolean(manageAccount.needsTokenRecovery)}
+                disabled={busy || mutation === "prepare_credentials" || Boolean(manageAccount.needsTokenRecovery)}
                 className="button secondary"
                 onClick={() => {
                   void prepare("recover_account", {
@@ -3689,7 +3755,7 @@ export default function App() {
                 从 Cloudflare 找回配置
               </button>
               <button
-                disabled={mutation === "prepare_credentials" || Boolean(manageAccount.needsTokenRecovery)}
+                disabled={busy || mutation === "prepare_credentials" || Boolean(manageAccount.needsTokenRecovery)}
                 className="button secondary"
                 onClick={() => {
                   void prepare("rotate_selftest", {
@@ -3751,13 +3817,19 @@ export default function App() {
             )}
             <div className="danger-zone">
               <strong>危险操作</strong>
-              <p>
-                删除云端短链接服务会删除此账户中由本应用管理的
-                Worker、路由和短链接数据；不会删除其他网站或 DNS 记录。此账户关联的 {state.domains.filter((domain) => domain.accountId === manageAccount.id).length} 个域名下的短链接会失效。删除后不能靠刷新恢复；如需重建，请先导出配置并妥善保存。
-              </p>
+              {manageDomainCount > 0 ? (
+                <p>
+                  此账户还有 {manageDomainCount} 个域名，请先在域名管理中逐个移除后，才能删除云端短链接服务。
+                </p>
+              ) : (
+                <p>
+                  删除云端短链接服务会删除此账户中由本应用管理的
+                  Worker、路由和短链接数据；不会删除其他网站或 DNS 记录。删除后无法通过刷新或导入备份恢复；如需日后手动重建，请先导出配置留作记录。
+                </p>
+              )}
               <div className="danger-actions">
                 <button
-                  disabled={mutation === "prepare_credentials" || Boolean(manageAccount.needsTokenRecovery)}
+                  disabled={busy || manageDomainCount > 0 || mutation === "prepare_credentials" || Boolean(manageAccount.needsTokenRecovery)}
                   className="button danger-button"
                   onClick={() => {
                     void prepare("cleanup_account", {

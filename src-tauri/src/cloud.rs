@@ -57,6 +57,57 @@ fn uncertain_write_status(status: StatusCode) -> bool {
     status.is_server_error() || status == StatusCode::REQUEST_TIMEOUT || status.is_redirection()
 }
 
+/// Largest error body read to find a Cloudflare error code.
+const MAX_ERROR_BODY: usize = 16 * 1024;
+
+/// Reads the first Cloudflare error code from a bounded error body. Any read
+/// or parse problem yields `None`, so the message falls back to the status.
+async fn error_code(mut response: reqwest::Response) -> Option<i64> {
+    if response
+        .content_length()
+        .is_some_and(|n| n > MAX_ERROR_BODY as u64)
+    {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.ok()? {
+        if chunk.len() > MAX_ERROR_BODY.saturating_sub(bytes.len()) {
+            return None;
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    let value: Value = serde_json::from_slice(&bytes).ok()?;
+    value["errors"].as_array()?.first()?["code"].as_i64()
+}
+
+/// User-facing text for a non-2xx API response. Only refusals (400/401/403/404)
+/// keep the wording that points at the token; rate limits and service errors
+/// must not read like a missing permission (`is_access_refusal` and the UI
+/// rely on this).
+fn failure_message(status: StatusCode, code: Option<i64>, uncertain_write: bool) -> String {
+    let http = status.as_u16();
+    // A write that may have been applied must not read like a plain retry.
+    let outcome = if uncertain_write {
+        "写入结果不确定，请先查看待处理操作再继续"
+    } else {
+        "请稍后再试"
+    };
+    if status == StatusCode::TOO_MANY_REQUESTS {
+        return format!("Cloudflare 请求过于频繁（HTTP {http}），请稍候 1 分钟再试");
+    }
+    if status.is_server_error() {
+        return format!("Cloudflare 服务暂时不可用（HTTP {http}），{outcome}");
+    }
+    if matches!(http, 400 | 401 | 403 | 404) {
+        return format!("云端请求失败（HTTP {http}），请检查令牌权限与资源状态");
+    }
+    let code = code.map_or_else(String::new, |code| format!("，Cloudflare 代码 {code}"));
+    if uncertain_write {
+        return format!("云端请求失败（HTTP {http}{code}），{outcome}");
+    }
+    format!("云端请求失败（HTTP {http}{code}），请检查资源状态后重试")
+}
+
 #[derive(Debug)]
 pub struct CloudError {
     pub message: String,
@@ -362,12 +413,17 @@ impl Cloud {
             }
             let status = response.status();
             if !status.is_success() {
+                let code = if status.is_client_error()
+                    && !matches!(status.as_u16(), 400 | 401 | 403 | 404 | 429)
+                {
+                    error_code(response).await
+                } else {
+                    None
+                };
+                let uncertain = write && uncertain_write_status(status);
                 return Err(CloudError::new(
-                    format!(
-                        "云端请求失败（HTTP {}），请检查令牌权限与资源状态",
-                        status.as_u16()
-                    ),
-                    write && uncertain_write_status(status),
+                    failure_message(status, code, uncertain),
+                    uncertain,
                 ));
             }
             let value: Value = response
@@ -387,6 +443,7 @@ impl Cloud {
             }
             return Ok(value);
         }
+        // Not reached: the last attempt always returns above, including a final 429.
         Err(CloudError::new("请求过于频繁，请稍后再试", false))
     }
 
@@ -923,5 +980,118 @@ mod tests {
     #[test]
     fn kv_keys_are_encoded_for_path_segments() {
         assert_eq!(encode("l:example.com:a/b"), "l%3Aexample.com%3Aa%2Fb");
+    }
+
+    async fn failed_get(status: u16, body: Option<Value>) -> CloudError {
+        use wiremock::{
+            matchers::{method, path},
+            Mock, MockServer, ResponseTemplate,
+        };
+        let server = MockServer::start().await;
+        let mut response = ResponseTemplate::new(status).insert_header("retry-after", "0");
+        if let Some(body) = body {
+            response = response.set_body_json(body);
+        }
+        Mock::given(method("GET"))
+            .and(path("/client/v4/zones"))
+            .respond_with(response)
+            .mount(&server)
+            .await;
+        Cloud::for_test(&format!("{}/client/v4/", server.uri()))
+            .get("synthetic-token", "zones")
+            .await
+            .unwrap_err()
+    }
+
+    #[tokio::test]
+    async fn rate_limit_and_service_errors_do_not_read_as_refusals() {
+        let blocked = ["错误码", "令牌", "权限", "授权", "凭据"];
+        for status in [429, 500, 503] {
+            let error = failed_get(status, None).await;
+            assert!(error.message.contains(&format!("HTTP {status}")));
+            assert!(
+                !crate::is_access_refusal(&error.message),
+                "{}",
+                error.message
+            );
+            for word in blocked {
+                assert!(!error.message.contains(word), "{}", error.message);
+            }
+            for refusal in ["HTTP 400", "HTTP 401", "HTTP 403", "HTTP 404"] {
+                assert!(!error.message.contains(refusal));
+            }
+            assert!(!error.uncertain);
+        }
+        let error = failed_get(429, None).await;
+        assert!(error.message.contains("请求过于频繁"));
+        let error = failed_get(500, None).await;
+        assert!(error.message.contains("暂时不可用"));
+    }
+
+    #[tokio::test]
+    async fn uncertain_write_failures_say_the_outcome_is_unknown() {
+        use wiremock::{
+            matchers::{method, path},
+            Mock, MockServer, ResponseTemplate,
+        };
+        for (status, uncertain) in [(503, true), (408, true), (409, false), (403, false)] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/client/v4/zones"))
+                .respond_with(ResponseTemplate::new(status))
+                .mount(&server)
+                .await;
+            let error = Cloud::for_test(&format!("{}/client/v4/", server.uri()))
+                .post("synthetic-token", "zones", json!({}))
+                .await
+                .unwrap_err();
+            assert_eq!(error.uncertain, uncertain, "{status}");
+            assert_eq!(
+                error.message.contains("写入结果不确定"),
+                uncertain,
+                "{}",
+                error.message
+            );
+            assert!(error.message.contains(&format!("HTTP {status}")));
+            if uncertain {
+                assert!(!crate::is_access_refusal(&error.message));
+                assert!(!error.message.contains("令牌"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn refusals_keep_status_and_other_client_errors_show_cloudflare_code() {
+        for status in [401, 403] {
+            let error = failed_get(status, None).await;
+            assert!(error.message.contains(&format!("HTTP {status}")));
+            assert!(error.message.contains("令牌权限"));
+            assert!(crate::is_access_refusal(&error.message));
+        }
+        let error = failed_get(
+            409,
+            Some(json!({"success": false, "errors": [{"code": 10014, "message": "x"}]})),
+        )
+        .await;
+        assert!(error.message.contains("HTTP 409"));
+        assert!(error.message.contains("Cloudflare 代码 10014"));
+        assert!(!crate::is_access_refusal(&error.message));
+        // Only 400/401/403/404 point at the token.
+        for word in ["错误码", "令牌", "权限", "授权", "凭据"] {
+            assert!(!error.message.contains(word), "{}", error.message);
+        }
+        for status in [400, 404] {
+            let error = failed_get(status, None).await;
+            assert!(error.message.contains("令牌权限"));
+            assert!(crate::is_access_refusal(&error.message));
+        }
+        // Unreadable or oversized bodies fall back to the status only.
+        let error = failed_get(422, None).await;
+        assert!(error.message.contains("HTTP 422"));
+        assert!(!error.message.contains("Cloudflare 代码"));
+        assert!(!error.message.contains("令牌"));
+        let large = json!({"errors": [{"code": 1}], "pad": "x".repeat(MAX_ERROR_BODY)});
+        let error = failed_get(422, Some(large)).await;
+        assert!(!error.message.contains("Cloudflare 代码"));
     }
 }

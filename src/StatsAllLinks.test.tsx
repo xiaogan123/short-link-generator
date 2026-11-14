@@ -71,3 +71,18 @@ it("sorts and pages locally, then resets for search and changed item identity", 
   expect(screen.getByText(/第 1 \/ 1 页/)).toBeTruthy();
   expect(screen.getByText("https://b.example.com/r/new")).toBeTruthy();
 });
+
+it("keeps detail buttons disabled while the overview is still reading", () => {
+  const items = [item("A", "a", "busy", 1)];
+  const rendered = render(view(items, true));
+  const button = screen.getByRole("button", { name: "详细统计" }) as HTMLButtonElement;
+  expect(button.disabled).toBe(true);
+  expect(button.title).toBe("读取完成后可查看详细统计");
+  fireEvent.click(button);
+  expect(onOpenLinkStats).not.toHaveBeenCalled();
+  rendered.rerender(view(items));
+  const ready = screen.getByRole("button", { name: "详细统计" }) as HTMLButtonElement;
+  expect(ready.disabled).toBe(false);
+  fireEvent.click(ready);
+  expect(onOpenLinkStats).toHaveBeenCalledWith(items[0].link, items[0].domain);
+});

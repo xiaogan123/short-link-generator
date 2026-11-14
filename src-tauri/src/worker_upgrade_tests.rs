@@ -103,6 +103,11 @@ async fn mount_upgrade_namespace(
                 .is_none());
             let mut state = state.lock().unwrap();
             let (metadata, uploaded_source) = sync_upload_parts(request);
+            // A 4xx refusal is rejected before processing: the cloud is unchanged.
+            if (400..500).contains(&state.upload_status) {
+                return ResponseTemplate::new(state.upload_status)
+                    .insert_header("retry-after", "0");
+            }
             if !state.delay_content_visibility {
                 state.source = uploaded_source;
             }
@@ -325,6 +330,62 @@ async fn upgrade_interruptions_resume_only_manifest_and_keep_durable_intent() {
         assert!(backend.db.pending_worker_upgrades.is_empty());
     }
 }
+#[tokio::test]
+async fn upgrade_definite_refusal_clears_record_but_rate_limit_keeps_it() {
+    let (server, mut backend, guard) = fixture().await;
+    let remote = mount_upgrade(&server, &backend.path).await;
+    remote.lock().unwrap().upload_status = 403;
+    let error = apply_upgrade(&mut backend).await.unwrap_err();
+    assert!(error.contains("Cloudflare 拒绝了这次上传"), "{error}");
+    assert!(error.contains("HTTP 403"));
+    assert!(error.contains("云端未改变"));
+    assert!(backend.db.pending_worker_upgrades.is_empty());
+    assert!(backend.db.pending_operations.is_empty());
+    let saved: Database = serde_json::from_slice(&fs::read(&backend.path).unwrap()).unwrap();
+    assert!(saved.pending_worker_upgrades.is_empty());
+    assert!(saved.pending_operations.is_empty());
+    assert_eq!(remote.lock().unwrap().source, OLD_SOURCE);
+    // The account is not locked: a later upgrade can run normally.
+    remote.lock().unwrap().upload_status = 200;
+    apply_upgrade(&mut backend).await.unwrap();
+    assert!(backend.db.pending_worker_upgrades.is_empty());
+    drop((server, backend, guard));
+
+    let (server, mut backend, _guard) = fixture().await;
+    let remote = mount_upgrade(&server, &backend.path).await;
+    remote.lock().unwrap().upload_status = 429;
+    let error = apply_upgrade(&mut backend).await.unwrap_err();
+    assert!(!error.contains("Cloudflare 拒绝了这次上传"), "{error}");
+    assert_eq!(backend.db.pending_worker_upgrades.len(), 1);
+    assert_eq!(backend.db.pending_operations.len(), 1);
+    assert!(backend.db.pending_operations[0].contains("上传未确认"));
+}
+
+#[tokio::test]
+async fn upgrade_refusal_record_is_kept_when_clearing_cannot_be_saved() {
+    let (server, mut backend, _guard) = fixture().await;
+    let remote = mount_upgrade(&server, &backend.path).await;
+    remote.lock().unwrap().upload_status = 400;
+    let plan = backend
+        .prepare_change(&json!({"kind":"upgrade_worker","accountId":"acct1"}))
+        .unwrap();
+    let base = backend
+        .persist_count
+        .load(std::sync::atomic::Ordering::SeqCst);
+    // The first persist records intent; the second (clearing) fails.
+    backend
+        .fail_persist_at
+        .store(base + 2, std::sync::atomic::Ordering::SeqCst);
+    let error = backend
+        .dispatch("apply_plan", &json!({"planId":plan["id"]}))
+        .await
+        .unwrap_err();
+    assert!(error.contains("升级记录未清除"), "{error}");
+    assert_eq!(backend.db.pending_worker_upgrades.len(), 1);
+    let saved: Database = serde_json::from_slice(&fs::read(&backend.path).unwrap()).unwrap();
+    assert_eq!(saved.pending_worker_upgrades.len(), 1);
+}
+
 #[tokio::test]
 async fn upgrade_unknown_source_does_not_write_and_explicit_dismiss_is_local() {
     let (server, mut backend, _guard) = fixture().await;
@@ -1579,4 +1640,66 @@ async fn invalid_protection_bindings_stop_before_write() {
             .is_err());
         assert!(writes(&server).await.is_empty());
     }
+}
+
+#[tokio::test]
+async fn upgrade_blockers_name_the_pending_operation_and_account() {
+    let (server, mut backend, _guard) = fixture().await;
+    backend.db.pending_operations = vec![
+        "保存链接 example.com / short (abc)：写入结果不确定，需要人工核对".into(),
+        "添加域名 www.example.com/go (def)".into(),
+    ];
+    let error = backend
+        .prepare_change(&json!({"kind":"upgrade_worker","accountId":"acct1"}))
+        .unwrap_err();
+    assert!(
+        error.contains(
+            "保存链接 example.com / short (abc)：写入结果不确定，需要人工核对（共 2 项）"
+        ),
+        "{error}"
+    );
+    assert!(error.contains("再升级此账户的 Worker"));
+    backend.db.pending_operations.clear();
+    backend
+        .db
+        .pending_monitor_changes
+        .push(PendingMonitorChange {
+            account_id: "acct1".into(),
+            endpoint: "https://probe.example/check".into(),
+            enabled: true,
+            journal: "monitor (x)".into(),
+        });
+    let error = backend
+        .prepare_change(&json!({"kind":"upgrade_worker","accountId":"acct1"}))
+        .unwrap_err();
+    assert!(
+        error.contains("账户「账号 1」的监测名单同步（共 1 项）"),
+        "{error}"
+    );
+    backend.db.pending_monitor_changes.clear();
+    backend
+        .db
+        .pending_selftest_rotations
+        .push(PendingSelftestRotation {
+            account_id: "acct1".into(),
+            script: "edge-one".into(),
+            namespace: "ns1".into(),
+            journal: "重置自检密钥 acct1 (x)".into(),
+            status: SelftestRotationStatus::Staged,
+        });
+    let error = backend
+        .prepare_change(&json!({"kind":"upgrade_worker","accountId":"acct1"}))
+        .unwrap_err();
+    assert!(error.contains("账户「账号 1」的检测密钥轮换"), "{error}");
+    backend.db.pending_selftest_rotations.clear();
+    assert!(backend
+        .prepare_change(&json!({"kind":"upgrade_worker","accountId":"acct1"}))
+        .is_ok());
+    // A pending upgrade on this account names the account.
+    let remote = mount_upgrade(&server, &backend.path).await;
+    remote.lock().unwrap().upload_status = 503;
+    assert!(apply_upgrade(&mut backend).await.is_err());
+    let error = backend.require_no_worker_upgrade("acct1").unwrap_err();
+    assert!(error.starts_with("账户「账号 1」："), "{error}");
+    assert!(error.contains("Worker 升级尚未核对"));
 }

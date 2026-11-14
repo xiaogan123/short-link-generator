@@ -21,6 +21,7 @@ type ViewState =
   | { kind: "report"; report: ClickStats }
   | { kind: "error"; message: string }
   | { kind: "no-account" }
+  | { kind: "token-recovery" }
   | { kind: "credential-migration" };
 
 const ranges: { value: ClickStatsDays; label: string }[] = [
@@ -101,6 +102,10 @@ export default function ClickStatsDialog({
       setView({ kind: "no-account" });
       return;
     }
+    if (account.needsTokenRecovery) {
+      setView({ kind: "token-recovery" });
+      return;
+    }
     if (account.needsCredentialMigration) {
       setView({ kind: "credential-migration" });
       return;
@@ -141,7 +146,7 @@ export default function ClickStatsDialog({
     } finally {
       if (inFlight.current.get(requestKey) === request) inFlight.current.delete(requestKey);
     }
-  }, [account?.id, account?.needsCredentialMigration, days, domain.id, link.slug, revision]);
+  }, [account?.id, account?.needsTokenRecovery, account?.needsCredentialMigration, days, domain.id, link.slug, revision]);
 
   useEffect(() => {
     void load();
@@ -152,7 +157,7 @@ export default function ClickStatsDialog({
   const checkBeforeDisable = view.kind === "error" || report?.status === "unavailable";
   const showConfigure = accountUnavailable || report !== undefined || checkBeforeDisable;
   const enabling = accountUnavailable || report?.status === "disabled";
-  const configureDisabled = busy || !account || Boolean(account.needsCredentialMigration);
+  const configureDisabled = busy || !account || Boolean(account.needsCredentialMigration) || Boolean(account.needsTokenRecovery);
 
   const openTokenSettings = async () => {
     setOpenerError("");
@@ -186,6 +191,9 @@ export default function ClickStatsDialog({
     }
     if (view.kind === "no-account") {
       return <Notice title="未连接账户" tone="warning">没有找到此域名连接的 Cloudflare 账户，暂时无法读取或配置访问统计。</Notice>;
+    }
+    if (view.kind === "token-recovery") {
+      return <Notice title="令牌导入未完成" tone="warning">请到“Cloudflare 账户”恢复此账户的令牌（重试导入或更新令牌）后，再查看或配置访问统计。</Notice>;
     }
     if (view.kind === "credential-migration") {
       return <Notice title="需要先更新本机授权" tone="warning">请先到“账户”完成此账户的本机授权迁移，再查看或配置访问统计。</Notice>;

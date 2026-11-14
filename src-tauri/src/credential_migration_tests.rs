@@ -521,3 +521,28 @@ async fn migration_removal_failure_retains_account_and_never_touches_legacy_name
         assert!(server.received_requests().await.unwrap().is_empty());
     }
 }
+
+#[tokio::test]
+async fn removal_persist_failure_explains_state_and_retry_completes() {
+    let (server, mut backend, _dir) = fixture().await;
+    let before = backend.database_snapshot();
+    backend
+        .fail_persist_at
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+    let error = backend
+        .dispatch("remove_account", &json!({"accountId":"acct1"}))
+        .await
+        .unwrap_err();
+    assert!(error.contains("测试注入：本机配置保存失败"), "{error}");
+    assert!(error.contains("本机凭据已删除，但账户记录没能移除"));
+    assert!(error.contains("请再点一次“确认本机移除”"));
+    assert!(error.contains("更换本机令牌"));
+    assert!(!error.contains("test-token-value"));
+    assert_eq!(backend.database_snapshot(), before);
+    backend
+        .dispatch("remove_account", &json!({"accountId":"acct1"}))
+        .await
+        .unwrap();
+    assert!(backend.db.accounts.is_empty());
+    assert!(server.received_requests().await.unwrap().is_empty());
+}

@@ -172,11 +172,13 @@ function previewDispatch(action: Action, payload: Record<string, unknown>): unkn
       local.accounts = local.accounts.map(item => item.id === account.id ? {...item,needsTokenRecovery:false} : item);
       return clone();
     }
+    // Mirrors the desktop rule: a plain import only adds accounts that are not
+    // connected yet and never touches the token of an existing one.
     const existing = local.accounts.find(a => a.id === 'demo-imported');
-    if (existing && !payload.replace) throw new Error('该账户已经存在。请确认是否替换本机保存的令牌。');
-    if (!existing) local.accounts.push({ id: 'demo-imported', label: '导入的示例账户', zoneCount: 1, checkedAt: now(), hasResources: false, needsSelftestKey: false, needsCredentialMigration: false });
-    else local.accounts = local.accounts.map(a => a.id === existing.id ? {...a, needsCredentialMigration: false} : a);
-    return clone();
+    if (existing) throw new Error(`这个令牌里的账号都已经导入过，没有新账号可导入。已导入过的账号「${existing.label}」保持不变，保存的令牌没有改动。要给某个账号换令牌，请在账户列表打开它的“管理账户”，选择“更换本机令牌”。`);
+    const skipped = local.accounts.slice(0, 1).map(account => ({id: account.id, label: account.label}));
+    local.accounts.push({ id: 'demo-imported', label: '导入的示例账户', zoneCount: 1, checkedAt: now(), hasResources: false, needsSelftestKey: false, needsCredentialMigration: false });
+    return {...clone(), importReport: {imported: [{id: 'demo-imported', name: '导入的示例账户'}], skipped, rejected: []}};
   }
   if (action === 'rename_account') { local.accounts = local.accounts.map(a => a.id === payload.accountId ? { ...a, label: String(payload.label) } : a); return clone(); }
   if (action === 'remove_account') {
@@ -264,6 +266,8 @@ function previewDispatch(action: Action, payload: Record<string, unknown>): unkn
     }
     const titles: Record<string, string> = { save_link: '保存短链接', delete_link: '删除短链接', save_pool: '保存平台地址', resume_pool_sync:'继续同步平台地址', delete_pool: '删除平台地址', remove_domain: '移除域名', cleanup_account: '清理远端资源', recover_account: '恢复账户资源', rotate_selftest: '轮换检测密钥', recover_selftest_rotation: '恢复检测密钥', resume_selftest_rotation: '继续恢复检测密钥' };
     if (kind === 'delete_pool' && local.links.some(l => l.poolId === payload.poolId)) throw new Error('平台地址仍有链接引用，无法删除。');
+    // Same gate as the desktop backend: domains must be removed first.
+    if (kind === 'cleanup_account' && local.domains.some(d => d.accountId === payload.accountId)) throw new Error('此账号还有域名，请先移除域名');
     return makePlan(titles[kind] || '确认变更', [`核对当前状态与资源归属`, `${titles[kind] || kind}并记录结果`], kind === 'delete_link' || kind === 'remove_domain' || kind === 'cleanup_account' ? ['该操作会修改远端资源。请确认影响范围。'] : [], kind, payload);
   }
   if (action === 'apply_plan') {
@@ -292,7 +296,11 @@ function previewDispatch(action: Action, payload: Record<string, unknown>): unkn
       if (p.poolId && !pool) throw new Error('平台地址不存在。');
       const code = String(p.code || '');
       const entry: Link = pool ? { domainId: String(p.domainId), slug: String(p.slug), poolId: pool.id, code, cnUrl: '', defaultUrl: '', updated: now() } : { domainId: String(p.domainId), slug: String(p.slug), cnUrl: String(p.cnUrl), defaultUrl: String(p.defaultUrl), updated: now() };
-      local.links = local.links.filter(l => !(l.domainId === entry.domainId && l.slug === entry.slug)); local.links.push(entry);
+      // Like the desktop app: an edited link keeps its position; a new one is appended.
+      const same = (l: Link) => l.domainId === entry.domainId && l.slug === entry.slug;
+      const index = local.links.findIndex(same);
+      if (index < 0) local.links.push(entry);
+      else local.links = local.links.map((l, i) => i === index ? entry : l).filter((l, i) => i === index || !same(l));
     }
     if (item.action === 'save_pool') {const pool = p.pool as Pool; const saved = {...pool,id:pool.id || uid(),updated:now(),syncStatus:pool.accountIds.map(accountId=>({accountId,status:'unknown',message:'本地预览不会同步云端。'}))}; local.pools = (local.pools || []).filter(x=>x.id!==saved.id).concat(saved);}
     if (item.action === 'delete_pool') local.pools = (local.pools || []).filter(x=>x.id!==p.poolId);

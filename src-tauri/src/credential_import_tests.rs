@@ -6,6 +6,25 @@ use wiremock::{
 };
 
 async fn authorize(server: &MockServer, ids: &[&str]) {
+    authorize_except(server, ids, &[], 403).await;
+}
+/// Lists every id as an account of the token; ids in `refused` answer their
+/// account-level reads with `refused_status` instead of succeeding.
+async fn authorize_except(
+    server: &MockServer,
+    ids: &[&str],
+    refused: &[&str],
+    refused_status: u16,
+) {
+    for id in refused {
+        Mock::given(method("GET"))
+            .and(wiremock::matchers::path_regex(format!(
+                "^/client/v4/accounts/{id}/"
+            )))
+            .respond_with(ResponseTemplate::new(refused_status))
+            .mount(server)
+            .await;
+    }
     let ok = |value: Value| {
         ResponseTemplate::new(200).set_body_json(json!({"success":true,"result":value}))
     };
@@ -246,4 +265,145 @@ async fn readback_mismatch_stays_gated_until_explicit_scoped_recovery() {
         .unwrap();
     assert_eq!(keyring_get("acct1", "token").unwrap(), token);
     assert!(backend.require_credentials("acct1").is_ok());
+}
+
+fn account_requests(requests: &[wiremock::Request], id: &str) -> usize {
+    requests
+        .iter()
+        .filter(|request| {
+            request
+                .url
+                .path()
+                .starts_with(&format!("/client/v4/accounts/{id}/"))
+        })
+        .count()
+}
+
+#[tokio::test]
+async fn shared_token_adds_only_the_new_account_and_keeps_the_saved_token() {
+    let (server, mut backend, _guard) = tests::fixture().await;
+    backend.persist().unwrap();
+    let saved = keyring_get("acct1", "token").unwrap();
+    let before = backend.db.accounts[0].clone();
+    authorize(&server, &["acct1", "acct2"]).await;
+    let token = "g".repeat(35);
+    let state = backend.import_token(&token, false, None).await.unwrap();
+    assert_eq!(keyring_get("acct1", "token").unwrap(), saved);
+    assert_eq!(keyring_get("acct2", "token").unwrap(), token);
+    reload_database(&mut backend);
+    assert_eq!(backend.db.accounts.len(), 2);
+    assert_eq!(backend.db.accounts[0].label, before.label);
+    assert_eq!(backend.db.accounts[0].checked_at, before.checked_at);
+    assert!(backend.db.accounts.iter().all(|a| !a.token_import_pending));
+    assert_eq!(state["importReport"]["imported"][0]["id"], "acct2");
+    assert_eq!(state["importReport"]["skipped"][0]["id"], "acct1");
+    assert_eq!(state["importReport"]["skipped"][0]["label"], "账号 1");
+    assert_eq!(state["importReport"]["rejected"], json!([]));
+    assert!(!fs::read_to_string(&backend.path)
+        .unwrap()
+        .contains("importReport"));
+    // A skipped account is not probed with the pasted token at all.
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(account_requests(&requests, "acct1"), 0);
+}
+
+#[tokio::test]
+async fn broad_replace_flag_never_overwrites_a_completed_account() {
+    let (server, mut backend, _guard) = tests::fixture().await;
+    backend.persist().unwrap();
+    let saved = keyring_get("acct1", "token").unwrap();
+    authorize(&server, &["acct1", "acct2"]).await;
+    let token = "h".repeat(35);
+    backend.import_token(&token, true, None).await.unwrap();
+    assert_eq!(keyring_get("acct1", "token").unwrap(), saved);
+    assert_eq!(keyring_get("acct2", "token").unwrap(), token);
+}
+
+#[tokio::test]
+async fn token_with_only_imported_accounts_changes_nothing_and_says_so() {
+    let (server, mut backend, _guard) = tests::fixture().await;
+    backend.persist().unwrap();
+    let saved = keyring_get("acct1", "token").unwrap();
+    let before = backend.database_snapshot();
+    authorize(&server, &["acct1"]).await;
+    for replace in [false, true] {
+        let error = backend
+            .import_token(&"i".repeat(35), replace, None)
+            .await
+            .unwrap_err();
+        assert!(error.contains("都已经导入过"));
+        assert!(error.contains("「账号 1」"));
+        assert!(error.contains("更换本机令牌"));
+    }
+    assert_eq!(keyring_get("acct1", "token").unwrap(), saved);
+    assert_eq!(backend.database_snapshot(), before);
+    assert!(mock_key_mutations().lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn refused_account_is_left_out_without_blocking_the_others() {
+    let (server, mut backend, _guard) = tests::fixture().await;
+    backend.persist().unwrap();
+    authorize_except(&server, &["acct1", "acct2", "acct3"], &["acct2"], 403).await;
+    let token = "j".repeat(35);
+    let state = backend.import_token(&token, false, None).await.unwrap();
+    assert_eq!(keyring_get("acct3", "token").unwrap(), token);
+    assert!(keyring_get("acct2", "token").is_err());
+    assert!(backend.db.accounts.iter().all(|a| a.id != "acct2"));
+    assert_eq!(state["importReport"]["imported"][0]["id"], "acct3");
+    assert_eq!(state["importReport"]["rejected"][0]["id"], "acct2");
+    assert!(state["importReport"]["rejected"][0]["reason"]
+        .as_str()
+        .unwrap()
+        .contains("Workers 脚本读取权限"));
+    assert_eq!(state["importReport"]["skipped"][0]["id"], "acct1");
+}
+
+#[tokio::test]
+async fn refused_only_account_names_the_account_and_stores_nothing() {
+    let (server, mut backend, _guard) = tests::fixture().await;
+    backend.persist().unwrap();
+    let before = backend.database_snapshot();
+    authorize_except(&server, &["acct1", "acct2"], &["acct2"], 403).await;
+    let error = backend
+        .import_token(&"k".repeat(35), false, None)
+        .await
+        .unwrap_err();
+    assert!(error.contains("没有导入任何账号"));
+    assert!(error.contains("账号「Example Account」"));
+    assert!(error.contains("Workers 脚本读取权限"));
+    assert!(error.contains("「账号 1」保持不变"));
+    assert!(keyring_get("acct2", "token").is_err());
+    assert_eq!(backend.database_snapshot(), before);
+}
+
+#[tokio::test]
+async fn service_failure_stops_the_import_and_is_not_called_a_permission_problem() {
+    let (server, mut backend, _guard) = tests::fixture().await;
+    backend.persist().unwrap();
+    let before = backend.database_snapshot();
+    authorize_except(&server, &["acct2", "acct3"], &["acct2"], 500).await;
+    let error = backend
+        .import_token(&"l".repeat(35), false, None)
+        .await
+        .unwrap_err();
+    assert!(error.contains("HTTP 500"));
+    assert!(!error.contains("缺少"));
+    assert!(keyring_get("acct3", "token").is_err());
+    assert_eq!(backend.database_snapshot(), before);
+}
+
+#[tokio::test]
+async fn scoped_update_still_reports_a_refusal_for_the_selected_account() {
+    let (server, mut backend, _guard) = tests::fixture().await;
+    backend.persist().unwrap();
+    let saved = keyring_get("acct1", "token").unwrap();
+    authorize_except(&server, &["acct1", "acct2"], &["acct1"], 403).await;
+    let error = backend
+        .import_token(&"m".repeat(35), true, Some("acct1"))
+        .await
+        .unwrap_err();
+    assert_eq!(error, "令牌缺少 Workers 脚本读取权限");
+    assert_eq!(keyring_get("acct1", "token").unwrap(), saved);
+    assert!(keyring_get("acct2", "token").is_err());
 }

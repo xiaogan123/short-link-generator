@@ -118,7 +118,9 @@ function LinkGroupSection({ domain, links, pools, getDetection, getAutoDetection
   const [pageState, setPageState] = useState({ linkKey: "", page: 1 });
   const [expanded, setExpanded] = useState<Set<string>>(() => new Set());
   const headerRef = useRef<HTMLElement>(null);
-  const linkKey = JSON.stringify(links.map((link) => link.slug));
+  // Keyed by the set of slugs: editing a link may reorder it, which must not
+  // reset the page or collapse details; adding or removing one still does.
+  const linkKey = JSON.stringify(links.map((link) => link.slug).sort());
   if (pageState.linkKey !== linkKey) {
     setPageState({ linkKey, page: 1 });
     setExpanded(new Set());

@@ -147,6 +147,21 @@ struct DomainTakeover<'a> {
 fn problem(error: CloudError) -> String {
     error.message
 }
+/// Outcome of the read checks an account must pass before it is imported.
+enum ImportAccessError {
+    /// Cloudflare refused this token for this account.
+    Denied(String),
+    /// The check could not be completed (network, rate limit, service error).
+    Failed(String),
+}
+/// True when a cloud read failed because the request was refused, as opposed
+/// to a network, rate-limit or service failure.
+fn is_access_refusal(message: &str) -> bool {
+    message.contains("错误码")
+        || ["HTTP 400", "HTTP 401", "HTTP 403", "HTTP 404"]
+            .iter()
+            .any(|status| message.contains(status))
+}
 fn dns_write_error(error: CloudError) -> String {
     if error.message.contains("HTTP 403") {
         "Cloudflare 拒绝修改 DNS（HTTP 403）。请检查此令牌的 DNS 编辑权限和域名授权范围，补齐授权后再继续；已有功能仍可使用。".into()
@@ -592,6 +607,22 @@ fn valid_cleanup_metadata(key: &str, raw: &str) -> bool {
         })
 }
 
+/// A platform address copy may be removed by account cleanup only when its ID
+/// is valid, its value is a readable copy, and the same pool still exists in
+/// the local pool library (so the definition is not lost).
+fn valid_cleanup_pool_copy(pool_id: &str, raw: &str, local: &[Pool]) -> bool {
+    if !pools::valid_id(pool_id) || raw.len() > 262_144 {
+        return false;
+    }
+    let Ok(value) = serde_json::from_str::<Value>(raw) else {
+        return false;
+    };
+    value
+        .as_object()
+        .is_some_and(|o| o.get("version") == Some(&json!(1)))
+        && local.iter().any(|pool| pool.id == pool_id)
+}
+
 fn normalize_host(input: &str) -> Result<String, String> {
     let value = input.trim();
     let url = url::Url::parse(
@@ -717,6 +748,24 @@ fn clear_journal(pending: &mut Vec<String>, id: &str) -> Result<(), String> {
     }
     Ok(())
 }
+/// Last eight characters of an account ID, to name an account that has no
+/// local label. Account IDs are not secret.
+fn id_tail(id: &str) -> String {
+    let chars: Vec<char> = id.chars().collect();
+    chars[chars.len().saturating_sub(8)..].iter().collect()
+}
+/// Removes earlier save/delete records for one link (for example an uncertain
+/// write) once a later write for the same host and slug has succeeded. The
+/// trailing " (" keeps `ab` from matching `abc`. `current` is left in place.
+fn clear_link_leftovers(pending: &mut Vec<String>, host: &str, slug: &str, current: &str) {
+    let prefixes = [
+        format!("保存链接 {host} / {slug} ("),
+        format!("删除链接 {host} / {slug} ("),
+    ];
+    pending.retain(|entry| {
+        journal_matches(entry, current) || !prefixes.iter().any(|p| entry.starts_with(p))
+    });
+}
 fn selftest_rotation_prefix(account_id: &str) -> String {
     format!("重置自检密钥 {account_id} (")
 }
@@ -839,10 +888,17 @@ impl Backend {
     fn require_credentials(&self, id: &str) -> Result<(), String> {
         let account = self.account(id)?;
         if account.token_import_pending {
-            return Err("此账号的令牌导入尚未完成，请重试原令牌或明确更新该账号令牌".into());
+            return Err(format!(
+                "账户「{}」：此账号的令牌导入尚未完成，请重试原令牌或明确更新该账号令牌",
+                account.label
+            ));
         }
         if cfg!(target_os = "macos") && account.mac_credential_schema != 2 {
-            return Err(secret_store::SecretError::MigrationRequired.to_string());
+            return Err(format!(
+                "账户「{}」：{}",
+                account.label,
+                secret_store::SecretError::MigrationRequired
+            ));
         }
         Ok(())
     }
@@ -1122,7 +1178,14 @@ impl Backend {
                 return Err("这个访问令牌不属于所选账号，请为该账号创建并粘贴新令牌".into());
             }
         }
+        // A token can list several accounts. A plain import only adds the ones
+        // that are not connected yet: completed accounts are skipped and keep
+        // their saved token, and an account the token cannot manage is left out
+        // without blocking the others. Replacing a saved token always goes
+        // through the account-scoped update (`expected_account_id`).
         let mut imported = Vec::new();
+        let mut skipped = Vec::new();
+        let mut rejected = Vec::new();
         for remote in accounts.into_iter().filter(|account| {
             expected_account_id.is_none_or(|expected| account["id"].as_str() == Some(expected))
         }) {
@@ -1134,32 +1197,72 @@ impl Backend {
             if cloudflare_name.is_empty() || cloudflare_name.chars().count() > 256 {
                 return Err("云端账号名称无效".into());
             }
-            if self
-                .db
-                .accounts
-                .iter()
-                .any(|a| a.id == id && !a.token_import_pending)
-                && !replace
-            {
-                return Err("这个账号已经导入过；若要换令牌，请确认替换".into());
+            if expected_account_id.is_none() {
+                if let Some(existing) = self
+                    .db
+                    .accounts
+                    .iter()
+                    .find(|a| a.id == id && !a.token_import_pending)
+                {
+                    skipped.push(json!({"id": id, "label": existing.label}));
+                    continue;
+                }
             }
-            self.cloud
-                .get(token, &format!("accounts/{id}/workers/scripts"))
-                .await
-                .map_err(|_| "令牌缺少 Workers 脚本读取权限".to_string())?;
-            self.cloud
-                .get(token, &format!("accounts/{id}/storage/kv/namespaces"))
-                .await
-                .map_err(|_| "令牌缺少 Workers KV 存储权限".to_string())?;
-            let zones = self.fetch_zones(token, &id).await?;
-            if let Some(zone) = zones.first() {
-                self.cloud
-                    .get(token, &format!("zones/{}/workers/routes", zone.id))
-                    .await
-                    .map_err(|_| "令牌缺少 Workers 路由读取权限".to_string())?;
+            match self.check_import_access(token, &id).await {
+                Ok(zones) => imported.push((id, cloudflare_name, zones)),
+                Err(ImportAccessError::Denied(reason)) if expected_account_id.is_none() => {
+                    rejected.push(json!({"id": id, "name": cloudflare_name, "reason": reason}));
+                }
+                Err(ImportAccessError::Denied(reason) | ImportAccessError::Failed(reason)) => {
+                    return Err(reason);
+                }
             }
-            imported.push((id, cloudflare_name, zones));
         }
+        if imported.is_empty() {
+            let names = |items: &[Value], key: &str| {
+                items
+                    .iter()
+                    .filter_map(|item| item[key].as_str())
+                    .map(|name| format!("「{name}」"))
+                    .collect::<Vec<_>>()
+                    .join("、")
+            };
+            let kept = if skipped.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "已导入过的账号{}保持不变，保存的令牌没有改动。",
+                    names(&skipped, "label")
+                )
+            };
+            if rejected.is_empty() {
+                return Err(format!(
+                    "这个令牌里的账号都已经导入过，没有新账号可导入。{kept}要给某个账号换令牌，请在账户列表打开它的“管理账户”，选择“更换本机令牌”"
+                ));
+            }
+            let reasons = rejected
+                .iter()
+                .map(|item| {
+                    format!(
+                        "账号「{}」：{}",
+                        item["name"].as_str().unwrap_or_default(),
+                        item["reason"].as_str().unwrap_or_default()
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("；");
+            return Err(format!(
+                "没有导入任何账号。{reasons}。{kept}请在 Cloudflare 补齐这个令牌的权限后重试"
+            ));
+        }
+        let report = json!({
+            "imported": imported
+                .iter()
+                .map(|(id, name, _)| json!({"id": id, "name": name}))
+                .collect::<Vec<_>>(),
+            "skipped": skipped,
+            "rejected": rejected,
+        });
         let before_import = self.db.clone();
         // Commit a visible, credential-gated account before any secret write.
         // A crash, denied/readback failure, or final commit failure can then be
@@ -1167,11 +1270,9 @@ impl Backend {
         // No token or token-derived digest is stored in local configuration.
         let mut writes = Vec::new();
         for (id, cloudflare_name, zones) in imported {
-            let previous = before_import.accounts.iter().find(|a| a.id == id);
-            let allow_replace = replace
-                && previous.is_some_and(|a| {
-                    !a.token_import_pending || expected_account_id == Some(id.as_str())
-                });
+            // Only the account-scoped update may overwrite a saved credential;
+            // it already required `replace` and an existing local account.
+            let allow_replace = replace && expected_account_id == Some(id.as_str());
             writes.push((id.clone(), allow_replace));
             if let Some(account) = self.db.accounts.iter_mut().find(|a| a.id == id) {
                 account.cloudflare_name = Some(cloudflare_name);
@@ -1226,7 +1327,47 @@ impl Backend {
             ));
         }
         self.publish_credential_routes();
-        Ok(self.state())
+        let mut state = self.state();
+        state["importReport"] = report;
+        Ok(state)
+    }
+
+    /// Checks the read access an imported account needs and returns its zones.
+    /// A refusal for this account is reported separately from a network or
+    /// service failure, so one unmanageable account does not look like a
+    /// missing permission on every account, and an outage is not reported as
+    /// a permission problem.
+    async fn check_import_access(
+        &self,
+        token: &str,
+        id: &str,
+    ) -> Result<Vec<Zone>, ImportAccessError> {
+        let classify = |message: String, denied: &str| {
+            if is_access_refusal(&message) {
+                ImportAccessError::Denied(denied.to_string())
+            } else {
+                ImportAccessError::Failed(message)
+            }
+        };
+        self.cloud
+            .get(token, &format!("accounts/{id}/workers/scripts"))
+            .await
+            .map_err(|error| classify(problem(error), "令牌缺少 Workers 脚本读取权限"))?;
+        self.cloud
+            .get(token, &format!("accounts/{id}/storage/kv/namespaces"))
+            .await
+            .map_err(|error| classify(problem(error), "令牌缺少 Workers KV 存储权限"))?;
+        let zones = self
+            .fetch_zones(token, id)
+            .await
+            .map_err(|error| classify(error, "令牌缺少域名读取权限"))?;
+        if let Some(zone) = zones.first() {
+            self.cloud
+                .get(token, &format!("zones/{}/workers/routes", zone.id))
+                .await
+                .map_err(|error| classify(problem(error), "令牌缺少 Workers 路由读取权限"))?;
+        }
+        Ok(zones)
     }
 
     async fn fetch_zones(&self, token: &str, account_id: &str) -> Result<Vec<Zone>, String> {
@@ -2315,7 +2456,7 @@ impl Backend {
                 (
                     "清理账号资源",
                     vec![
-                        "确认没有域名、业务记录、监测任务或未知数据后，清理已验证的遗留检测结果和轮转位置".into(),
+                        "确认没有域名、业务记录、监测任务或未知数据后，清理已验证的遗留检测结果、轮转位置，以及本机平台地址库中仍有定义的平台地址副本".into(),
                         format!("删除专用转发程序 Worker：{}", resources.script),
                         format!("删除专用链接存储 KV：{}", resources.namespace),
                     ],
@@ -2516,7 +2657,9 @@ impl Backend {
                 self.plans.clear();
                 if let Err(error) = self.persist() {
                     self.db = previous;
-                    return Err(error);
+                    return Err(format!(
+                        "{error}；本机凭据已删除，但账户记录没能移除。请再点一次“确认本机移除”；如果仍然失败，请在该账户的“管理账户”中选择“更换本机令牌”重新保存令牌"
+                    ));
                 }
                 self.publish_credential_routes();
                 Ok(self.state())
@@ -2973,7 +3116,12 @@ impl Backend {
             if label.is_empty() || label.chars().count() > 64 {
                 return Err("账号备注名无效".into());
             }
-            self.account(id)?;
+            if self.account(id).is_err() {
+                return Err(format!(
+                    "备份中的账户「{label}」（ID 末尾 {}）尚未导入本机。请先导入该账户的令牌，再导入这份备份；本机配置未改变",
+                    id_tail(id)
+                ));
+            }
             labels.push((id.to_owned(), label.to_owned()));
         }
         let mut credential_accounts = HashSet::new();
@@ -2987,6 +3135,18 @@ impl Backend {
             for id in ids {
                 credential_accounts.insert(id.as_str().ok_or("备份平台地址账号无效")?.to_owned());
             }
+        }
+        let mut missing: Vec<_> = credential_accounts
+            .iter()
+            .filter(|id| self.account(id).is_err())
+            .map(|id| id_tail(id))
+            .collect();
+        if !missing.is_empty() {
+            missing.sort();
+            return Err(format!(
+                "备份中的域名或平台地址属于尚未导入本机的账户（ID 末尾 {}）。请先导入该账户的令牌，再导入这份备份；本机配置未改变",
+                missing.join("、")
+            ));
         }
         self.require_many_credentials(credential_accounts.iter().map(String::as_str))?;
         // Import only records that already exist on the remote account; never write remote data.
@@ -3002,78 +3162,84 @@ impl Backend {
             let host = normalize_host(field(item, "host")?)?;
             let prefix = field(item, "prefix")?;
             validate_prefix(prefix)?;
-            let account = self.account(account_id)?;
-            let zone = account
-                .zones
-                .iter()
-                .filter(|z| {
-                    z.status == "active"
-                        && (host == z.name || host.ends_with(&format!(".{}", z.name)))
+            let checked: Result<Domain, String> = async {
+                let account = self.account(account_id)?;
+                let zone = account
+                    .zones
+                    .iter()
+                    .filter(|z| {
+                        z.status == "active"
+                            && (host == z.name || host.ends_with(&format!(".{}", z.name)))
+                    })
+                    .max_by_key(|z| z.name.len())
+                    .ok_or("备份域名未归属已启用区域")?;
+                let token = keyring_get(account_id, "token")?;
+                let routes = self
+                    .cloud
+                    .get(&token, &format!("zones/{}/workers/routes", zone.id))
+                    .await
+                    .map_err(problem)?;
+                let pattern = route_pattern(&host, prefix);
+                let route = routes["result"]
+                    .as_array()
+                    .and_then(|arr| {
+                        arr.iter()
+                            .find(|r| r["pattern"].as_str() == Some(pattern.as_str()))
+                    })
+                    .ok_or("备份中的域名路由在云端不存在")?;
+                let resources = account.resources.as_ref().ok_or("请先从账号找回云端资源")?;
+                if route["script"].as_str() != Some(resources.script.as_str()) {
+                    return Err("域名路由不属于已验证的 Worker".into());
+                }
+                let config = self
+                    .cloud
+                    .read_value(
+                        &token,
+                        account_id,
+                        &resources.namespace,
+                        &format!("c:{host}"),
+                    )
+                    .await
+                    .map_err(problem)?
+                    .ok_or("云端缺少域名前缀记录")?;
+                let config: Value =
+                    serde_json::from_str(&config).map_err(|_| "云端域名配置无效".to_string())?;
+                if config["prefix"].as_str() != Some(prefix) {
+                    return Err("云端域名前缀与备份不同".into());
+                }
+                let route_id = value_str(route, "id")?.to_owned();
+                let domain_id = self
+                    .db
+                    .domains
+                    .iter()
+                    .find(|d| d.host == host)
+                    .map(|d| {
+                        if d.account_id != account_id {
+                            return Err("同一主机名已有另一账号的本机配置".to_string());
+                        }
+                        if d.prefix != prefix || d.zone_id != zone.id || d.route_id != route_id {
+                            return Err(
+                                "本机已有该域名的不同前缀或路由；请先处理本机配置冲突，再导入备份"
+                                    .to_string(),
+                            );
+                        }
+                        Ok(d.id.clone())
+                    })
+                    .transpose()?
+                    .unwrap_or_else(random_id);
+                Ok(Domain {
+                    id: domain_id,
+                    account_id: account_id.into(),
+                    zone_id: zone.id.clone(),
+                    host: host.clone(),
+                    prefix: prefix.into(),
+                    route_id,
                 })
-                .max_by_key(|z| z.name.len())
-                .ok_or("备份域名未归属已启用区域")?;
-            let token = keyring_get(account_id, "token")?;
-            let routes = self
-                .cloud
-                .get(&token, &format!("zones/{}/workers/routes", zone.id))
-                .await
-                .map_err(problem)?;
-            let pattern = route_pattern(&host, prefix);
-            let route = routes["result"]
-                .as_array()
-                .and_then(|arr| {
-                    arr.iter()
-                        .find(|r| r["pattern"].as_str() == Some(pattern.as_str()))
-                })
-                .ok_or("备份中的域名路由在云端不存在")?;
-            let resources = account.resources.as_ref().ok_or("请先从账号找回云端资源")?;
-            if route["script"].as_str() != Some(resources.script.as_str()) {
-                return Err("域名路由不属于已验证的 Worker".into());
             }
-            let config = self
-                .cloud
-                .read_value(
-                    &token,
-                    account_id,
-                    &resources.namespace,
-                    &format!("c:{host}"),
-                )
-                .await
-                .map_err(problem)?
-                .ok_or("云端缺少域名前缀记录")?;
-            let config: Value =
-                serde_json::from_str(&config).map_err(|_| "云端域名配置无效".to_string())?;
-            if config["prefix"].as_str() != Some(prefix) {
-                return Err("云端域名前缀与备份不同".into());
-            }
-            let route_id = value_str(route, "id")?.to_owned();
-            let domain_id = self
-                .db
-                .domains
-                .iter()
-                .find(|d| d.host == host)
-                .map(|d| {
-                    if d.account_id != account_id {
-                        return Err("同一主机名已有另一账号的本机配置".to_string());
-                    }
-                    if d.prefix != prefix || d.zone_id != zone.id || d.route_id != route_id {
-                        return Err(
-                            "本机已有该域名的不同前缀或路由；请先处理本机配置冲突，再导入备份"
-                                .to_string(),
-                        );
-                    }
-                    Ok(d.id.clone())
-                })
-                .transpose()?
-                .unwrap_or_else(random_id);
-            recovered_domains.push(Domain {
-                id: domain_id,
-                account_id: account_id.into(),
-                zone_id: zone.id.clone(),
-                host,
-                prefix: prefix.into(),
-                route_id,
-            });
+            .await;
+            recovered_domains.push(checked.map_err(|e| {
+                format!("备份中的域名 {host}/{prefix}：{e}。没有导入任何内容，本机配置未改变")
+            })?);
         }
         let mut recovered_links = Vec::new();
         let mut recovered_pools = Vec::new();
@@ -3084,22 +3250,32 @@ impl Backend {
             pools::validate_pool(&pool)?;
             for id in &pool.account_ids {
                 let account = self.account(id)?;
-                let resources = account
-                    .resources
-                    .as_ref()
-                    .ok_or("备份平台地址账号缺少云端资源")?;
-                let token = keyring_get(id, "token")?;
-                let raw = self
-                    .cloud
-                    .read_value(&token, id, &resources.namespace, &format!("p:{}", pool.id))
-                    .await
-                    .map_err(problem)?
-                    .ok_or("云端缺少备份平台地址")?;
-                let remote: Value =
-                    serde_json::from_str(&raw).map_err(|_| "云端平台地址格式无效")?;
-                if !pools::matching_cloud_value(&pool, &remote) {
-                    return Err("云端平台地址与备份不同".into());
+                let checked: Result<(), String> = async {
+                    let resources = account
+                        .resources
+                        .as_ref()
+                        .ok_or("备份平台地址账号缺少云端资源")?;
+                    let token = keyring_get(id, "token")?;
+                    let raw = self
+                        .cloud
+                        .read_value(&token, id, &resources.namespace, &format!("p:{}", pool.id))
+                        .await
+                        .map_err(problem)?
+                        .ok_or("云端缺少备份平台地址")?;
+                    let remote: Value =
+                        serde_json::from_str(&raw).map_err(|_| "云端平台地址格式无效")?;
+                    if !pools::matching_cloud_value(&pool, &remote) {
+                        return Err("云端平台地址与备份不同".into());
+                    }
+                    Ok(())
                 }
+                .await;
+                checked.map_err(|e| {
+                    format!(
+                        "备份中的平台地址「{}」（账户「{}」）：{e}。没有导入任何内容，本机配置未改变",
+                        pool.name, account.label
+                    )
+                })?;
                 pool.sync_status.push(PoolSyncStatus {
                     account_id: id.clone(),
                     status: "synced".into(),
@@ -3120,66 +3296,89 @@ impl Backend {
             let domain = recovered_domains
                 .iter()
                 .find(|d| d.host == host)
-                .ok_or("链接没有对应域名")?;
+                .ok_or_else(|| {
+                    format!(
+                        "备份中的链接 {host} / {}：备份里没有它所属的域名。没有导入任何内容，本机配置未改变",
+                        item["slug"].as_str().unwrap_or_default()
+                    )
+                })?;
             let slug = field(item, "slug")?;
             validate_slug(slug)?;
-            let resources = self
-                .account(&domain.account_id)?
-                .resources
-                .as_ref()
-                .ok_or("缺少资源")?;
-            let token = keyring_get(&domain.account_id, "token")?;
-            let value = self
-                .cloud
-                .read_value(
-                    &token,
-                    &domain.account_id,
-                    &resources.namespace,
-                    &format!("l:{host}:{slug}"),
-                )
-                .await
-                .map_err(problem)?
-                .ok_or("云端缺少备份链接")?;
-            let value: Value =
-                serde_json::from_str(&value).map_err(|_| "云端链接数据无效".to_string())?;
-            let link = if let Some(pool_id) = item["poolId"].as_str() {
-                let code = field(item, "code")?;
-                if value["poolId"].as_str() != Some(pool_id) || value["code"].as_str() != Some(code)
-                {
-                    return Err("云端按平台地址生成的链接与备份不同".into());
-                }
-                if !recovered_pools
-                    .iter()
-                    .any(|p| p.id == pool_id && p.account_ids.contains(&domain.account_id))
-                {
-                    return Err("备份平台地址未包含链接所属账号".into());
-                }
-                link_from_remote(&value, &domain.id, slug, &recovered_pools)?
-            } else {
-                let cn = field(item, "cnUrl")?;
-                let default = field(item, "defaultUrl")?;
-                validate_target(cn)?;
-                validate_target(default)?;
-                if value["rules"][0]["url"].as_str() != Some(cn)
-                    || value["default"].as_str() != Some(default)
-                {
+            let checked: Result<(Link, Value), String> = async {
+                let resources = self
+                    .account(&domain.account_id)?
+                    .resources
+                    .as_ref()
+                    .ok_or("缺少资源")?;
+                let token = keyring_get(&domain.account_id, "token")?;
+                let value = self
+                    .cloud
+                    .read_value(
+                        &token,
+                        &domain.account_id,
+                        &resources.namespace,
+                        &format!("l:{host}:{slug}"),
+                    )
+                    .await
+                    .map_err(problem)?
+                    .ok_or("云端缺少备份链接")?;
+                let value: Value =
+                    serde_json::from_str(&value).map_err(|_| "云端链接数据无效".to_string())?;
+                let link = if let Some(pool_id) = item["poolId"].as_str() {
+                    let code = field(item, "code")?;
+                    if value["poolId"].as_str() != Some(pool_id)
+                        || value["code"].as_str() != Some(code)
+                    {
+                        return Err("云端按平台地址生成的链接与备份不同".into());
+                    }
+                    if !recovered_pools
+                        .iter()
+                        .any(|p| p.id == pool_id && p.account_ids.contains(&domain.account_id))
+                    {
+                        return Err("备份平台地址未包含链接所属账号".into());
+                    }
+                    link_from_remote(&value, &domain.id, slug, &recovered_pools)?
+                } else {
+                    let cn = field(item, "cnUrl")?;
+                    let default = field(item, "defaultUrl")?;
+                    validate_target(cn)?;
+                    validate_target(default)?;
+                    if value["rules"][0]["url"].as_str() != Some(cn)
+                        || value["default"].as_str() != Some(default)
+                    {
+                        return Err("云端链接目标与备份不同".into());
+                    }
+                    link_from_remote(&value, &domain.id, slug, &recovered_pools)?
+                };
+                if !remote_matches_link(&value, &link) {
                     return Err("云端链接目标与备份不同".into());
                 }
-                link_from_remote(&value, &domain.id, slug, &recovered_pools)?
-            };
-            if !remote_matches_link(&value, &link) {
-                return Err("云端链接目标与备份不同".into());
+                Ok((link, value))
             }
-            recovered_links.push(link);
+            .await;
+            recovered_links.push(checked.map_err(|e| {
+                format!(
+                    "备份中的链接 {host}/{}/{slug}：{e}。没有导入任何内容，本机配置未改变",
+                    domain.prefix
+                )
+            })?);
         }
         for pool in &recovered_pools {
             if let Some(existing) = self.db.pools.iter().find(|p| p.id == pool.id) {
                 if pools::cloud_value(existing) != pools::cloud_value(pool) {
-                    return Err("本机已有不同版本的同名平台地址".into());
+                    return Err(format!(
+                        "本机已有不同版本的同名平台地址「{}」；请先处理本机配置冲突，再导入备份。本机配置未改变",
+                        existing.name
+                    ));
                 }
             }
         }
         let mut staged_db = self.db.clone();
+        let mut pools_added = 0;
+        let mut domains_added = 0;
+        let mut links_added = 0;
+        let mut links_existing = 0;
+        let mut links_differing = 0;
         for pool in recovered_pools {
             if let Some(existing) = staged_db.pools.iter_mut().find(|p| p.id == pool.id) {
                 for id in &pool.account_ids {
@@ -3195,21 +3394,31 @@ impl Backend {
                 }
             } else {
                 staged_db.pools.push(pool);
+                pools_added += 1;
             }
         }
         for domain in recovered_domains {
             if !staged_db.domains.iter().any(|d| d.host == domain.host) {
                 staged_db.domains.push(domain);
+                domains_added += 1;
             }
         }
-        for link in recovered_links {
+        // Existing local links are kept as they are. They are counted, and the
+        // ones that differ from the cloud value just verified are reported.
+        for (link, cloud_value) in recovered_links {
             if let Some(domain) = staged_db.domains.iter().find(|d| d.id == link.domain_id) {
-                if !staged_db
+                if let Some(existing) = staged_db
                     .links
                     .iter()
-                    .any(|l| l.domain_id == domain.id && l.slug == link.slug)
+                    .find(|l| l.domain_id == domain.id && l.slug == link.slug)
                 {
+                    links_existing += 1;
+                    if !remote_matches_link(&cloud_value, existing) {
+                        links_differing += 1;
+                    }
+                } else {
                     staged_db.links.push(link);
+                    links_added += 1;
                 }
             }
         }
@@ -3223,7 +3432,16 @@ impl Backend {
             self.db = previous_db;
             return Err(error);
         }
-        Ok(self.state())
+        // One-time summary for this response only; it is not saved locally.
+        let mut state = self.state();
+        state["configImportReport"] = json!({
+            "domainsAdded": domains_added,
+            "linksAdded": links_added,
+            "poolsAdded": pools_added,
+            "linksExisting": links_existing,
+            "linksDiffering": links_differing,
+        });
+        Ok(state)
     }
 
     async fn ensure_domain_owned(&self, domain: &Domain, token: &str) -> Result<Resources, String> {
@@ -3598,6 +3816,45 @@ impl Backend {
             }
         }
         let names = if existing.is_none() {
+            // Read-only check before any journal or write: if this account
+            // already holds this app's Worker/KV (for example after removing the
+            // account locally), creating another set would break recovery.
+            let owned = self
+                .owned_manifest_candidates(account_id, &token)
+                .await
+                .map_err(|error| {
+                    format!(
+                        "无法确认此账号云端是否已有本工具创建的转发程序：{error}。为避免重复创建，本次没有做任何改动，请稍后重试"
+                    )
+                })?;
+            // Recovery needs the Worker each manifest names. If that Worker is
+            // gone, recovery cannot succeed, so name what is left instead of
+            // sending the user to a recovery that always fails.
+            for found in &owned {
+                match self
+                    .cloud
+                    .script_settings(&token, account_id, &found.script)
+                    .await
+                {
+                    Ok(_) => {}
+                    Err(error) if error.message.contains("HTTP 404") => {
+                        return Err(format!(
+                            "此账号云端留有本工具以前创建的链接存储（KV 命名空间 ID 末尾 {}），但配套的转发程序 {} 已经不存在，无法自动找回。请到 Cloudflare 后台的 KV 页面核对这个命名空间，确认里面的短链接不再需要后删除它，再回来添加域名；本次没有做任何改动",
+                            id_tail(&found.namespace),
+                            found.script
+                        ));
+                    }
+                    Err(error) => {
+                        return Err(format!(
+                            "无法确认此账号云端是否已有本工具创建的转发程序：{}。为避免重复创建，本次没有做任何改动，请稍后重试",
+                            error.message
+                        ));
+                    }
+                }
+            }
+            if !owned.is_empty() {
+                return Err("此账号云端已有本工具创建的转发程序和链接存储。为避免重复创建，请先在“Cloudflare 账户”页打开该账户的“管理账户”，点“从 Cloudflare 找回配置”，再添加域名；本次没有做任何改动".into());
+            }
             let scripts = self
                 .cloud
                 .list_pages(&token, &format!("accounts/{account_id}/workers/scripts"))
@@ -3812,6 +4069,15 @@ impl Backend {
                 .list_keys(&token, &domain.account_id, &resources.namespace, &prefix)
                 .await
                 .map_err(problem)?;
+            if keys
+                .iter()
+                .any(|key| key.strip_prefix(&prefix) == Some(slug))
+            {
+                return Err(format!(
+                    "云端已有同名链接 {} / {slug}（可能是上次保存实际已成功）。请在“Cloudflare 账户”页打开该账户的“管理账户”，点“从 Cloudflare 找回配置”核对；已有链接未修改",
+                    domain.host
+                ));
+            }
             if keys.iter().any(|key| {
                 key.strip_prefix(&prefix)
                     .is_some_and(|remote| remote.eq_ignore_ascii_case(slug))
@@ -3888,11 +4154,39 @@ impl Backend {
             }
             return Err(e.message);
         }
-        self.db
+        // Edit in place so the list keeps its order; drop any older duplicates.
+        if let Some(index) = self
+            .db
             .links
-            .retain(|l| l.domain_id != domain_id || l.slug != slug);
-        self.db.links.push(link);
-        self.persist()?;
+            .iter()
+            .position(|l| l.domain_id == domain_id && l.slug == slug)
+        {
+            self.db.links[index] = link;
+            let mut seen = 0;
+            self.db.links.retain(|l| {
+                if l.domain_id == domain_id && l.slug == slug {
+                    seen += 1;
+                    seen == 1
+                } else {
+                    true
+                }
+            });
+        } else {
+            self.db.links.push(link);
+        }
+        // This write was checked against the cloud and succeeded, so older
+        // unresolved records for the same link are settled in the same commit.
+        let before_operations = self.db.pending_operations.clone();
+        clear_link_leftovers(
+            &mut self.db.pending_operations,
+            &domain.host,
+            slug,
+            &journal,
+        );
+        if let Err(error) = self.persist() {
+            self.db.pending_operations = before_operations;
+            return Err(error);
+        }
         self.journal_end(&journal)
     }
 
@@ -4015,6 +4309,22 @@ impl Backend {
                 )
                 .await
             {
+                // A definite refusal wrote nothing: undo this operation's journal,
+                // pending change and pool status so other links are not blocked.
+                if !error.uncertain {
+                    let pending = std::mem::replace(&mut self.db, before);
+                    if let Err(persist_error) = self.persist() {
+                        self.db = pending;
+                        return Err(format!(
+                            "{}；{persist_error}，平台地址的待处理记录未能清除，请在待处理操作中继续处理",
+                            error.message
+                        ));
+                    }
+                    return Err(format!(
+                        "{}；平台地址没有配置到此账户，短链接未保存，可稍后重试",
+                        error.message
+                    ));
+                }
                 let status = self
                     .db
                     .pools
@@ -4167,6 +4477,7 @@ impl Backend {
         }
         struct Target {
             account: String,
+            label: String,
             token: String,
             namespace: String,
             monitor: Option<Value>,
@@ -4178,60 +4489,67 @@ impl Backend {
             let Some(resources) = &account.resources else {
                 continue;
             };
-            let token = keyring_get(id, "token")?;
-            self.verify_resource_source(&token, id, resources).await?;
-            let monitor = self
-                .monitor_config_for(id, &token, &resources.namespace, &pool.id)
-                .await?;
-            if let Some(mut projected) = monitor.clone() {
-                let ids = projected["poolIds"]
-                    .as_array_mut()
-                    .ok_or("监测平台地址清单无效")?;
-                if !ids.iter().any(|entry| entry.as_str() == Some(&pool.id)) {
-                    ids.push(Value::String(pool.id.clone()));
+            let checked: Result<Target, String> = async {
+                let token = keyring_get(id, "token")?;
+                self.verify_resource_source(&token, id, resources).await?;
+                let monitor = self
+                    .monitor_config_for(id, &token, &resources.namespace, &pool.id)
+                    .await?;
+                if let Some(mut projected) = monitor.clone() {
+                    let ids = projected["poolIds"]
+                        .as_array_mut()
+                        .ok_or("监测平台地址清单无效")?;
+                    if !ids.iter().any(|entry| entry.as_str() == Some(&pool.id)) {
+                        ids.push(Value::String(pool.id.clone()));
+                    }
+                    validate_monitor_config(&projected)?;
                 }
-                validate_monitor_config(&projected)?;
-            }
-            let remote = self
-                .cloud
-                .read_value(&token, id, &resources.namespace, &format!("p:{}", pool.id))
-                .await
-                .map_err(problem)?;
-            if let Some(raw) = remote {
-                let value: Value =
-                    serde_json::from_str(&raw).map_err(|_| "云端平台地址格式无效")?;
-                let already_desired =
-                    pending.is_some() && pools::matching_cloud_value(&pool, &value);
-                let owned = already_desired
-                    || old.as_ref().is_some_and(|prior| {
-                        prior.account_ids.contains(id) && pools::matching_cloud_value(prior, &value)
-                    });
-                if !owned {
-                    return Err("云端已有不同的同名平台地址，停止覆盖".into());
+                let remote = self
+                    .cloud
+                    .read_value(&token, id, &resources.namespace, &format!("p:{}", pool.id))
+                    .await
+                    .map_err(problem)?;
+                if let Some(raw) = remote {
+                    let value: Value =
+                        serde_json::from_str(&raw).map_err(|_| "云端平台地址格式无效")?;
+                    let already_desired =
+                        pending.is_some() && pools::matching_cloud_value(&pool, &value);
+                    let owned = already_desired
+                        || old.as_ref().is_some_and(|prior| {
+                            prior.account_ids.contains(id)
+                                && pools::matching_cloud_value(prior, &value)
+                        });
+                    if !owned {
+                        return Err("云端已有不同的同名平台地址，停止覆盖".into());
+                    }
+                    Ok(Target {
+                        account: id.clone(),
+                        label: account.label.clone(),
+                        token,
+                        namespace: resources.namespace.clone(),
+                        monitor,
+                        already_desired,
+                    })
+                } else if old.as_ref().is_some_and(|prior| {
+                    prior
+                        .sync_status
+                        .iter()
+                        .any(|s| s.account_id == *id && s.status == "synced")
+                }) {
+                    Err("已同步平台地址在云端缺失，请先核对".into())
+                } else {
+                    Ok(Target {
+                        account: id.clone(),
+                        label: account.label.clone(),
+                        token,
+                        namespace: resources.namespace.clone(),
+                        monitor,
+                        already_desired: false,
+                    })
                 }
-                targets.push(Target {
-                    account: id.clone(),
-                    token,
-                    namespace: resources.namespace.clone(),
-                    monitor,
-                    already_desired,
-                });
-            } else if old.as_ref().is_some_and(|prior| {
-                prior
-                    .sync_status
-                    .iter()
-                    .any(|s| s.account_id == *id && s.status == "synced")
-            }) {
-                return Err("已同步平台地址在云端缺失，请先核对".into());
-            } else {
-                targets.push(Target {
-                    account: id.clone(),
-                    token,
-                    namespace: resources.namespace.clone(),
-                    monitor,
-                    already_desired: false,
-                });
             }
+            .await;
+            targets.push(checked.map_err(|e| format!("账户「{}」：{e}", account.label))?);
         }
         pool.sync_status = pool
             .account_ids
@@ -4291,7 +4609,7 @@ impl Backend {
                     status.message = e.message.clone();
                     self.persist()?;
                     self.journal_note(&journal, "账号同步未完成，需要核对云端状态")?;
-                    return Err(e.message);
+                    return Err(format!("账户「{}」：{}", target.label, e.message));
                 }
             }
             if let Some(mut monitor) = target.monitor {
@@ -4315,7 +4633,7 @@ impl Backend {
                         status.message = "平台地址已写入，监测清单未确认".into();
                         self.persist()?;
                         self.journal_note(&journal, "平台地址已写入，但监测清单未同步")?;
-                        return Err(e.message);
+                        return Err(format!("账户「{}」：{}", target.label, e.message));
                     }
                 }
             }
@@ -4376,6 +4694,7 @@ impl Backend {
         }
         struct Target {
             account: String,
+            label: String,
             token: String,
             namespace: String,
             monitor: Option<Value>,
@@ -4387,66 +4706,78 @@ impl Backend {
             let Some(resources) = &account.resources else {
                 continue;
             };
-            let token = keyring_get(id, "token")?;
-            self.verify_resource_source(&token, id, resources).await?;
-            let monitor = if pool.account_ids.contains(id) {
-                self.monitor_config_for(id, &token, &resources.namespace, pool_id)
-                    .await?
-            } else {
-                None
-            };
-            let keys = self
-                .cloud
-                .list_keys(&token, id, &resources.namespace, "l:")
-                .await
-                .map_err(problem)?;
-            for key in keys {
+            let checked: Result<Option<Target>, String> = async {
+                let token = keyring_get(id, "token")?;
+                self.verify_resource_source(&token, id, resources).await?;
+                let monitor = if pool.account_ids.contains(id) {
+                    self.monitor_config_for(id, &token, &resources.namespace, pool_id)
+                        .await?
+                } else {
+                    None
+                };
+                let keys = self
+                    .cloud
+                    .list_keys(&token, id, &resources.namespace, "l:")
+                    .await
+                    .map_err(problem)?;
+                for key in keys {
+                    let raw = self
+                        .cloud
+                        .read_value(&token, id, &resources.namespace, &key)
+                        .await
+                        .map_err(problem)?
+                        .ok_or("云端链接记录在核对时消失")?;
+                    let value: Value =
+                        serde_json::from_str(&raw).map_err(|_| "云端链接格式无效")?;
+                    if value["poolId"].as_str() == Some(pool_id) {
+                        return Err("云端仍有链接引用此平台地址".into());
+                    }
+                }
                 let raw = self
                     .cloud
-                    .read_value(&token, id, &resources.namespace, &key)
+                    .read_value(&token, id, &resources.namespace, &format!("p:{pool_id}"))
                     .await
-                    .map_err(problem)?
-                    .ok_or("云端链接记录在核对时消失")?;
-                let value: Value = serde_json::from_str(&raw).map_err(|_| "云端链接格式无效")?;
-                if value["poolId"].as_str() == Some(pool_id) {
-                    return Err("云端仍有链接引用此平台地址".into());
+                    .map_err(problem)?;
+                if let Some(raw) = raw {
+                    if !pool.account_ids.contains(id) {
+                        return Err("另一账号存在同名平台地址，停止删除".into());
+                    }
+                    let value: Value =
+                        serde_json::from_str(&raw).map_err(|_| "云端平台地址格式无效")?;
+                    if !pools::matching_cloud_value(&pool, &value) {
+                        return Err("云端平台地址已变化，停止删除".into());
+                    }
+                    Ok(Some(Target {
+                        account: id.clone(),
+                        label: account.label.clone(),
+                        token,
+                        namespace: resources.namespace.clone(),
+                        monitor,
+                        already_deleted: false,
+                    }))
+                } else if pending.is_some() && pool.account_ids.contains(id) {
+                    Ok(Some(Target {
+                        account: id.clone(),
+                        label: account.label.clone(),
+                        token,
+                        namespace: resources.namespace.clone(),
+                        monitor,
+                        already_deleted: true,
+                    }))
+                } else if pool
+                    .sync_status
+                    .iter()
+                    .any(|s| s.account_id == *id && s.status == "synced")
+                {
+                    Err("已同步平台地址在云端缺失，请先核对".into())
+                } else {
+                    Ok(None)
                 }
             }
-            let raw = self
-                .cloud
-                .read_value(&token, id, &resources.namespace, &format!("p:{pool_id}"))
-                .await
-                .map_err(problem)?;
-            if let Some(raw) = raw {
-                if !pool.account_ids.contains(id) {
-                    return Err("另一账号存在同名平台地址，停止删除".into());
-                }
-                let value: Value =
-                    serde_json::from_str(&raw).map_err(|_| "云端平台地址格式无效")?;
-                if !pools::matching_cloud_value(&pool, &value) {
-                    return Err("云端平台地址已变化，停止删除".into());
-                }
-                targets.push(Target {
-                    account: id.clone(),
-                    token,
-                    namespace: resources.namespace.clone(),
-                    monitor,
-                    already_deleted: false,
-                });
-            } else if pending.is_some() && pool.account_ids.contains(id) {
-                targets.push(Target {
-                    account: id.clone(),
-                    token,
-                    namespace: resources.namespace.clone(),
-                    monitor,
-                    already_deleted: true,
-                });
-            } else if pool
-                .sync_status
-                .iter()
-                .any(|s| s.account_id == *id && s.status == "synced")
+            .await;
+            if let Some(target) = checked.map_err(|e| format!("账户「{}」：{e}", account.label))?
             {
-                return Err("已同步平台地址在云端缺失，请先核对".into());
+                targets.push(target);
             }
         }
         let journal = pending
@@ -4476,7 +4807,7 @@ impl Backend {
                     .await
                 {
                     self.journal_note(&journal, "云端删除未完成，需要核对所有账号")?;
-                    return Err(e.message);
+                    return Err(format!("账户「{}」：{}", target.label, e.message));
                 }
             }
             if let Some(mut monitor) = target.monitor {
@@ -4496,7 +4827,7 @@ impl Backend {
                     .await
                 {
                     self.journal_note(&journal, "平台地址已删除，但监测清单未同步")?;
-                    return Err(e.message);
+                    return Err(format!("账户「{}」：{}", target.label, e.message));
                 }
             }
             if let Some(status) = self
@@ -4790,7 +5121,12 @@ impl Backend {
             .read_value(&token, &domain.account_id, &resources.namespace, &key)
             .await
             .map_err(problem)?
-            .ok_or("云端链接不存在，请刷新或找回")?;
+            .ok_or_else(|| {
+                format!(
+                    "云端没有链接 {} / {slug}，可能上次删除已生效。请在“Cloudflare 账户”页打开该账户的“管理账户”，点“从 Cloudflare 找回配置”核对",
+                    domain.host
+                )
+            })?;
         let local = self
             .db
             .links
@@ -4817,10 +5153,19 @@ impl Backend {
             }
             return Err(e.message);
         }
+        let before_links = self.db.links.clone();
+        let before_operations = self.db.pending_operations.clone();
         self.db
             .links
             .retain(|l| l.domain_id != domain_id || l.slug != slug);
+        clear_link_leftovers(
+            &mut self.db.pending_operations,
+            &domain.host,
+            slug,
+            &journal,
+        );
         if let Err(e) = self.persist() {
+            self.db.pending_operations = before_operations;
             let restored = self
                 .cloud
                 .write_value(
@@ -4833,7 +5178,8 @@ impl Backend {
                 .await
                 .is_ok();
             if restored {
-                self.db.links.push(local);
+                // Restore the list exactly, keeping the link at its position.
+                self.db.links = before_links;
                 self.journal_end(&journal)?;
             } else {
                 self.journal_note(&journal, "本机保存失败且云端恢复失败")?;
@@ -5049,11 +5395,15 @@ impl Backend {
             .list_keys(&token, account_id, &resources.namespace, "")
             .await
             .map_err(problem)?;
+        // Any link (l:) or other record stops cleanup. A platform address copy
+        // (p:) is allowed only when it is checked below against the local pool
+        // library, so no unique data is deleted.
         if keys.iter().collect::<HashSet<_>>().len() != keys.len()
             || keys.iter().any(|key| {
                 key != MANIFEST_KEY
                     && key != "m:monitor:cursor"
                     && !key.strip_prefix("h:").is_some_and(pools::valid_id)
+                    && !key.strip_prefix("p:").is_some_and(pools::valid_id)
             })
         {
             return Err("KV 仍有业务或未知配置记录，停止清理".into());
@@ -5066,7 +5416,13 @@ impl Backend {
                 .await
                 .map_err(problem)?
                 .ok_or("检测记录在核对中消失，请重新准备清理")?;
-            if !valid_cleanup_metadata(key, &raw) {
+            if let Some(pool_id) = key.strip_prefix("p:") {
+                if !valid_cleanup_pool_copy(pool_id, &raw, &self.db.pools) {
+                    return Err(format!(
+                        "此账号 KV 中仍有平台地址副本 {pool_id}，但本机没有这组平台地址或副本格式无法确认，停止清理；云端未改动"
+                    ));
+                }
+            } else if !valid_cleanup_metadata(key, &raw) {
                 return Err("遗留检测数据格式无法确认，停止清理".into());
             }
             metadata.push((key.clone(), raw));
@@ -5157,6 +5513,12 @@ impl Backend {
                     )?;
                     return Err("遗留检测数据无法再次核实，停止清理".into());
                 }
+            }
+            // A platform address copy goes away with the namespace. Deleting it
+            // here would leave the pool reported as synced but missing in the
+            // cloud if a later step fails, blocking every edit of that pool.
+            if key.starts_with("p:") {
+                continue;
             }
             if let Err(error) = self
                 .cloud
@@ -5499,11 +5861,14 @@ impl Backend {
         Ok(())
     }
 
-    async fn discover_owned_resources(
+    /// Read-only: lists the account's KV namespaces and returns those holding
+    /// an ownership manifest of this app for this account. A namespace without
+    /// a manifest is skipped; a failed list or read is an error.
+    async fn owned_manifest_candidates(
         &self,
         account_id: &str,
         token: &str,
-    ) -> Result<Resources, String> {
+    ) -> Result<Vec<Resources>, String> {
         let namespaces = self
             .cloud
             .list_pages(
@@ -5512,7 +5877,7 @@ impl Backend {
             )
             .await
             .map_err(problem)?;
-        let mut matches = Vec::new();
+        let mut candidates = Vec::new();
         for ns in namespaces {
             let Some(id) = ns["id"].as_str() else {
                 continue;
@@ -5541,10 +5906,21 @@ impl Backend {
             {
                 continue;
             }
-            let resources = Resources {
+            candidates.push(Resources {
                 script: script.into(),
                 namespace: id.into(),
-            };
+            });
+        }
+        Ok(candidates)
+    }
+
+    async fn discover_owned_resources(
+        &self,
+        account_id: &str,
+        token: &str,
+    ) -> Result<Resources, String> {
+        let mut matches = Vec::new();
+        for resources in self.owned_manifest_candidates(account_id, token).await? {
             // A matching ownership manifest is a candidate, not permission to
             // ignore an unreadable or altered Worker and choose another one.
             self.verify_resource_source(token, account_id, &resources)
@@ -6568,6 +6944,177 @@ mod tests {
         let persisted: Database =
             serde_json::from_slice(&fs::read(&backend.path).unwrap()).unwrap();
         assert_eq!(persisted.accounts[0].label, "Changed");
+    }
+
+    fn url_link(slug: &str, cn: &str, default: &str) -> Link {
+        Link {
+            domain_id: "domain1".into(),
+            slug: slug.into(),
+            cn_url: cn.into(),
+            default_url: default.into(),
+            updated: "2026-01-01T00:00:00Z".into(),
+            pool_id: None,
+            code: None,
+        }
+    }
+
+    async fn mount_import_domain(server: &MockServer, links: &[(&str, &str, &str)]) {
+        Mock::given(method("GET"))
+            .and(path("/client/v4/zones/zone1/workers/routes"))
+            .respond_with(ok(json!([{"id":"route1","pattern":"example.com/go/*",
+                "script":"edge-one"}])))
+            .mount(server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/client/v4/accounts/acct1/storage/kv/namespaces/ns1/values/c%3Aexample.com",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"prefix":"go"}"#))
+            .mount(server)
+            .await;
+        for (slug, cn, default) in links {
+            Mock::given(method("GET"))
+                .and(path(format!(
+                    "/client/v4/accounts/acct1/storage/kv/namespaces/ns1/values/l%3Aexample.com%3A{slug}"
+                )))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(kv_link(&url_link(slug, cn, default))),
+                )
+                .mount(server)
+                .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn import_reports_added_existing_and_differing_links_without_overwriting() {
+        let (server, mut backend, _guard) = fixture().await;
+        backend.db.domains.push(domain());
+        backend.db.links.push(url_link(
+            "same",
+            "https://example.org/a",
+            "https://example.org/b",
+        ));
+        backend.db.links.push(url_link(
+            "diff",
+            "https://example.org/local-cn",
+            "https://example.org/local-default",
+        ));
+        mount_import_domain(
+            &server,
+            &[
+                ("same", "https://example.org/a", "https://example.org/b"),
+                ("diff", "https://example.org/c", "https://example.org/d"),
+                ("new", "https://example.org/e", "https://example.org/f"),
+            ],
+        )
+        .await;
+        let backup = json!({"schema":SCHEMA,"accounts":[{"id":"acct1","label":"Example"}],
+            "domains":[{"accountId":"acct1","host":"example.com","prefix":"go"}],
+            "links":[
+                {"host":"example.com","slug":"same","cnUrl":"https://example.org/a",
+                    "defaultUrl":"https://example.org/b"},
+                {"host":"example.com","slug":"diff","cnUrl":"https://example.org/c",
+                    "defaultUrl":"https://example.org/d"},
+                {"host":"example.com","slug":"new","cnUrl":"https://example.org/e",
+                    "defaultUrl":"https://example.org/f"}]});
+        let state = backend.import_config(&backup.to_string()).await.unwrap();
+        assert_eq!(
+            state["configImportReport"],
+            json!({"domainsAdded":0,"linksAdded":1,"poolsAdded":0,
+                "linksExisting":2,"linksDiffering":1})
+        );
+        let diff = backend.db.links.iter().find(|l| l.slug == "diff").unwrap();
+        assert_eq!(diff.cn_url, "https://example.org/local-cn");
+        assert_eq!(backend.db.links.len(), 3);
+        let raw = fs::read_to_string(&backend.path).unwrap();
+        assert!(!raw.contains("configImportReport"));
+        assert!(!raw.contains("linksDiffering"));
+        let persisted: Database = serde_json::from_str(&raw).unwrap();
+        assert_eq!(persisted.links.len(), 3);
+        // The report is one-time: a later state read does not carry it.
+        assert!(backend.state().get("configImportReport").is_none());
+        assert!(server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .all(|request| request.method.as_str() == "GET"));
+    }
+
+    #[tokio::test]
+    async fn import_errors_name_the_account_domain_or_link() {
+        let (server, mut backend, _guard) = fixture().await;
+        let before = backend.database_snapshot();
+        let missing_account = json!({"schema":SCHEMA,
+            "accounts":[{"id":"acctgone0000abcd1234","label":"旧账户"}],
+            "domains":[],"links":[]});
+        let error = backend
+            .import_config(&missing_account.to_string())
+            .await
+            .unwrap_err();
+        assert!(error.contains("「旧账户」"), "{error}");
+        assert!(error.contains("abcd1234"));
+        assert!(error.contains("尚未导入本机"));
+
+        let missing_owner = json!({"schema":SCHEMA,"accounts":[],
+            "domains":[{"accountId":"acct9","host":"example.com","prefix":"go"}],"links":[]});
+        let error = backend
+            .import_config(&missing_owner.to_string())
+            .await
+            .unwrap_err();
+        assert!(error.contains("尚未导入本机的账户"), "{error}");
+        assert!(error.contains("acct9"));
+
+        backend.db.accounts[0].token_import_pending = true;
+        let pending_owner = json!({"schema":SCHEMA,"accounts":[],
+            "domains":[{"accountId":"acct1","host":"example.com","prefix":"go"}],"links":[]});
+        let error = backend
+            .import_config(&pending_owner.to_string())
+            .await
+            .unwrap_err();
+        assert!(error.contains("账户「账号 1」"), "{error}");
+        assert!(error.contains("令牌导入尚未完成"));
+        backend.db.accounts[0].token_import_pending = false;
+
+        let missing_route = json!({"schema":SCHEMA,"accounts":[],
+            "domains":[{"accountId":"acct1","host":"example.com","prefix":"other"}],"links":[]});
+        mount_import_domain(&server, &[]).await;
+        let error = backend
+            .import_config(&missing_route.to_string())
+            .await
+            .unwrap_err();
+        assert!(error.contains("example.com/other"), "{error}");
+        assert!(error.contains("备份中的域名路由在云端不存在"));
+
+        let missing_link = json!({"schema":SCHEMA,"accounts":[],
+            "domains":[{"accountId":"acct1","host":"example.com","prefix":"go"}],
+            "links":[{"host":"example.com","slug":"gone","cnUrl":"https://example.org/a",
+                "defaultUrl":"https://example.org/b"}]});
+        let error = backend
+            .import_config(&missing_link.to_string())
+            .await
+            .unwrap_err();
+        assert!(error.contains("example.com/go/gone"), "{error}");
+        assert!(error.contains("云端缺少备份链接"));
+
+        mount_import_domain(
+            &server,
+            &[("moved", "https://example.org/c", "https://example.org/d")],
+        )
+        .await;
+        let changed_link = json!({"schema":SCHEMA,"accounts":[],
+            "domains":[{"accountId":"acct1","host":"example.com","prefix":"go"}],
+            "links":[{"host":"example.com","slug":"moved","cnUrl":"https://example.org/a",
+                "defaultUrl":"https://example.org/b"}]});
+        let error = backend
+            .import_config(&changed_link.to_string())
+            .await
+            .unwrap_err();
+        assert!(error.contains("example.com/go/moved"), "{error}");
+        assert!(error.contains("云端链接目标与备份不同"));
+        assert_eq!(backend.database_snapshot(), before);
+        assert!(!error.contains("test-token-value"));
     }
 
     fn ok(result: Value) -> ResponseTemplate {
@@ -8556,6 +9103,147 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn first_domain_checks_cloud_for_existing_app_resources_before_any_write() {
+        let manifest = json!({"schema":SCHEMA,"accountId":"acct1","script":"edge-old",
+            "namespace":"ns1","sourceHash":bundled_source_hash()})
+        .to_string();
+        for case in [
+            "owned",
+            "owned-worker-missing",
+            "owned-worker-unreadable",
+            "list-fails",
+            "read-fails",
+            "no-manifest",
+            "foreign",
+        ] {
+            let (server, mut backend, _dir) = fixture().await;
+            backend.db.accounts[0].resources = None;
+            backend.db.accounts[0].has_resources = false;
+            Mock::given(method("GET"))
+                .and(path(
+                    "/client/v4/accounts/acct1/workers/scripts/edge-old/settings",
+                ))
+                .respond_with(match case {
+                    "owned-worker-missing" => ResponseTemplate::new(404),
+                    "owned-worker-unreadable" => ResponseTemplate::new(500),
+                    _ => ok(json!({"bindings":[]})),
+                })
+                .mount(&server)
+                .await;
+            mount_domain_hard_checks(
+                &server,
+                json!([{"name":"example.com","type":"A","proxied":true}]),
+                json!([]),
+            )
+            .await;
+            Mock::given(method("HEAD"))
+                .and(path_regex(r"^/client/v4/probe/example\.com/go/"))
+                .respond_with(ResponseTemplate::new(404))
+                .mount(&server)
+                .await;
+            let namespaces = if case == "list-fails" {
+                ResponseTemplate::new(500)
+            } else {
+                ok(json!([{"id":"ns1","title":"links-old"}]))
+            };
+            Mock::given(method("GET"))
+                .and(path("/client/v4/accounts/acct1/storage/kv/namespaces"))
+                .respond_with(namespaces)
+                .mount(&server)
+                .await;
+            let value = match case {
+                "read-fails" => ResponseTemplate::new(500),
+                "no-manifest" => ResponseTemplate::new(404),
+                "foreign" => ResponseTemplate::new(200).set_body_string(
+                    json!({"schema":SCHEMA,"accountId":"other","script":"edge-old",
+                        "namespace":"ns1"})
+                    .to_string(),
+                ),
+                _ => ResponseTemplate::new(200).set_body_string(manifest.clone()),
+            };
+            Mock::given(method("GET"))
+                .and(path(
+                    "/client/v4/accounts/acct1/storage/kv/namespaces/ns1/values/m%3Aconfig",
+                ))
+                .respond_with(value)
+                .mount(&server)
+                .await;
+            // Stops the flow right after the check, before any write.
+            Mock::given(method("GET"))
+                .and(path("/client/v4/accounts/acct1/workers/scripts"))
+                .respond_with(ResponseTemplate::new(503))
+                .mount(&server)
+                .await;
+            let error = backend
+                .apply_domain(
+                    "acct1",
+                    "zone1",
+                    "example.com",
+                    "go",
+                    DomainTakeover {
+                        dns_mode: local_check::DnsMode::System,
+                        expected_path_risk: &PathRiskSnapshot {
+                            root: domain_check::ProbeRisk::Missing,
+                            child: domain_check::ProbeRisk::Missing,
+                            probe_segment: "probe-fixed".into(),
+                        },
+                        requires_confirmation: false,
+                        acknowledged: false,
+                    },
+                )
+                .await
+                .unwrap_err();
+            let requests = server.received_requests().await.unwrap();
+            let listed_scripts = requests
+                .iter()
+                .any(|r| r.url.path() == "/client/v4/accounts/acct1/workers/scripts");
+            match case {
+                "owned" => {
+                    assert!(
+                        error.contains("已有本工具创建的转发程序"),
+                        "{case}: {error}"
+                    );
+                    assert!(error.contains("从 Cloudflare 找回配置"));
+                    assert!(!listed_scripts);
+                }
+                "owned-worker-missing" => {
+                    // Recovery cannot work without the Worker: say what is left.
+                    assert!(error.contains("已经不存在，无法自动找回"), "{error}");
+                    assert!(error.contains("KV 命名空间 ID 末尾 ns1"));
+                    assert!(error.contains("edge-old"));
+                    assert!(!error.contains("从 Cloudflare 找回配置"));
+                    assert!(!listed_scripts);
+                }
+                "owned-worker-unreadable" => {
+                    assert!(
+                        error.contains("无法确认此账号云端是否已有"),
+                        "{case}: {error}"
+                    );
+                    assert!(error.contains("HTTP 500"));
+                    assert!(!listed_scripts);
+                }
+                "list-fails" | "read-fails" => {
+                    assert!(
+                        error.contains("无法确认此账号云端是否已有"),
+                        "{case}: {error}"
+                    );
+                    assert!(error.contains("HTTP 500"));
+                    assert!(!listed_scripts);
+                }
+                _ => {
+                    assert!(!error.contains("本工具创建"), "{case}: {error}");
+                    assert!(listed_scripts, "{case}: {error}");
+                }
+            }
+            assert!(!requests
+                .iter()
+                .any(|r| matches!(r.method.as_str(), "PUT" | "POST" | "DELETE")));
+            assert!(backend.db.pending_operations.is_empty(), "{case}");
+            assert!(backend.db.domains.is_empty());
+        }
+    }
+
+    #[tokio::test]
     async fn existing_cloud_config_blocks_domain_write() {
         let (server, mut backend, _dir) = fixture().await;
         mount_resource(&server, include_str!("../../edge/worker.mjs")).await;
@@ -8649,6 +9337,303 @@ mod tests {
         assert!(backend.db.links.is_empty());
         let requests = server.received_requests().await.unwrap();
         assert!(!requests.iter().any(|r| r.method.as_str() == "DELETE"));
+    }
+
+    const SHORT_PATH: &str =
+        "/client/v4/accounts/acct1/storage/kv/namespaces/ns1/values/l%3Aexample.com%3Ashort";
+    fn unrelated_journals() -> Vec<String> {
+        vec![
+            "保存链接 example.com / shorter (aaa)：写入结果不确定，需要人工核对".into(),
+            "删除链接 www.example.com / short (bbb)：删除结果不确定，需要人工核对".into(),
+            "添加域名 example.com/go (ccc)".into(),
+        ]
+    }
+
+    #[tokio::test]
+    async fn later_successful_save_clears_only_that_links_uncertain_record() {
+        let (server, mut backend, _dir) = fixture().await;
+        backend.db.domains.push(domain());
+        backend.db.pending_operations = unrelated_journals();
+        mount_resource(&server, include_str!("../../edge/worker.mjs")).await;
+        mount_owned_domain(&server).await;
+        Mock::given(method("GET"))
+            .and(path(SHORT_PATH))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path(SHORT_PATH))
+            .respond_with(ResponseTemplate::new(503))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path(SHORT_PATH))
+            .respond_with(ok(json!({})))
+            .mount(&server)
+            .await;
+        async fn save(backend: &mut Backend) -> Result<(), String> {
+            backend
+                .apply_save_link(
+                    "domain1",
+                    "short",
+                    "https://example.org/cn",
+                    "https://example.org/other",
+                    None,
+                    None,
+                )
+                .await
+        }
+        assert!(save(&mut backend).await.is_err());
+        assert_eq!(backend.db.pending_operations.len(), 4);
+        assert!(backend
+            .db
+            .pending_operations
+            .iter()
+            .any(|entry| entry.starts_with("保存链接 example.com / short (")));
+        save(&mut backend).await.unwrap();
+        assert_eq!(backend.db.pending_operations, unrelated_journals());
+        let disk: Database = serde_json::from_slice(&fs::read(&backend.path).unwrap()).unwrap();
+        assert_eq!(disk.pending_operations, unrelated_journals());
+        assert_eq!(backend.db.links.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn later_successful_delete_clears_that_links_uncertain_record() {
+        let (server, mut backend, _dir) = fixture().await;
+        backend.db.domains.push(domain());
+        let local = url_link("short", "https://example.org/cn", "https://example.org/d");
+        backend.db.links.push(local.clone());
+        backend.db.pending_operations = unrelated_journals();
+        backend
+            .db
+            .pending_operations
+            .push("保存链接 example.com / short (ddd)：写入结果不确定，需要人工核对".into());
+        mount_resource(&server, include_str!("../../edge/worker.mjs")).await;
+        mount_owned_domain(&server).await;
+        Mock::given(method("GET"))
+            .and(path(SHORT_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(kv_link(&local)))
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path(SHORT_PATH))
+            .respond_with(ResponseTemplate::new(503))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path(SHORT_PATH))
+            .respond_with(ok(json!({})))
+            .mount(&server)
+            .await;
+        assert!(backend.apply_delete_link("domain1", "short").await.is_err());
+        assert_eq!(backend.db.pending_operations.len(), 5);
+        assert_eq!(backend.db.links.len(), 1);
+        backend.apply_delete_link("domain1", "short").await.unwrap();
+        assert_eq!(backend.db.pending_operations, unrelated_journals());
+        let disk: Database = serde_json::from_slice(&fs::read(&backend.path).unwrap()).unwrap();
+        assert_eq!(disk.pending_operations, unrelated_journals());
+        assert!(backend.db.links.is_empty());
+    }
+
+    #[tokio::test]
+    async fn link_save_persist_failure_keeps_leftover_records() {
+        let (server, mut backend, _dir) = fixture().await;
+        backend.db.domains.push(domain());
+        let leftover = "保存链接 example.com / short (eee)：写入结果不确定，需要人工核对";
+        backend.db.pending_operations = vec![leftover.into()];
+        mount_resource(&server, include_str!("../../edge/worker.mjs")).await;
+        mount_owned_domain(&server).await;
+        Mock::given(method("GET"))
+            .and(path(SHORT_PATH))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path(SHORT_PATH))
+            .respond_with(ok(json!({})))
+            .mount(&server)
+            .await;
+        // Persist 1 records the journal; persist 2 (link + cleanup) fails.
+        backend.fail_persist_at.store(
+            backend
+                .persist_count
+                .load(std::sync::atomic::Ordering::SeqCst)
+                + 2,
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        assert!(backend
+            .apply_save_link(
+                "domain1",
+                "short",
+                "https://example.org/cn",
+                "https://example.org/other",
+                None,
+                None,
+            )
+            .await
+            .is_err());
+        assert!(backend
+            .db
+            .pending_operations
+            .iter()
+            .any(|entry| entry == leftover));
+        assert_eq!(backend.db.pending_operations.len(), 2);
+        let disk: Database = serde_json::from_slice(&fs::read(&backend.path).unwrap()).unwrap();
+        assert!(disk
+            .pending_operations
+            .iter()
+            .any(|entry| entry == leftover));
+    }
+
+    #[tokio::test]
+    async fn editing_a_link_keeps_its_position_and_drops_duplicates() {
+        let (server, mut backend, _dir) = fixture().await;
+        backend.db.domains.push(domain());
+        let old = url_link("b", "https://example.org/old", "https://example.org/old-d");
+        backend.db.links = vec![
+            url_link("a", "https://example.org/a", "https://example.org/a-d"),
+            old.clone(),
+            url_link("c", "https://example.org/c", "https://example.org/c-d"),
+            old.clone(),
+        ];
+        mount_resource(&server, include_str!("../../edge/worker.mjs")).await;
+        mount_owned_domain(&server).await;
+        let b_path =
+            "/client/v4/accounts/acct1/storage/kv/namespaces/ns1/values/l%3Aexample.com%3Ab";
+        Mock::given(method("GET"))
+            .and(path(b_path))
+            .respond_with(ResponseTemplate::new(200).set_body_json(kv_link(&old)))
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path(b_path))
+            .respond_with(ok(json!({})))
+            .mount(&server)
+            .await;
+        backend
+            .apply_save_link(
+                "domain1",
+                "b",
+                "https://example.org/new",
+                "https://example.org/new-d",
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let slugs: Vec<_> = backend.db.links.iter().map(|l| l.slug.as_str()).collect();
+        assert_eq!(slugs, ["a", "b", "c"]);
+        assert_eq!(backend.db.links[1].cn_url, "https://example.org/new");
+    }
+
+    #[tokio::test]
+    async fn restored_delete_keeps_the_link_at_its_position() {
+        let (server, mut backend, _dir) = fixture().await;
+        backend.db.domains.push(domain());
+        let local = url_link("short", "https://example.org/cn", "https://example.org/d");
+        backend.db.links = vec![
+            local.clone(),
+            url_link("z", "https://example.org/z", "https://example.org/z-d"),
+        ];
+        mount_resource(&server, include_str!("../../edge/worker.mjs")).await;
+        mount_owned_domain(&server).await;
+        Mock::given(method("GET"))
+            .and(path(SHORT_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(kv_link(&local)))
+            .mount(&server)
+            .await;
+        for verb in ["DELETE", "PUT"] {
+            Mock::given(method(verb))
+                .and(path(SHORT_PATH))
+                .respond_with(ok(json!({})))
+                .mount(&server)
+                .await;
+        }
+        backend.fail_persist_at.store(
+            backend
+                .persist_count
+                .load(std::sync::atomic::Ordering::SeqCst)
+                + 2,
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        assert!(backend.apply_delete_link("domain1", "short").await.is_err());
+        let slugs: Vec<_> = backend.db.links.iter().map(|l| l.slug.as_str()).collect();
+        assert_eq!(slugs, ["short", "z"]);
+        assert!(backend.db.pending_operations.is_empty());
+    }
+
+    #[tokio::test]
+    async fn retry_after_possibly_applied_write_points_to_recovery() {
+        let (server, mut backend, _dir) = fixture().await;
+        backend.db.domains.push(domain());
+        mount_resource(&server, include_str!("../../edge/worker.mjs")).await;
+        mount_owned_domain(&server).await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/client/v4/accounts/acct1/storage/kv/namespaces/ns1/keys",
+            ))
+            .and(query_param("prefix", "l:example.com:"))
+            .respond_with(ok(
+                json!([{"name":"l:example.com:short"},{"name":"l:example.com:Mixed"}]),
+            ))
+            .mount(&server)
+            .await;
+        let error = backend
+            .apply_save_link(
+                "domain1",
+                "short",
+                "https://example.org/cn",
+                "https://example.org/other",
+                None,
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error.contains("云端已有同名链接 example.com / short"),
+            "{error}"
+        );
+        assert!(error.contains("从 Cloudflare 找回配置"));
+        assert!(!error.contains("大小写相同"));
+        let error = backend
+            .apply_save_link(
+                "domain1",
+                "mixed",
+                "https://example.org/cn",
+                "https://example.org/other",
+                None,
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.contains("大小写相同"), "{error}");
+
+        backend.db.links.push(url_link(
+            "short",
+            "https://example.org/cn",
+            "https://example.org/d",
+        ));
+        Mock::given(method("GET"))
+            .and(path(SHORT_PATH))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        let error = backend
+            .apply_delete_link("domain1", "short")
+            .await
+            .unwrap_err();
+        assert!(error.contains("可能上次删除已生效"), "{error}");
+        assert!(error.contains("example.com / short"));
+        assert!(!error.contains("请刷新"));
+        assert!(backend.db.pending_operations.is_empty());
+        assert!(server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .all(|r| r.method.as_str() == "GET"));
     }
 
     #[tokio::test]
@@ -8923,6 +9908,90 @@ mod tests {
             .unwrap()
             .iter()
             .all(|r| r.method.as_str() == "GET"));
+    }
+
+    #[tokio::test]
+    async fn pool_sync_and_delete_errors_name_the_account() {
+        let (server, mut backend, _dir) = fixture().await;
+        mount_resource(&server, include_str!("../../edge/worker.mjs")).await;
+        Mock::given(method("GET"))
+            .and(path_regex("/values/p%3Apool1$"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"different":"configuration"})),
+            )
+            .mount(&server)
+            .await;
+        let error = backend.apply_save_pool(sample_pool()).await.unwrap_err();
+        assert!(error.starts_with("账户「账号 1」："), "{error}");
+        assert!(error.contains("云端已有不同的同名平台地址"));
+        assert!(backend.db.pending_operations.is_empty());
+
+        backend.db.pools.push(sample_pool());
+        Mock::given(method("GET"))
+            .and(path(
+                "/client/v4/accounts/acct1/storage/kv/namespaces/ns1/keys",
+            ))
+            .and(query_param("prefix", "l:"))
+            .respond_with(ok(json!([])))
+            .mount(&server)
+            .await;
+        let error = backend.apply_delete_pool("pool1").await.unwrap_err();
+        assert!(error.starts_with("账户「账号 1」："), "{error}");
+        assert!(error.contains("停止删除"));
+        assert!(server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .all(|r| r.method.as_str() == "GET"));
+    }
+
+    #[tokio::test]
+    async fn global_pool_refused_first_use_rolls_back_and_unblocks_retry() {
+        let (server, mut backend, _dir) = fixture().await;
+        let mut pool = sample_pool();
+        pool.account_ids.clear();
+        backend.db.pools.push(pool);
+        let pools_before = serde_json::to_value(&backend.db.pools).unwrap();
+        let resources = backend.db.accounts[0].resources.clone().unwrap();
+        Mock::given(method("GET"))
+            .and(path_regex("/values/p%3Apool1$"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path_regex("/values/p%3Apool1$"))
+            .respond_with(ResponseTemplate::new(403))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        let error = backend
+            .ensure_pool_on_account("pool1", "acct1", "test-token-value", &resources)
+            .await
+            .unwrap_err();
+        assert!(error.contains("HTTP 403"), "{error}");
+        assert!(error.contains("短链接未保存"));
+        assert!(backend.db.pending_pool_changes.is_empty());
+        assert!(backend.db.pending_operations.is_empty());
+        assert_eq!(
+            serde_json::to_value(&backend.db.pools).unwrap(),
+            pools_before
+        );
+        let disk: Database = serde_json::from_slice(&fs::read(&backend.path).unwrap()).unwrap();
+        assert!(disk.pending_pool_changes.is_empty());
+        assert!(disk.pending_operations.is_empty());
+        // A later attempt is not blocked by a leftover record.
+        Mock::given(method("PUT"))
+            .and(path_regex("/values/p%3Apool1$"))
+            .respond_with(ok(json!({})))
+            .mount(&server)
+            .await;
+        backend
+            .ensure_pool_on_account("pool1", "acct1", "test-token-value", &resources)
+            .await
+            .unwrap();
+        assert_eq!(backend.db.pools[0].sync_status[0].status, "synced");
+        assert!(backend.db.pending_operations.is_empty());
     }
 
     #[tokio::test]
@@ -10081,7 +11150,7 @@ mod tests {
             .await;
         let read_store = store.clone();
         Mock::given(method("GET"))
-            .and(path_regex(r"^/client/v4/accounts/acct1/storage/kv/namespaces/ns1/values/(h%3A[^/]+|m%3Amonitor%3Acursor)$"))
+            .and(path_regex(r"^/client/v4/accounts/acct1/storage/kv/namespaces/ns1/values/(h%3A[^/]+|p%3A[^/]+|m%3Amonitor%3Acursor)$"))
             .respond_with(move |request: &wiremock::Request| {
                 let encoded=request.url.path().rsplit('/').next().unwrap();
                 let key=url::form_urlencoded::parse(encoded.as_bytes()).next().unwrap().0.into_owned();
@@ -10093,7 +11162,7 @@ mod tests {
             .mount(server).await;
         let delete_store = store.clone();
         Mock::given(method("DELETE"))
-            .and(path_regex(r"^/client/v4/accounts/acct1/storage/kv/namespaces/ns1/values/(h%3A[^/]+|m%3Amonitor%3Acursor)$"))
+            .and(path_regex(r"^/client/v4/accounts/acct1/storage/kv/namespaces/ns1/values/(h%3A[^/]+|p%3A[^/]+|m%3Amonitor%3Acursor)$"))
             .respond_with(move |request: &wiremock::Request| {
                 let encoded=request.url.path().rsplit('/').next().unwrap();
                 let key=url::form_urlencoded::parse(encoded.as_bytes()).next().unwrap().0.into_owned();
@@ -10199,6 +11268,82 @@ mod tests {
                     .await;
             }
             assert!(backend.apply_cleanup("acct1").await.is_err());
+            assert!(backend.db.accounts[0].resources.is_some());
+            assert!(server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .all(|r| r.method.as_str() == "GET"));
+            assert!(backend.db.pending_operations.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn cleanup_removes_pool_copy_that_matches_a_local_pool() {
+        let (server, mut backend, _dir) = fixture().await;
+        let mut pool = sample_pool();
+        pool.account_ids.push("acct2".into());
+        let copy = pools::cloud_value(&pool).to_string();
+        backend.db.pools.push(pool);
+        let store = mount_cleanup_cloud(
+            &server,
+            vec![("p:pool1", copy), ("h:pool1", cleanup_health())],
+        )
+        .await;
+        backend.apply_cleanup("acct1").await.unwrap();
+        // The copy is not deleted key by key: it is removed with the namespace,
+        // so a failed later step cannot leave a synced pool without its copy.
+        assert_eq!(
+            store.lock().unwrap().keys().collect::<Vec<_>>(),
+            vec!["p:pool1"]
+        );
+        assert!(backend.db.accounts[0].resources.is_none());
+        assert_eq!(backend.db.pools[0].account_ids, vec!["acct2"]);
+        assert!(backend.db.pending_operations.is_empty());
+        let deletes: Vec<_> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.method.as_str() == "DELETE")
+            .map(|r| r.url.path().to_owned())
+            .collect();
+        assert!(deletes.iter().any(|p| p.ends_with("h%3Apool1")));
+        assert!(!deletes.iter().any(|p| p.ends_with("p%3Apool1")));
+        assert!(deletes.last().unwrap().ends_with("/ns1"));
+    }
+
+    #[tokio::test]
+    async fn cleanup_rejects_unknown_or_malformed_pool_copies_and_any_link() {
+        for case in ["unknown-pool", "bad-json", "not-a-copy", "bad-id", "link"] {
+            let (server, mut backend, _dir) = fixture().await;
+            backend.db.pools.push(sample_pool());
+            let valid = pools::cloud_value(&sample_pool()).to_string();
+            let entries = match case {
+                "unknown-pool" => vec![("p:other", valid)],
+                "bad-json" => vec![("p:pool1", "{not json".to_string())],
+                "not-a-copy" => vec![("p:pool1", "[1,2]".to_string())],
+                "bad-id" => vec![("p:bad id", valid)],
+                _ => vec![
+                    ("p:pool1", valid),
+                    (
+                        "l:example.com:a",
+                        r#"{"default":"https://example.org"}"#.to_string(),
+                    ),
+                ],
+            };
+            mount_cleanup_cloud(&server, entries).await;
+            let error = backend.apply_cleanup("acct1").await.unwrap_err();
+            match case {
+                "unknown-pool" | "bad-json" | "not-a-copy" => {
+                    assert!(error.contains("平台地址副本"), "{case}: {error}")
+                }
+                _ => assert!(
+                    error.contains("KV 仍有业务或未知配置记录"),
+                    "{case}: {error}"
+                ),
+            }
             assert!(backend.db.accounts[0].resources.is_some());
             assert!(server
                 .received_requests()

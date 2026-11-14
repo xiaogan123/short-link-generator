@@ -2,7 +2,7 @@
 
 ## 创建第一条短链接
 
-1. 在 **Cloudflare 账户** 页面添加账户。按提示打开 Cloudflare，创建 API 令牌，再粘贴回软件。权限模板包含 Workers Scripts 编辑、Workers KV Storage 编辑、Workers Routes 编辑、Zone 读取、DNS 编辑和 Account Settings 读取。软件会验证令牌是否有效并读取可见资源；连接成功不代表已获得所有修改权限。
+1. 在 **Cloudflare 账户** 页面添加账户。按提示打开 Cloudflare，创建 API 令牌，再粘贴回软件。权限模板包含 Workers Scripts 编辑、Workers KV Storage 编辑、Workers Routes 编辑、Zone 读取、DNS 编辑和 Account Settings 读取。软件会验证令牌是否有效并读取可见资源；连接成功不代表已获得所有修改权限。一个令牌如果能访问多个 Cloudflare 账户，软件只添加还没导入的账户；已导入的账户自动跳过，原来保存的令牌不会改动，导入完成后会列出添加和跳过了哪些账户。
 2. 在 **域名管理** 中选择账户已有的域名，也可手填子域名。软件先检查归属和现有配置，你确认后才会连接该域名。
 3. 在 **短链接** 页面新建链接，选择域名，填写短链接名称，例如 `welcome`。
 4. 选择直接填写两个完整网址，或使用已经保存的平台地址并填写自己的 **邀请码**。

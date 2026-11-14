@@ -4,6 +4,10 @@ export type Domain = { id: string; accountId: string; zoneId: string; host: stri
 export type Link = { domainId: string; slug: string; cnUrl: string; defaultUrl: string; updated: string; poolId?: string; code?: string };
 export type PendingAction = {kind:'resume_pool_sync'|'delete_pool'|'resume_monitor'|'resume_selftest_rotation'|'recover_selftest_rotation'|'recover_selftest_resources'|'resume_worker_upgrade';poolId:string|null;accountId:string|null;label:string};
 export type State = { accounts: Account[]; domains: Domain[]; links: Link[]; pendingOperations: string[]; pendingActions:PendingAction[]; pools?: Pool[]; appVersion?: string };
+/** One-off result of `import_token`; returned beside the state, never stored. */
+export type ImportReport = { imported: { id: string; name: string }[]; skipped: { id: string; label: string }[]; rejected: { id: string; name: string; reason: string }[] };
+/** One-off result of `import_config`; returned beside the state, never stored. Older backends omit it. */
+export type ConfigImportReport = { domainsAdded: number; linksAdded: number; poolsAdded: number; linksExisting: number; linksDiffering: number };
 export type Plan = { id: string; title: string; steps: string[]; warnings: string[]; expiresAt: string; domainTakeoverConfirmation?: string; credentialMigrationConfirmation?: string };
 export type Check = { label: string; ok: boolean; message: string };
 export type DomainCheck = Check & { level?: 'pass' | 'warning' | 'error'; reason?: string };
