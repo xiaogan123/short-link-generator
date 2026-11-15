@@ -227,7 +227,7 @@ impl Backend {
                 .find(|a| a.id == account_id)
                 .map_or(account_id, |a| a.label.as_str());
             Err(format!(
-                "账户「{label}」：此账户的 Worker 升级尚未核对，请从待处理操作恢复；云端未确认前不会执行其他变更"
+                "账户「{label}」：此账户的云端跳转服务升级尚未核对，请先用页面上方“……项变更可继续处理”那一栏里的「继续核对升级」按钮处理；云端未确认前不会执行其他变更"
             ))
         } else {
             Ok(())
@@ -280,12 +280,25 @@ impl Backend {
                 .find(|a| a.id == id)
                 .map_or_else(|| id.to_owned(), |a| format!("「{}」", a.label))
         };
-        let blocker = if let Some(first) = self.db.pending_operations.first() {
-            Some(format!(
-                "{first}（共 {} 项）",
-                self.db.pending_operations.len()
-            ))
-        } else if !self.db.pending_pool_changes.is_empty() {
+        if let Some(first) = self.db.pending_operations.first() {
+            let count = self.db.pending_operations.len();
+            // A record with its own entry cannot be cleared by hand.
+            return Err(match self.db.dedicated_recovery_entry(first) {
+                Some(place) => format!(
+                    "请先处理待处理记录里的这一条：{first}（共 {count} 项）。{place}，再升级此账户的云端跳转服务"
+                ),
+                None => match self.db.resume_hint(first) {
+                    // One more click usually finishes it; clearing stays allowed.
+                    Some(step) => format!(
+                        "待处理记录里还有这一条：{first}（共 {count} 项）。请先{step}；实在做不了，也可以到页面上方「查看待处理记录」里核对后清除它。然后再升级此账户的云端跳转服务"
+                    ),
+                    None => format!(
+                        "请先到页面上方「查看待处理记录」里核对并清除：{first}（共 {count} 项），再升级此账户的云端跳转服务"
+                    ),
+                },
+            });
+        }
+        let blocker = if !self.db.pending_pool_changes.is_empty() {
             Some(format!(
                 "平台地址同步（共 {} 项）",
                 self.db.pending_pool_changes.len()
@@ -307,7 +320,7 @@ impl Backend {
         };
         if let Some(blocker) = blocker {
             return Err(format!(
-                "请先在待处理操作中完成：{blocker}，再升级此账户的 Worker"
+                "请先用页面上方“……项变更可继续处理”那一栏把它做完：{blocker}，再升级此账户的云端跳转服务"
             ));
         }
         Ok(())
@@ -628,7 +641,7 @@ impl Backend {
                     clear_journal(&mut db.pending_operations, &journal)
                 }) {
                     return Err(format!(
-                        "{}；{persist_error}，升级记录未清除，请从待处理操作核对",
+                        "{}；{persist_error}，升级记录未清除，请用页面上方“……项变更可继续处理”那一栏里的「继续核对升级」按钮核对",
                         error.message
                     ));
                 }
@@ -651,7 +664,7 @@ impl Backend {
                 } else {
                     WorkerUpgradePhase::Prepared
                 },
-                "上传未确认；请从待处理操作核对，禁止重复上传",
+                "上传未确认；请用页面上方“……项变更可继续处理”那一栏里的「继续核对升级」按钮核对，禁止重复上传",
             )?;
             return Err(error.message);
         }
@@ -675,7 +688,7 @@ impl Backend {
                 "升级核对尚未完成；保留记录，不重新上传",
             )?;
             return Err(format!(
-                "{error}；请从待处理操作核对，必要时明确确认解除本机升级记录"
+                "{error}；请用页面上方“……项变更可继续处理”那一栏里的「继续核对升级」按钮再核对，必要时点旁边的「解除本机升级记录」"
             ));
         }
         result

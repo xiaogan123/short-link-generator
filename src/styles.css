@@ -721,3 +721,15 @@ button:disabled{opacity:0.72;}
   .panel-tools{width:100%;}
   .panel-tools .searchbox{min-width:120px;}
 }
+/* Notices stay in view while the list scrolls; they sit above the page, below dialogs. */
+.alert-stack{position:sticky;top:10px;z-index:12;}
+.alert-stack .alert{box-shadow:0 8px 20px #1f3a2a1f;}
+.alert-stack .alert .button{flex:0 0 auto;}
+.dialog-escape-warning{margin:0 0 8px;padding:8px 11px;border-radius:5px;background:#fff3df;border:1px solid #e7d5b1;color:#745627;font-size:11px;line-height:1.5;}
+.dialog-status .dialog-escape-warning:last-child{margin-bottom:0;}
+.operation-log-entry{display:flex;align-items:center;justify-content:space-between;gap:12px;}
+.operation-log-entry > span{min-width:0;flex:1;overflow-wrap:anywhere;}
+.operation-log-hint{display:block;margin-top:2px;font-size:12px;font-weight:700;}
+.operation-log-entry .button{flex:0 0 auto;font-size:11px;}
+.attention-disabled-reason{flex:0 1 170px;min-width:120px;color:#5f6f66;font-size:11px;line-height:1.4;}
+.hero-action > .button + .button{margin-left:8px;}

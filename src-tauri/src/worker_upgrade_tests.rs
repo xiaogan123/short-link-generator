@@ -1652,13 +1652,53 @@ async fn upgrade_blockers_name_the_pending_operation_and_account() {
     let error = backend
         .prepare_change(&json!({"kind":"upgrade_worker","accountId":"acct1"}))
         .unwrap_err();
+    // Plain records still block every account, and the text says where to
+    // check and clear them.
+    assert_eq!(
+        error,
+        "请先到页面上方「查看待处理记录」里核对并清除：保存链接 example.com / short (abc)：写入结果不确定，需要人工核对（共 2 项），再升级此账户的云端跳转服务"
+    );
+    // A first record with its own entry cannot be cleared by hand: the text
+    // names that entry instead.
+    backend.db.pending_operations = vec![
+        "清理账号 acct1 (c)：Worker 删除结果不确定，请核对后继续清理".into(),
+        "保存链接 example.com / short (abc)".into(),
+    ];
+    let error = backend
+        .prepare_change(&json!({"kind":"upgrade_worker","accountId":"acct1"}))
+        .unwrap_err();
+    assert_eq!(
+        error,
+        "请先处理待处理记录里的这一条：清理账号 acct1 (c)：Worker 删除结果不确定，请核对后继续清理（共 2 项）。请到「Cloudflare 账户」页打开账户「账号 1」的「管理账户」，再点一次「删除云端短链接服务」继续处理，再升级此账户的云端跳转服务"
+    );
+    assert!(!error.contains("清除："), "{error}");
+    backend.db.pending_operations = vec!["重置自检密钥 acct1 (r)：云端结果不确定".into()];
+    let error = backend
+        .prepare_change(&json!({"kind":"upgrade_worker","accountId":"acct1"}))
+        .unwrap_err();
     assert!(
-        error.contains(
-            "保存链接 example.com / short (abc)：写入结果不确定，需要人工核对（共 2 项）"
-        ),
+        error.contains("请用页面上方“……项变更可继续处理”那一栏里的「"),
         "{error}"
     );
-    assert!(error.contains("再升级此账户的 Worker"));
+    // A removal record of a domain that is still here: one more click usually
+    // finishes it, so the text names that click before clearing.
+    backend.db.pending_operations = vec!["移除域名 example.com (old)：链接删除结果不确定".into()];
+    let plain = backend
+        .prepare_change(&json!({"kind":"upgrade_worker","accountId":"acct1"}))
+        .unwrap_err();
+    assert!(
+        plain.starts_with("请先到页面上方「查看待处理记录」里核对并清除："),
+        "{plain}"
+    );
+    backend.db.domains.push(domain());
+    let error = backend
+        .prepare_change(&json!({"kind":"upgrade_worker","accountId":"acct1"}))
+        .unwrap_err();
+    assert_eq!(
+        error,
+        "待处理记录里还有这一条：移除域名 example.com (old)：链接删除结果不确定（共 1 项）。请先到「域名管理」对域名 example.com 再点一次「移除域名」把它做完；实在做不了，也可以到页面上方「查看待处理记录」里核对后清除它。然后再升级此账户的云端跳转服务"
+    );
+    backend.db.domains.clear();
     backend.db.pending_operations.clear();
     backend
         .db
@@ -1701,5 +1741,6 @@ async fn upgrade_blockers_name_the_pending_operation_and_account() {
     assert!(apply_upgrade(&mut backend).await.is_err());
     let error = backend.require_no_worker_upgrade("acct1").unwrap_err();
     assert!(error.starts_with("账户「账号 1」："), "{error}");
-    assert!(error.contains("Worker 升级尚未核对"));
+    assert!(error.contains("云端跳转服务升级尚未核对"), "{error}");
+    assert!(error.contains("「继续核对升级」"), "{error}");
 }

@@ -6,6 +6,8 @@ export const MONITOR_INTERVAL_MS = 48 * 60 * 60_000;
 export const CONFIRM_DELAY_MS = 60_000;
 export const STALE_AFTER_MS = MONITOR_INTERVAL_MS + 5 * 60_000;
 const SPACING_MS = 250;
+/** Waits after a "backend busy" reply: 1, 3, then every 10 minutes. */
+export const BUSY_BACKOFF_MS = [60_000, 3 * 60_000, 10 * 60_000] as const;
 const preferenceKey = preview ? 'redirect-monitor-preview-enabled' : 'redirect-monitor-enabled';
 const completionKey = `${preferenceKey}-completed-at`;
 
@@ -77,6 +79,16 @@ export function useRedirectMonitor({state,paused,ready,check = defaultCheck}:Opt
   const incompleteRound = useRef(false);
   const roundRemaining = useRef(new Map<string,string>());
   const busyResults = useRef(new Set<string>());
+  // A paused or busy-blocked full round resumes from roundRemaining.
+  const resumeRound = useRef(false);
+  const roundTotal = useRef(0);
+  const roundAllPassed = useRef(true);
+  // When the current round began, and whether it was continued after a stop.
+  const roundStartedAt = useRef(0);
+  const roundResumed = useRef(false);
+  const busyUntil = useRef(0);
+  const busyStreak = useRef(0);
+  const busyTimer = useRef<number|undefined>(undefined);
   const [clockView,setClockView] = useState({elapsed:0,wall:Date.now()});
   const clock = useRef({elapsed:0,wall:Date.now(),monotonic:performance.now()});
   const indexed = useMemo(() => indexState(state),[state.links,state.domains,state.pools]);
@@ -92,7 +104,6 @@ export function useRedirectMonitor({state,paused,ready,check = defaultCheck}:Opt
   const revision = useRef(0);
   const scopeRevision = useRef(0);
   const requestSequence = useRef<Record<string,number>>({});
-  const busyRetries = useRef<Record<string,number>>({});
   const changed = useRef(new Map<string,string>());
   const confirmations = useRef(new Map<string,{identity:string;due:number}>());
   const confirmationTimers = useRef(new Map<string,number>());
@@ -138,7 +149,27 @@ export function useRedirectMonitor({state,paused,ready,check = defaultCheck}:Opt
     },CONFIRM_DELAY_MS));
   };
 
-  const checkOne = async (key:string, expectedIdentity:string, confirm:boolean):Promise<boolean|null> => {
+  const backingOff = () => busyUntil.current > sampleClock().elapsed;
+  const clearBusyWait = () => {
+    if (busyTimer.current !== undefined) window.clearTimeout(busyTimer.current);
+    busyTimer.current = undefined;
+    busyUntil.current = 0;
+  };
+  // The backend lock is shared by every check, so one busy reply pauses all work.
+  const backOff = () => {
+    const delay = BUSY_BACKOFF_MS[Math.min(busyStreak.current,BUSY_BACKOFF_MS.length - 1)];
+    busyStreak.current++;
+    clearBusyWait();
+    busyUntil.current = sampleClock().elapsed + delay;
+    busyTimer.current = window.setTimeout(() => {
+      busyTimer.current = undefined;
+      if (mounted.current) setClockView(sampleClock());
+      void drainRef.current();
+    },delay);
+  };
+
+  // 'busy' means not checked: the caller keeps the link queued for this round.
+  const checkOne = async (key:string, expectedIdentity:string, confirm:boolean):Promise<boolean|null|'busy'> => {
     if (!canStart() || currentIdentity(key) !== expectedIdentity) return null;
     const entry = indexRef.current.get(key)!;
     const seq = (requestSequence.current[key] || 0) + 1;
@@ -155,15 +186,12 @@ export function useRedirectMonitor({state,paused,ready,check = defaultCheck}:Opt
     if (result.status !== 'passed') { writeCompletion(null); restoredSuccess.current = null; }
     if (result.reason === 'busy') {
       busyResults.current.add(key);
-      clearConfirmation(key);
-      if ((busyRetries.current[key] || 0) < 1) {
-        busyRetries.current[key] = 1;
-        confirmLater(key,expectedIdentity);
-      }
-      return false;
+      backOff();
+      if (confirm) confirmations.current.set(key,{identity:expectedIdentity,due:busyUntil.current});
+      return 'busy';
     }
     busyResults.current.delete(key);
-    busyRetries.current[key] = 0;
+    busyStreak.current = 0;
     const previous = recordsRef.current[key];
     const same = previous?.identity === expectedIdentity ? previous : undefined;
     let phase:Phase;
@@ -184,6 +212,7 @@ export function useRedirectMonitor({state,paused,ready,check = defaultCheck}:Opt
     return result.status === 'passed';
   };
   const hasWork = () => {
+    if (backingOff()) return false;
     const time = sampleClock().elapsed;
     return (indexRef.current.size > 0 && dueAt.current <= time) || changed.current.size > 0
       || [...confirmations.current.values()].some(item => item.due <= time);
@@ -196,7 +225,7 @@ export function useRedirectMonitor({state,paused,ready,check = defaultCheck}:Opt
     try {
       const runDueConfirmations = async () => {
         for (const [key,item] of [...confirmations.current]) {
-          if (!canStart()) return;
+          if (!canStart() || backingOff()) return;
           if (item.due > sampleClock().elapsed) continue;
           clearConfirmation(key);
           setRunKind('confirm');
@@ -204,48 +233,65 @@ export function useRedirectMonitor({state,paused,ready,check = defaultCheck}:Opt
         }
       };
       await runDueConfirmations();
-      if (!canStart()) return;
+      if (!canStart() || backingOff()) return;
       const full = indexRef.current.size > 0 && dueAt.current <= sampleClock().elapsed;
-      const items = full ? [...indexRef.current].map(([key,item]) => [key,item.identity] as const) : [...changed.current];
+      // Resume an interrupted round with only the links it has not checked yet.
+      const resume = full && resumeRound.current && incompleteRound.current && roundRemaining.current.size > 0;
+      const items = !full ? [...changed.current]
+        : resume ? [...roundRemaining.current]
+          : [...indexRef.current].map(([key,item]) => [key,item.identity] as const);
       if (!items.length) return;
       if (full) {
-        incompleteRound.current = true;
-        roundRemaining.current = new Map(items);
+        if (!resume) {
+          incompleteRound.current = true;
+          roundRemaining.current = new Map(items);
+          roundTotal.current = items.length;
+          roundAllPassed.current = true;
+          roundStartedAt.current = sampleClock().elapsed;
+        }
+        roundResumed.current = resume;
+        resumeRound.current = false;
         restoredSuccess.current = null;
         dueAt.current = sampleClock().elapsed + MONITOR_INTERVAL_MS;
         writeCompletion(null);
-        busyRetries.current = {};
       }
       const cycleRevision = revision.current;
       const cycleScope = scopeRevision.current;
+      const offset = resume ? Math.max(0,roundTotal.current - items.length) : 0;
+      const total = offset + items.length;
+      // An interrupted full round stays due and continues where it stopped.
+      const interrupt = () => { if (full) { dueAt.current = 0; resumeRound.current = true; } };
       setRunKind(full ? 'full' : 'changed');
-      setProgress({done:0,total:items.length});
+      setProgress({done:offset,total});
       let done = 0;
-      let allPassed = true;
       for (const [key,identity] of items) {
-        if (!canStart() || revision.current !== cycleRevision) { if (full) dueAt.current = 0; break; }
+        if (!canStart() || revision.current !== cycleRevision || backingOff()) { interrupt(); break; }
         await runDueConfirmations();
-        if (!canStart() || revision.current !== cycleRevision) { if (full) dueAt.current = 0; break; }
+        if (!canStart() || revision.current !== cycleRevision || backingOff()) { interrupt(); break; }
         setRunKind(full ? 'full' : 'changed');
         const passed = await checkOne(key,identity,false);
+        // Busy is not checked: keep it in this round and in the changed queue.
+        if (passed === 'busy') { interrupt(); break; }
         if (passed !== null && currentIdentity(key) === identity && roundRemaining.current.get(key) === identity) roundRemaining.current.delete(key);
-        allPassed = allPassed && passed === true;
+        if (full) roundAllPassed.current = roundAllPassed.current && passed === true;
         if (changed.current.get(key) === identity && (passed !== null || currentIdentity(key) !== identity)) changed.current.delete(key);
-        if (!canStart() || revision.current !== cycleRevision) { if (full) dueAt.current = 0; break; }
+        if (!canStart() || revision.current !== cycleRevision) { interrupt(); break; }
         done++;
-        if (mounted.current) setProgress({done,total:items.length});
+        if (mounted.current) setProgress({done:offset + done,total});
         if (done < items.length) await new Promise<void>(resolve => window.setTimeout(resolve,SPACING_MS));
       }
-      if (full && done === items.length && canStart() && revision.current === cycleRevision && scopeRevision.current === cycleScope) {
+      if (full && done === items.length && roundRemaining.current.size === 0 && canStart() && revision.current === cycleRevision && scopeRevision.current === cycleScope) {
         incompleteRound.current = false;
         const completedAt = new Date().toISOString();
         setLastCompletion(completedAt);
-        dueAt.current = sampleClock().elapsed + MONITOR_INTERVAL_MS;
-        const allHealthy = allPassed && confirmations.current.size === 0 && changed.current.size === 0 && items.every(([key,identity]) => {
+        // A continued round holds results from before the stop. Count the next
+        // 48 hours from its start so they are rechecked before they expire.
+        dueAt.current = (roundResumed.current ? roundStartedAt.current : sampleClock().elapsed) + MONITOR_INTERVAL_MS;
+        const allHealthy = roundAllPassed.current && confirmations.current.size === 0 && changed.current.size === 0 && [...indexRef.current].every(([key,item]) => {
           const record = recordsRef.current[key];
           const time = recordTimes.current.get(key);
           const now = sampleClock();
-          return currentIdentity(key) === identity && record?.identity === identity && record.phase === 'healthy' &&
+          return record?.identity === item.identity && record.phase === 'healthy' &&
             Date.parse(record.checkedAt) <= now.wall && !!time && time.age + Math.max(0,now.elapsed - time.at) <= STALE_AFTER_MS;
         });
         writeCompletion(allHealthy ? completedAt : null);
@@ -266,8 +312,11 @@ export function useRedirectMonitor({state,paused,ready,check = defaultCheck}:Opt
     if (!value) {
       restoredSuccess.current = null;
       incompleteRound.current = false;
+      resumeRound.current = false;
       roundRemaining.current.clear();
       busyResults.current.clear();
+      busyStreak.current = 0;
+      clearBusyWait();
       writeCompletion(null);
       revision.current++;
       for (const key of [...confirmations.current.keys()]) clearConfirmation(key);
@@ -281,7 +330,7 @@ export function useRedirectMonitor({state,paused,ready,check = defaultCheck}:Opt
     setEnabledState(value);
     if (value) window.setTimeout(() => void drainRef.current(),0);
   },[]);
-  const runNow = useCallback(() => { if (!running.current && canStart()) { dueAt.current = 0; void drainRef.current(); } },[]);
+  const runNow = useCallback(() => { if (!running.current && canStart()) { dueAt.current = 0; clearBusyWait(); void drainRef.current(); } },[]);
 
   useEffect(() => {
     mounted.current = true;
@@ -301,6 +350,7 @@ export function useRedirectMonitor({state,paused,ready,check = defaultCheck}:Opt
       document.removeEventListener('visibilitychange',tick);
       for (const timer of confirmationTimers.current.values()) window.clearTimeout(timer);
       confirmationTimers.current.clear();
+      clearBusyWait();
       confirmations.current.clear();
     };
   },[]);
@@ -358,6 +408,7 @@ export function useRedirectMonitor({state,paused,ready,check = defaultCheck}:Opt
   const scopePending = previousScope.current !== null && (previousScope.current.size !== indexed.size ||
     [...indexed].some(([key,item]) => previousScope.current?.get(key)?.identity !== item.identity));
   let resultStatus:MonitorResultStatus = 'unverified';
+  let previousRunAt:string|null = null;
   if (enabled && ready && indexed.size && !active && !running.current && !scopePending && !changed.current.size && !incompleteRound.current) {
     const current = [...indexed].map(([key,item]) => ({key,item,record:records[key],time:recordTimes.current.get(key)}));
     if (current.some(({record,item}) => record?.identity === item.identity && record.phase !== 'healthy')) resultStatus = 'attention';
@@ -365,10 +416,12 @@ export function useRedirectMonitor({state,paused,ready,check = defaultCheck}:Opt
       resultStatus = current.some(({record,time}) => !time || Date.parse(record!.checkedAt) > clockView.wall || time.age + Math.max(0,clockView.elapsed - time.at) > STALE_AFTER_MS) ? 'stale' : 'healthy';
     } else if (!busyResults.current.size && !current.some(({record}) => record) && restoredSuccess.current && !confirmations.current.size) {
       const timestamp = Date.parse(restoredSuccess.current);
+      previousRunAt = restoredSuccess.current;
       resultStatus = timestamp > clockView.wall ? 'unverified' : Math.max(clockView.wall - timestamp,restoredAge.current + clockView.elapsed) > STALE_AFTER_MS ? 'stale' : 'healthy';
     }
   }
-  const nextDue = Math.min(changed.current.size ? clockView.elapsed : Infinity,dueAt.current,...[...confirmations.current.values()].map(item => item.due));
+  const waitingForBackend = enabled && busyUntil.current > clockView.elapsed;
+  const nextDue = Math.max(busyUntil.current,Math.min(changed.current.size ? clockView.elapsed : Infinity,dueAt.current,...[...confirmations.current.values()].map(item => item.due)));
   const nextCheckAt = enabled && indexed.size > 0 ? new Date(clockView.wall + Math.max(0,nextDue - clockView.elapsed)).toISOString() : null;
-  return {enabled,setEnabled,runNow,active,runKind,progress,lastCompletion,nextCheckAt,getRecord,summary,resultStatus,online:isOnline(),ready,pendingChanges:changed.current.size,totalLinks:indexed.size};
+  return {enabled,setEnabled,runNow,active,runKind,progress,lastCompletion,nextCheckAt,getRecord,summary,resultStatus,previousRunAt,waitingForBackend,online:isOnline(),ready,pendingChanges:changed.current.size,totalLinks:indexed.size};
 }

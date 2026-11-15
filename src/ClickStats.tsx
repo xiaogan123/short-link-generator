@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import Dialog from "./Dialog";
-import { dispatch, errorMessage, preview } from "./bridge";
+import { errorMessage, preview } from "./bridge";
 import type { Account, ClickStats, ClickStatsDays, Domain, Link } from "./types";
 import { dedupNote, validDedup } from "./clickDedup";
+import { STATS_BUSY_WAITING, isTemporaryReadError, readWhenFree } from "./StatsCenter";
 import "./ClickStats.css";
 
 type Props = {
@@ -14,10 +15,14 @@ type Props = {
   revision: number;
   busy?: boolean;
   configurationError?: string;
+  /** Range chosen in the statistics center; the link list opens with 7 days. */
+  initialDays?: ClickStatsDays;
 };
 
+const BUSY_GIVE_UP = "后台还在忙，请过一会儿再点『重试』。";
+
 type ViewState =
-  | { kind: "loading" }
+  | { kind: "loading"; waiting?: boolean }
   | { kind: "report"; report: ClickStats }
   | { kind: "error"; message: string }
   | { kind: "no-account" }
@@ -79,13 +84,15 @@ export default function ClickStatsDialog({
   revision,
   busy = false,
   configurationError,
+  initialDays = 7,
 }: Props) {
-  const [days, setDays] = useState<ClickStatsDays>(7);
+  const [days, setDays] = useState<ClickStatsDays>(initialDays);
   const [view, setView] = useState<ViewState>({ kind: "loading" });
   const [openerError, setOpenerError] = useState("");
   const sequence = useRef(0);
   const mounted = useRef(false);
   const inFlight = useRef(new Map<string, Promise<ClickStats>>());
+  const currentKey = useRef("");
 
   useEffect(() => {
     mounted.current = true;
@@ -113,13 +120,16 @@ export default function ClickStatsDialog({
 
     setView({ kind: "loading" });
     const requestKey = JSON.stringify([domain.id, link.slug, days, revision]);
+    currentKey.current = requestKey;
     let request = inFlight.current.get(requestKey);
     if (!request) {
-      request = dispatch<ClickStats>("get_link_stats", {
+      // A shared request keeps retrying while its key is still the one shown.
+      const alive = () => mounted.current && currentKey.current === requestKey;
+      request = readWhenFree<ClickStats>("get_link_stats", {
         domainId: domain.id,
         slug: link.slug,
         days,
-      });
+      }, { alive, giveUp: BUSY_GIVE_UP, onWait: () => { if (alive()) setView({ kind: "loading", waiting: true }); } });
       inFlight.current.set(requestKey, request);
     }
 
@@ -154,7 +164,8 @@ export default function ClickStatsDialog({
 
   const report = view.kind === "report" ? view.report : undefined;
   const accountUnavailable = view.kind === "no-account" || view.kind === "credential-migration";
-  const checkBeforeDisable = view.kind === "error" || report?.status === "unavailable";
+  // A network hiccup or a busy backend only needs a retry, not the disable path.
+  const checkBeforeDisable = (view.kind === "error" && !isTemporaryReadError(view.message)) || report?.status === "unavailable";
   const showConfigure = accountUnavailable || report !== undefined || checkBeforeDisable;
   const enabling = accountUnavailable || report?.status === "disabled";
   const configureDisabled = busy || !account || Boolean(account.needsCredentialMigration) || Boolean(account.needsTokenRecovery);
@@ -187,7 +198,7 @@ export default function ClickStatsDialog({
 
   const body = (() => {
     if (view.kind === "loading") {
-      return <div className="cstats-loading" role="status">正在读取所选时间范围的统计…</div>;
+      return <div className="cstats-loading" role="status">{view.waiting ? STATS_BUSY_WAITING : "正在读取所选时间范围的统计…"}</div>;
     }
     if (view.kind === "no-account") {
       return <Notice title="未连接账户" tone="warning">没有找到此域名连接的 Cloudflare 账户，暂时无法读取或配置访问统计。</Notice>;
@@ -199,7 +210,12 @@ export default function ClickStatsDialog({
       return <Notice title="需要先更新本机授权" tone="warning">请先到“账户”完成此账户的本机授权迁移，再查看或配置访问统计。</Notice>;
     }
     if (view.kind === "error") {
-      return <Notice title="访问统计读取失败" tone="error">{view.message || "操作未完成，请重试。"}</Notice>;
+      return (
+        <Notice title="访问统计读取失败" tone="error">
+          <p>{view.message || "操作未完成，请重试。"}</p>
+          <button type="button" className="button bordered cstats-token-button" onClick={() => void load()}>重试</button>
+        </Notice>
+      );
     }
 
     const current = view.report;

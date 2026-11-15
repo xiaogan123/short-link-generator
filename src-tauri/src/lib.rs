@@ -21,8 +21,12 @@ mod mac_helper_adapter;
 #[cfg(all(target_os = "macos", not(test)))]
 mod mac_helper_ffi;
 mod model;
+#[cfg(test)]
+mod pending_cleanup_tests;
 mod pools;
 mod redirect_check;
+#[cfg(test)]
+mod resume_flow_tests;
 mod secret_store;
 #[cfg(test)]
 mod selftest_resource_recovery_tests;
@@ -70,6 +74,27 @@ fn bundled_source_hash() -> String {
 
 pub struct AppState(Mutex<Backend>);
 
+/// How long a foreground action waits for the one before it to finish.
+const BUSY_WAIT: Duration = if cfg!(test) {
+    Duration::from_millis(200)
+} else {
+    Duration::from_secs(8)
+};
+/// Shown when that wait ran out. The frontend recognizes the opening words;
+/// the text must not read like a token or permission problem.
+const BUSY_MESSAGE: &str =
+    "上一个操作还没结束，已经等了几秒。请稍后再点一次；如果屏幕上有系统的钥匙串窗口，请先处理它。";
+
+/// Waits at most `wait` for the backend, then gives up with `BUSY_MESSAGE`.
+async fn lock_backend_within(
+    state: &AppState,
+    wait: Duration,
+) -> Result<tokio::sync::MutexGuard<'_, Backend>, String> {
+    tokio::time::timeout(wait, state.0.lock())
+        .await
+        .map_err(|_| BUSY_MESSAGE.to_string())
+}
+
 async fn lock_backend<'a>(
     state: &'a AppState,
     action: &str,
@@ -95,9 +120,7 @@ async fn lock_backend<'a>(
             | "import_config"
             | "install_update"
     ) {
-        state.0.try_lock().map_err(|_| {
-            "上一个操作仍在进行，请稍候；若有系统授权窗口，请先完成或取消，无需重复点击".to_string()
-        })
+        lock_backend_within(state, BUSY_WAIT).await
     } else {
         Ok(state.0.lock().await)
     }
@@ -137,6 +160,12 @@ struct HealthSnapshot {
     cloud: Cloud,
 }
 
+/// The manifest and Worker settings read by `verify_resource_source`.
+struct VerifiedSource {
+    manifest: Value,
+    settings: Value,
+}
+
 struct DomainTakeover<'a> {
     expected_path_risk: &'a PathRiskSnapshot,
     dns_mode: local_check::DnsMode,
@@ -150,6 +179,15 @@ fn problem(error: CloudError) -> String {
 
 /// `DomainCheck.reason` for a Cloudflare read that got no HTTP response.
 const CLOUD_UNREACHABLE: &str = "cloud_unreachable";
+/// `DomainCheck.reason` for a Cloudflare read answered with HTTP 401 or 403
+/// (a real answer, not a network failure).
+const CLOUD_REFUSED: &str = "cloud_refused";
+/// `DomainCheck.reason` when this computer could not use the account's saved
+/// authorization (the `本机授权` and `凭据` checks).
+const CREDENTIAL: &str = "credential";
+/// Where the resume buttons are: the bar above the page content on every
+/// page, titled 「有 N 项变更可继续处理」.
+const RESUME_BAR: &str = "页面上方“……项变更可继续处理”那一栏";
 /// Check reasons that mean "the network did not let us finish", not "the
 /// domain is wrong". Repeating the same check is safe and often succeeds.
 const TRANSIENT_NETWORK_REASONS: [&str; 7] = [
@@ -164,9 +202,142 @@ const TRANSIENT_NETWORK_REASONS: [&str; 7] = [
 /// Present in an `apply_plan` error exactly when the domain plan was kept
 /// and may be confirmed again with the same plan ID (see docs/CONTRACT.md).
 const PLAN_STILL_VALID: &str = "接入计划仍然有效";
+/// `DomainCheck.reason` when the zone ID cached on this computer answered 404
+/// (the domain was deleted and added again in Cloudflare, so its ID changed).
+const ZONE_CACHE_STALE: &str = "zone_cache_stale";
+/// Before a refresh: the cached zone ID is no longer known to Cloudflare.
+const ZONE_ID_STALE: &str = "本机记的这个域名的编号已经过期，请重新检查域名";
+/// After one automatic refresh the domain is still not found.
+const ZONE_CACHE_STALE_MESSAGE: &str = "本机的域名列表过期了，已刷新仍未找到这个域名。请到 Cloudflare 确认这个域名还在所选账户里，再检查一次";
+
+/// A Cloudflare answer (not a network failure) saying the resource is gone.
+fn answered_not_found(error: &CloudError) -> bool {
+    !error.network && error.message.contains("HTTP 404")
+}
+
+/// A Cloudflare answer (not a network failure) refusing the read. On the
+/// `zones/{zone_id}` read this may also mean a stale cached zone ID, so the
+/// preparing steps refresh the zone list once; the 403 wording stays unless
+/// the refresh shows that the ID really changed or the domain is gone.
+fn answered_forbidden(error: &CloudError) -> bool {
+    !error.network && error.message.contains("HTTP 403")
+}
+
+/// A Cloudflare answer (not a network failure) of HTTP 401 or 403.
+fn answered_refused(error: &CloudError) -> bool {
+    !error.network && (error.message.contains("HTTP 401") || error.message.contains("HTTP 403"))
+}
+
+/// Why a confirmed zone read failed, where that changes the check shown.
+#[derive(Clone, Copy, Default)]
+struct ZoneReadFailure {
+    /// `zones/{zone_id}` answered HTTP 403: the cached ID may be stale too.
+    forbidden: bool,
+    /// `zones/{zone_id}` answered HTTP 401 or 403.
+    refused: bool,
+    /// Label of the local authorization step that failed.
+    credential: Option<&'static str>,
+}
+
+/// A failed check because this computer could not use the saved authorization.
+fn credential_check(label: &str, message: impl Into<String>) -> DomainCheck {
+    let mut check = domain_check::hard_check(label, false, message);
+    check.reason = Some(CREDENTIAL.into());
+    check
+}
+
+/// The ownership check for a cached zone ID that answered 404.
+fn stale_zone_check() -> DomainCheck {
+    let mut check = domain_check::hard_check("云端域名归属", false, ZONE_ID_STALE);
+    check.reason = Some(ZONE_CACHE_STALE.into());
+    check
+}
+
+/// The two ownership errors an interrupted domain removal leaves behind:
+/// its route is gone, or its prefix config is gone. Only these lead to the
+/// read-only check for a half-finished removal.
+const DOMAIN_ROUTE_CHANGED: &str = "Worker 路由已变化，请刷新或找回";
+const DOMAIN_CONFIG_LOST: &str = "云端域名配置已丢失";
+
+/// Ends a domain-removal error that a later removal can finish.
+const REMOVAL_RETRY_HINT: &str = "再点一次「移除域名」会接着做完";
+/// What an interrupted domain removal left in the cloud (see
+/// `Backend::removal_leftover`).
+struct RemovalLeftover {
+    namespace: String,
+    /// Link keys of this domain still in the cloud.
+    links: Vec<String>,
+    /// This tool's recorded route for the domain is still there.
+    route_left: bool,
+}
+
+/// Ends an account-cleanup error that a later cleanup can finish.
+const CLEANUP_RETRY_HINT: &str = "再点一次「删除云端短链接服务」会接着做完";
+/// An account cleanup that stopped before deleting anything in the cloud.
+const CLEANUP_NOTHING_DELETED: &str = "云端没有删除任何东西";
+
+/// A failed Worker delete in an account cleanup: the note kept on the record
+/// (`None` ends the record) and the error. `nothing_deleted` is true when this
+/// run started the record and deleted nothing in the cloud before.
+fn cleanup_worker_delete_failure(
+    error: &CloudError,
+    nothing_deleted: bool,
+) -> (Option<&'static str>, String) {
+    if error.uncertain {
+        return (
+            Some("Worker 删除结果不确定，请核对后继续清理"),
+            format!("{}；{CLEANUP_RETRY_HINT}", error.message),
+        );
+    }
+    // A connection that never opened sent nothing: not a refusal.
+    if error.network {
+        return if nothing_deleted {
+            (
+                None,
+                format!(
+                    "连不上云端，删除云端跳转服务的请求没有发出去；{CLEANUP_NOTHING_DELETED}。网络恢复后{CLEANUP_RETRY_HINT}"
+                ),
+            )
+        } else {
+            (
+                Some("连不上云端，云端跳转服务还没删，网络恢复后再点一次「删除云端短链接服务」"),
+                format!(
+                    "连不上云端，删除云端跳转服务的请求没有发出去，云端跳转服务还没删。网络恢复后{CLEANUP_RETRY_HINT}"
+                ),
+            )
+        };
+    }
+    if nothing_deleted {
+        (
+            None,
+            format!("{}；{CLEANUP_NOTHING_DELETED}", error.message),
+        )
+    } else {
+        (
+            Some("Worker 删除被拒绝，账号清理尚未完成"),
+            error.message.clone(),
+        )
+    }
+}
+
+/// Key names an account cleanup may let go together with the namespace: the
+/// manifest, the monitor cursor, health records and platform address copies.
+/// A link (`l:`), a prefix config (`c:`) or anything unknown is never one.
+fn cleanup_may_remove_key(key: &str) -> bool {
+    key == MANIFEST_KEY
+        || key == "m:monitor:cursor"
+        || key.strip_prefix("h:").is_some_and(pools::valid_id)
+        || key.strip_prefix("p:").is_some_and(pools::valid_id)
+}
 /// Replaces the marker and what follows it when a network-only review failure
 /// could not keep the plan (it expired while the review was running).
 const PLAN_GONE_TAIL: &str = "这份接入计划已经过期，云端没有任何改动，请重新检查域名。";
+
+fn has_reason(checks: &[DomainCheck], reason: &str) -> bool {
+    checks
+        .iter()
+        .any(|check| check.reason.as_deref() == Some(reason))
+}
 
 fn is_transient_network_reason(reason: &str) -> bool {
     TRANSIENT_NETWORK_REASONS.contains(&reason)
@@ -210,7 +381,13 @@ fn cloud_read_failure(label: &str, context: &str, error: CloudError) -> DomainCh
         check.reason = Some(CLOUD_UNREACHABLE.into());
         check
     } else {
-        domain_check::hard_check(label, false, format!("{context}{}", problem(error)))
+        let refused = answered_refused(&error);
+        let mut check =
+            domain_check::hard_check(label, false, format!("{context}{}", problem(error)));
+        if refused {
+            check.reason = Some(CLOUD_REFUSED.into());
+        }
+        check
     }
 }
 
@@ -818,7 +995,7 @@ fn set_journal_note(pending: &mut [String], id: &str, detail: &str) -> Result<St
     let item = pending
         .iter_mut()
         .find(|entry| journal_matches(entry, id))
-        .ok_or_else(|| "操作记录不存在".to_string())?;
+        .ok_or_else(|| "待处理记录里已经没有这一条".to_string())?;
     *item = note.clone();
     Ok(note)
 }
@@ -826,7 +1003,7 @@ fn clear_journal(pending: &mut Vec<String>, id: &str) -> Result<(), String> {
     let before = pending.len();
     pending.retain(|entry| !journal_matches(entry, id));
     if pending.len() == before {
-        return Err("操作记录不存在".into());
+        return Err("待处理记录里已经没有这一条".into());
     }
     Ok(())
 }
@@ -848,9 +1025,129 @@ fn clear_link_leftovers(pending: &mut Vec<String>, host: &str, slug: &str, curre
         journal_matches(entry, current) || !prefixes.iter().any(|p| entry.starts_with(p))
     });
 }
+/// A host this tool fully set up earlier (prefix config and route) that is
+/// not on this computer: only recovery brings it back together with links.
+const NEEDS_RECOVERY_MESSAGE: &str = "云端已有此主机名的配置和转发规则（可能还有链接），不能覆盖。请先找回：在“Cloudflare 账户”页打开该账户的“管理账户”，点“从 Cloudflare 找回配置”";
+/// Marks a note naming cloud resources that a failed first setup could not
+/// undo. Automatic clean-up keeps such records so the names stay visible until
+/// the user has checked them and dismisses the record.
+const UNDO_INCOMPLETE: &str = "本次建出的云端资源没能全部撤销";
+/// A new account's first setup got no clear answer and everything this run may
+/// have created was deleted again. Also shown after an HTTP 5xx or 408, so it
+/// does not claim a network cut.
+const UNDONE_FIRST_SETUP: &str = "这一步没有收到明确的答复，已撤销本次创建，请再试一次";
+/// Note kept on an add-domain record whose reused prefix config brought back
+/// links this computer does not list; recovery imports them and settles it.
+fn revived_links_note(count: usize) -> String {
+    format!(
+        "云端还留着这个主机名以前的 {count} 条短链接，现在重新生效了，本机列表里还看不到。请到该账户的「管理账户」点「从 Cloudflare 找回配置」把它们找回来"
+    )
+}
+/// Refusal to save a link whose platform address copy `p:{id}` is recorded as
+/// synced but missing in the cloud.
+const POOL_COPY_MISSING_FOR_LINK: &str = "这条链接用的平台地址在云端的副本不见了。请到「平台地址」页点这组地址的「编辑地址」，不用改内容，直接保存一次，再回来保存链接";
+/// Recovery found two routes of this tool for one host and stopped before
+/// changing anything on this computer.
+fn duplicate_route_message(host: &str, first: &str, second: &str) -> String {
+    format!(
+        "域名 {host} 上有两条本工具的转发规则（{first}、{second}），没法确定该用哪一条，所以这次没有找回，本机记录没有改动。请联系维护的人处理"
+    )
+}
+/// Note on an add-domain record whose undo after a failure did not finish.
+const ROLLBACK_INCOMPLETE: &str = "失败且回滚未完全成功，需要人工核对";
+/// True for a record that is the only place naming cloud resources a failed
+/// or interrupted first setup may have left behind: an `UNDO_INCOMPLETE`
+/// note, or any new-account add-domain record (planned KV and Worker names),
+/// whatever its note says: a run that stopped while creating, uploading or
+/// writing the manifest, or whose answer or rollback was unclear, may have
+/// left them. A record whose undo finished is ended, not kept. Automatic
+/// clean-up keeps these until the user dismisses them; the existing-account
+/// form names no resources and is not one.
+fn names_leftover_resources(entry: &str) -> bool {
+    if entry.contains(UNDO_INCOMPLETE) {
+        return true;
+    }
+    let id = entry.split_once('：').map_or(entry, |(id, _)| id);
+    id.starts_with("添加域名 ") && id.contains("（计划 KV ")
+}
+/// A pending record asked to be dismissed is no longer there.
+const RECORD_GONE: &str = "这条记录已经不在了，可能已经被自动清掉。请点一下「刷新数据」看最新情况";
+/// Both forms of an add-domain record for one host (existing account, and new
+/// account with planned resource names).
+fn add_domain_prefixes(host: &str) -> Vec<String> {
+    vec![format!("添加域名 {host} ("), format!("添加域名 {host}（")]
+}
+/// Removes earlier records starting with one of `prefixes` once a later
+/// operation on the same host succeeded. `current` is left in place.
+fn clear_domain_leftovers(pending: &mut Vec<String>, prefixes: &[String], current: &str) {
+    pending.retain(|entry| {
+        journal_matches(entry, current)
+            || names_leftover_resources(entry)
+            || !prefixes.iter().any(|p| entry.starts_with(p))
+    });
+}
+/// Host named by an add/remove-domain or save/delete-link record.
+fn journal_host(entry: &str) -> Option<&str> {
+    let rest = ["添加域名 ", "移除域名 ", "保存链接 ", "删除链接 "]
+        .iter()
+        .find_map(|p| entry.strip_prefix(p))?;
+    let end = rest.find([' ', '（']).unwrap_or(rest.len());
+    Some(&rest[..end])
+}
+/// True when the stored link value equals `link` apart from `updated`, which
+/// a retry always renews.
+fn same_link_content(raw: &str, link: &Link) -> bool {
+    let Ok(Value::Object(mut remote)) = serde_json::from_str::<Value>(raw) else {
+        return false;
+    };
+    let Value::Object(mut wanted) = kv_link(link) else {
+        return false;
+    };
+    remote.remove("updated");
+    wanted.remove("updated");
+    remote == wanted
+}
 fn selftest_rotation_prefix(account_id: &str) -> String {
     format!("重置自检密钥 {account_id} (")
 }
+/// Pattern of a route of `script` for exactly `host` whose pattern is not the
+/// one this tool would create for `prefix`, if any.
+fn own_route_under_other_directory<'a>(
+    routes: &'a [Value],
+    script: &str,
+    host: &str,
+    prefix: &str,
+) -> Option<&'a str> {
+    let exact = route_pattern(host, prefix);
+    routes
+        .iter()
+        .filter(|route| route["script"].as_str() == Some(script))
+        .filter_map(|route| route["pattern"].as_str())
+        .find(|pattern| {
+            *pattern != exact
+                && pattern
+                    .split_once('/')
+                    .is_some_and(|(route_host, _)| route_host == host)
+        })
+}
+
+/// Refusal for a leftover route of this tool under another directory: names
+/// the route and, when it is one this tool creates, the directory to use.
+fn stray_route_message(host: &str, pattern: &str) -> String {
+    match pattern
+        .strip_prefix(&format!("{host}/"))
+        .and_then(|rest| rest.strip_suffix("/*"))
+        .filter(|old| validate_prefix(old).is_ok())
+    {
+        Some(old) => format!(
+            "这个域名上还留着本工具以前建的转发规则 {pattern}（上次移除没做完）。请把链接目录改成「{old}」再检查，添加时会直接沿用它"
+        ),
+        None => format!(
+            "这个域名上还留着本工具的转发规则 {pattern}，和要添加的链接目录对不上，不能自动沿用。本次没有做任何改动，请联系维护的人"
+        ),
+    }
+}
+
 fn route_conflict(pattern: &str, host: &str, prefix: &str) -> bool {
     let p = pattern
         .trim_start_matches("http://")
@@ -995,7 +1292,9 @@ impl Backend {
     }
     fn require_plan_credentials(&self, kind: &PlanKind) -> Result<(), String> {
         let ids: Vec<String> = match kind {
-            PlanKind::MigrateCredentials { .. } => return Ok(()),
+            PlanKind::MigrateCredentials { .. } | PlanKind::DismissPendingOperation { .. } => {
+                return Ok(())
+            }
             PlanKind::UpgradeWorker { account_id, .. }
             | PlanKind::SetClickStats { account_id, .. }
             | PlanKind::SetClickProtection { account_id, .. }
@@ -1171,6 +1470,14 @@ impl Backend {
             || self.has_legacy_selftest_rotation(account_id)
     }
 
+    /// The `key_missing` text for a domain whose self-test got no snapshot.
+    fn selftest_unavailable_message(&self, domain_id: &str) -> &'static str {
+        selftest_key_missing_message(
+            self.domain(domain_id)
+                .is_ok_and(|domain| self.has_selftest_rotation(&domain.account_id)),
+        )
+    }
+
     fn persist_rotation_mutation(
         &mut self,
         mutation: impl FnOnce(&mut Database) -> Result<(), String>,
@@ -1268,6 +1575,8 @@ impl Backend {
         let mut imported = Vec::new();
         let mut skipped = Vec::new();
         let mut rejected = Vec::new();
+        // With several accounts a failure must say which one it was.
+        let several = expected_account_id.is_none() && accounts.len() > 1;
         for remote in accounts.into_iter().filter(|account| {
             expected_account_id.is_none_or(|expected| account["id"].as_str() == Some(expected))
         }) {
@@ -1294,6 +1603,11 @@ impl Backend {
                 Ok(zones) => imported.push((id, cloudflare_name, zones)),
                 Err(ImportAccessError::Denied(reason)) if expected_account_id.is_none() => {
                     rejected.push(json!({"id": id, "name": cloudflare_name, "reason": reason}));
+                }
+                Err(ImportAccessError::Failed(reason)) if several => {
+                    return Err(format!(
+                        "读取账户「{cloudflare_name}」时出错：{reason}。这次一个账户都没有导入，请稍后再导入一次"
+                    ));
                 }
                 Err(ImportAccessError::Denied(reason) | ImportAccessError::Failed(reason)) => {
                     return Err(reason);
@@ -1639,13 +1953,72 @@ impl Backend {
         Ok(self.candidates(host))
     }
 
+    /// Re-reads one account's zones after its cached zone ID answered 404 or
+    /// 403 and returns the fresh candidates for `host`. Local data changes only after
+    /// the read succeeded.
+    async fn refresh_stale_zone(
+        &mut self,
+        host: &str,
+        account_id: &str,
+    ) -> Result<Vec<Candidate>, String> {
+        let label = self.account(account_id)?.label.clone();
+        let token = read_account_token(account_id)
+            .await
+            .map_err(|error| format!("无法刷新账户「{label}」的域名：{error}"))?;
+        let zones = self
+            .fetch_zones(&token, account_id)
+            .await
+            .map_err(|error| format!("无法刷新账户「{label}」的域名：{error}"))?;
+        let previous = self.db.accounts.clone();
+        if let Some(account) = self.db.accounts.iter_mut().find(|a| a.id == account_id) {
+            account.zone_count = zones.len();
+            account.zones = zones;
+            account.checked_at = Some(now());
+        }
+        if let Err(error) = self.persist() {
+            self.db.accounts = previous;
+            return Err(error);
+        }
+        Ok(self.candidates(host))
+    }
+
     async fn confirmed_zone_token(
         &self,
         account_id: &str,
         zone_id: &str,
         host: &str,
     ) -> Result<(Zeroizing<String>, String), String> {
-        self.require_credentials(account_id)?;
+        self.confirmed_zone_token_detailed(account_id, zone_id, host)
+            .await
+            .0
+    }
+
+    /// `confirmed_zone_token`, plus why it failed when that matters for the
+    /// check shown: see `ZoneReadFailure`.
+    async fn confirmed_zone_token_detailed(
+        &self,
+        account_id: &str,
+        zone_id: &str,
+        host: &str,
+    ) -> (Result<(Zeroizing<String>, String), String>, ZoneReadFailure) {
+        let mut failure = ZoneReadFailure::default();
+        let result = self
+            .confirmed_zone_token_inner(account_id, zone_id, host, &mut failure)
+            .await;
+        (result, failure)
+    }
+
+    async fn confirmed_zone_token_inner(
+        &self,
+        account_id: &str,
+        zone_id: &str,
+        host: &str,
+        failure: &mut ZoneReadFailure,
+    ) -> Result<(Zeroizing<String>, String), String> {
+        if let Err(error) = self.require_credentials(account_id) {
+            failure.credential = Some("本机授权");
+            return Err(error);
+        }
         let account = self.account(account_id)?;
         let zone = account
             .zones
@@ -1656,12 +2029,26 @@ impl Backend {
                     && (host == zone.name || host.ends_with(&format!(".{}", zone.name)))
             })
             .ok_or("域名所属区域未启用，或不属于此账号")?;
-        let token = read_account_token(account_id).await?;
+        let token = match read_account_token(account_id).await {
+            Ok(token) => token,
+            Err(error) => {
+                failure.credential = Some("凭据");
+                return Err(error);
+            }
+        };
         let remote = self
             .cloud
             .get(&token, &format!("zones/{zone_id}"))
             .await
-            .map_err(problem)?;
+            .map_err(|error| {
+                if answered_not_found(&error) {
+                    ZONE_ID_STALE.to_string()
+                } else {
+                    failure.forbidden = answered_forbidden(&error);
+                    failure.refused = answered_refused(&error);
+                    problem(error)
+                }
+            })?;
         if remote["result"]["status"] != "active"
             || remote["result"]["id"].as_str() != Some(zone_id)
             || remote["result"]["account"]["id"].as_str() != Some(account_id)
@@ -1676,10 +2063,14 @@ impl Backend {
         token: &str,
         zone_id: &str,
         host: &str,
-    ) -> Result<Vec<domain_check::DnsRecordFingerprint>, String> {
+    ) -> Result<Vec<domain_check::DnsRecordFingerprint>, (String, bool)> {
+        // The flag is true when Cloudflare answered the read with 401 or 403.
         let path = format!("zones/{zone_id}/dns_records?name={}", cloud::encode(host));
-        let items = self.cloud.list_pages(token, &path).await.map_err(problem)?;
-        domain_check::dns_fingerprint(&items, host)
+        let items = self.cloud.list_pages(token, &path).await.map_err(|error| {
+            let refused = answered_refused(&error);
+            (problem(error), refused)
+        })?;
+        domain_check::dns_fingerprint(&items, host).map_err(|message| (message, false))
     }
 
     async fn placeholder_is_safe(
@@ -1689,21 +2080,38 @@ impl Backend {
         zone_name: &str,
         host: &str,
         expected: &[domain_check::DnsRecordFingerprint],
-    ) -> Result<(), String> {
-        let all = self
-            .cloud
-            .list_pages(token, &format!("zones/{zone_id}/dns_records"))
-            .await
-            .map_err(problem)?;
-        let observed = domain_check::dns_fingerprint(&all, host)
-            .map_err(|message| format!("完整 DNS 清单格式无效：{message}；请重新检查"))?;
+    ) -> Result<(), (String, bool)> {
+        // The flag is true when Cloudflare answered the read with 401 or 403.
+        let all = self.full_dns_records(token, zone_id).await?;
+        let observed = domain_check::dns_fingerprint(&all, host).map_err(|message| {
+            (
+                format!("完整 DNS 清单格式无效：{message}；请重新检查"),
+                false,
+            )
+        })?;
         if observed != expected {
-            return Err("DNS 记录已变化，请重新检查并生成新计划".into());
+            return Err(("DNS 记录已变化，请重新检查并生成新计划".into(), false));
         }
         if let Some(message) = domain_check::placeholder_conflict(&all, host, zone_name) {
-            return Err(message);
+            return Err((message, false));
         }
         Ok(())
+    }
+
+    /// Every DNS record of the zone, for the safety checks before a DNS fix.
+    /// The flag is true when Cloudflare answered the read with 401 or 403.
+    async fn full_dns_records(
+        &self,
+        token: &str,
+        zone_id: &str,
+    ) -> Result<Vec<Value>, (String, bool)> {
+        self.cloud
+            .list_pages(token, &format!("zones/{zone_id}/dns_records"))
+            .await
+            .map_err(|error| {
+                let refused = answered_refused(&error);
+                (problem(error), refused)
+            })
     }
 
     async fn proxy_is_safe(
@@ -1713,17 +2121,16 @@ impl Backend {
         zone_name: &str,
         host: &str,
         expected: &[domain_check::DnsRecordFingerprint],
-    ) -> Result<(), String> {
-        let all = self
-            .cloud
-            .list_pages(token, &format!("zones/{zone_id}/dns_records"))
-            .await
-            .map_err(problem)?;
-        if domain_check::dns_fingerprint(&all, host)? != expected {
-            return Err("DNS 记录已变化，请重新检查并生成新计划".into());
+    ) -> Result<(), (String, bool)> {
+        // The flag is true when Cloudflare answered the read with 401 or 403.
+        let all = self.full_dns_records(token, zone_id).await?;
+        let observed =
+            domain_check::dns_fingerprint(&all, host).map_err(|message| (message, false))?;
+        if observed != expected {
+            return Err(("DNS 记录已变化，请重新检查并生成新计划".into(), false));
         }
         if let Some(message) = domain_check::proxy_conflict(&all, host, zone_name) {
-            return Err(message);
+            return Err((message, false));
         }
         Ok(())
     }
@@ -1731,7 +2138,7 @@ impl Backend {
     async fn prepare_domain_dns(&mut self, payload: &Value) -> Result<Value, String> {
         let host = normalize_host(field(payload, "input")?)?;
         let choice = payload["accountId"].as_str();
-        let candidates = self.domain_candidates(&host, choice).await?;
+        let mut candidates = self.domain_candidates(&host, choice).await?;
         let selected = if candidates.len() == 1 && choice.is_none() {
             candidates.first()
         } else {
@@ -1741,6 +2148,7 @@ impl Backend {
                     .find(|candidate| candidate.account_id == id)
             })
         };
+        let mut refreshed = None;
         let mut checks = Vec::new();
         let mut dns_status = "conflict".to_string();
         let mut actions = Vec::new();
@@ -1758,13 +2166,69 @@ impl Backend {
                 account_choice_message(choice, &candidates),
             ));
         } else if let Some(candidate) = selected {
-            match self
-                .confirmed_zone_token(&candidate.account_id, &candidate.zone_id, &host)
-                .await
-            {
-                Err(message) => {
-                    checks.push(domain_check::hard_check("云端域名归属", false, message));
+            let mut candidate = candidate.clone();
+            let (mut confirmed, mut failure) = self
+                .confirmed_zone_token_detailed(&candidate.account_id, &candidate.zone_id, &host)
+                .await;
+            // A 403 may be a stale ID too; if the refresh does not show a new
+            // ID or a missing domain, the original 403 error is shown.
+            let refusal = if failure.forbidden {
+                confirmed.as_ref().err().cloned()
+            } else {
+                None
+            };
+            if refusal.is_some() || confirmed.as_ref().err().is_some_and(|m| m == ZONE_ID_STALE) {
+                // The cached zone ID may be gone: refresh this account once
+                // and match the domain again.
+                confirmed = match self.refresh_stale_zone(&host, &candidate.account_id).await {
+                    // The original 403 stays, with its reason.
+                    Err(error) => Err(refusal.unwrap_or(error)),
+                    Ok(fresh) => {
+                        let listed = fresh
+                            .iter()
+                            .find(|c| c.account_id == candidate.account_id)
+                            .cloned();
+                        let next = listed
+                            .as_ref()
+                            .filter(|c| c.zone_id != candidate.zone_id)
+                            .cloned();
+                        refreshed = Some(fresh);
+                        match (next, refusal) {
+                            (Some(next), _) => {
+                                candidate = next;
+                                let (result, again) = self
+                                    .confirmed_zone_token_detailed(
+                                        &candidate.account_id,
+                                        &candidate.zone_id,
+                                        &host,
+                                    )
+                                    .await;
+                                failure = again;
+                                result
+                            }
+                            (None, Some(refusal)) if listed.is_some() => Err(refusal),
+                            (None, _) => {
+                                failure = ZoneReadFailure::default();
+                                Err(ZONE_CACHE_STALE_MESSAGE.into())
+                            }
+                        }
+                    }
+                };
+                if confirmed.as_ref().err().is_some_and(|m| m == ZONE_ID_STALE) {
+                    confirmed = Err(ZONE_CACHE_STALE_MESSAGE.into());
                 }
+            }
+            match confirmed {
+                Err(message) => match failure.credential {
+                    Some(label) => checks.push(credential_check(label, message)),
+                    None => {
+                        let mut check = domain_check::hard_check("云端域名归属", false, message);
+                        if failure.refused {
+                            check.reason = Some(CLOUD_REFUSED.into());
+                        }
+                        checks.push(check);
+                    }
+                },
                 Ok((token, zone_name)) => {
                     checks.push(domain_check::hard_check(
                         "云端域名归属",
@@ -1775,13 +2239,17 @@ impl Backend {
                         .exact_dns_records(&token, &candidate.zone_id, &host)
                         .await
                     {
-                        Err(message) => {
+                        Err((message, refused)) => {
                             dns_status = "readFailed".into();
-                            checks.push(domain_check::hard_check(
+                            let mut check = domain_check::hard_check(
                                 "DNS",
                                 false,
                                 format!("无法读取 DNS 记录：{message}"),
-                            ));
+                            );
+                            if refused {
+                                check.reason = Some(CLOUD_REFUSED.into());
+                            }
+                            checks.push(check);
                         }
                         Ok(records) => match domain_check::assess_dns(&records) {
                             domain_check::DnsAssessment::Ready => {
@@ -1845,10 +2313,14 @@ impl Backend {
                                             },
                                         ));
                                     }
-                                    Err(message) => {
+                                    Err((message, refused)) => {
                                         dns_status = "conflict".into();
-                                        checks
-                                            .push(domain_check::hard_check("DNS", false, message));
+                                        let mut check =
+                                            domain_check::hard_check("DNS", false, message);
+                                        if refused {
+                                            check.reason = Some(CLOUD_REFUSED.into());
+                                        }
+                                        checks.push(check);
                                     }
                                 }
                             }
@@ -1863,10 +2335,14 @@ impl Backend {
                                     )
                                     .await
                                 {
-                                    Err(message) => {
+                                    Err((message, refused)) => {
                                         dns_status = "conflict".into();
-                                        checks
-                                            .push(domain_check::hard_check("DNS", false, message));
+                                        let mut check =
+                                            domain_check::hard_check("DNS", false, message);
+                                        if refused {
+                                            check.reason = Some(CLOUD_REFUSED.into());
+                                        }
+                                        checks.push(check);
                                     }
                                     Ok(()) => {
                                         dns_status = "dnsOnly".into();
@@ -1925,6 +2401,9 @@ impl Backend {
                 }
             }
         }
+        if let Some(fresh) = refreshed {
+            candidates = fresh;
+        }
         Ok(serde_json::to_value(DomainDnsPreparation {
             host,
             candidates,
@@ -1946,9 +2425,58 @@ impl Backend {
         planned_probe_segment: Option<&str>,
         dns_mode: local_check::DnsMode,
     ) -> (Vec<DomainCheck>, Option<PathRiskSnapshot>) {
+        let mut refused = false;
+        self.preflight_inner(
+            account_id,
+            zone_id,
+            host,
+            prefix,
+            planned_probe_segment,
+            dns_mode,
+            &mut refused,
+        )
+        .await
+    }
+
+    /// `preflight`, plus whether the `zones/{zone_id}` read was answered with
+    /// HTTP 403 (its check keeps the original wording and reason then).
+    async fn preflight_detailed(
+        &self,
+        account_id: &str,
+        zone_id: &str,
+        host: &str,
+        prefix: &str,
+        dns_mode: local_check::DnsMode,
+    ) -> (Vec<DomainCheck>, Option<PathRiskSnapshot>, bool) {
+        let mut refused = false;
+        let (checks, risk) = self
+            .preflight_inner(
+                account_id,
+                zone_id,
+                host,
+                prefix,
+                None,
+                dns_mode,
+                &mut refused,
+            )
+            .await;
+        (checks, risk, refused)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn preflight_inner(
+        &self,
+        account_id: &str,
+        zone_id: &str,
+        host: &str,
+        prefix: &str,
+        planned_probe_segment: Option<&str>,
+        dns_mode: local_check::DnsMode,
+        refused: &mut bool,
+    ) -> (Vec<DomainCheck>, Option<PathRiskSnapshot>) {
         let mut checks = Vec::new();
         if let Err(error) = self.require_credentials(account_id) {
-            checks.push(domain_check::hard_check("本机授权", false, error));
+            checks.push(credential_check("本机授权", error));
             return (checks, None);
         }
         let account = match self.account(account_id) {
@@ -1980,7 +2508,7 @@ impl Backend {
         let token = match read_account_token(account_id).await {
             Ok(t) => t,
             Err(e) => {
-                checks.push(domain_check::hard_check("凭据", false, e));
+                checks.push(credential_check("凭据", e));
                 return (checks, None);
             }
         };
@@ -1996,7 +2524,12 @@ impl Backend {
         );
         let remote_zone = match remote_zone {
             Ok(value) => value,
+            Err(error) if answered_not_found(&error) => {
+                checks.push(stale_zone_check());
+                return (checks, None);
+            }
             Err(error) => {
+                *refused = answered_forbidden(&error);
                 checks.push(cloud_read_failure("云端域名归属", "", error));
                 return (checks, None);
             }
@@ -2049,20 +2582,80 @@ impl Backend {
                     ));
                     return (checks, None);
                 };
-                let found = arr.iter().any(|r| {
-                    r["pattern"]
-                        .as_str()
-                        .is_some_and(|p| route_conflict(p, host, prefix))
+                let overlapping: Vec<&Value> = arr
+                    .iter()
+                    .filter(|r| {
+                        r["pattern"]
+                            .as_str()
+                            .is_some_and(|p| route_conflict(p, host, prefix))
+                    })
+                    .collect();
+                // The exact route this tool would create for this account is
+                // what an unfinished earlier attempt leaves behind. Anything
+                // else overlapping stays a conflict.
+                let own_script = account.resources.as_ref().map(|r| r.script.as_str());
+                let pattern = route_pattern(host, prefix);
+                let leftover = overlapping.len() == 1
+                    && own_script.is_some()
+                    && overlapping[0]["script"].as_str() == own_script
+                    && overlapping[0]["pattern"].as_str() == Some(pattern.as_str());
+                // This tool's route for exactly this host under another
+                // directory: what an interrupted removal leaves behind. A
+                // second route for the host would break recovery for good.
+                let stray = own_script.and_then(|script| {
+                    own_route_under_other_directory(arr, script, host, prefix).map(str::to_owned)
                 });
-                domain_check::hard_check(
-                    "转发规则",
-                    !found,
-                    if found {
-                        "现有转发规则与此前缀重叠"
-                    } else {
-                        "没有发现重叠的转发规则"
-                    },
-                )
+                if overlapping.is_empty() && stray.is_none() {
+                    domain_check::hard_check("转发规则", true, "没有发现重叠的转发规则")
+                } else if !overlapping.is_empty() && !leftover {
+                    domain_check::hard_check("转发规则", false, "现有转发规则与此前缀重叠")
+                } else if let Some(stray) = stray {
+                    let namespace = account
+                        .resources
+                        .as_ref()
+                        .map(|r| r.namespace.clone())
+                        .unwrap_or_default();
+                    match self
+                        .cloud
+                        .read_value(&token, account_id, &namespace, &format!("c:{host}"))
+                        .await
+                    {
+                        Err(error) => {
+                            cloud_read_failure("转发规则", "无法读取云端前缀配置：", error)
+                        }
+                        Ok(Some(_)) => {
+                            domain_check::hard_check("转发规则", false, NEEDS_RECOVERY_MESSAGE)
+                        }
+                        Ok(None) => domain_check::hard_check(
+                            "转发规则",
+                            false,
+                            stray_route_message(host, &stray),
+                        ),
+                    }
+                } else {
+                    let namespace = account
+                        .resources
+                        .as_ref()
+                        .map(|r| r.namespace.clone())
+                        .unwrap_or_default();
+                    match self
+                        .cloud
+                        .read_value(&token, account_id, &namespace, &format!("c:{host}"))
+                        .await
+                    {
+                        Err(error) => {
+                            cloud_read_failure("转发规则", "无法读取云端前缀配置：", error)
+                        }
+                        Ok(Some(_)) => {
+                            domain_check::hard_check("转发规则", false, NEEDS_RECOVERY_MESSAGE)
+                        }
+                        Ok(None) => domain_check::hard_check(
+                            "转发规则",
+                            true,
+                            "发现本工具上次没做完留下的转发规则，接入时会直接沿用",
+                        ),
+                    }
+                }
             }
         };
         checks.push(routes_check);
@@ -2130,12 +2723,13 @@ impl Backend {
             .unwrap_or(Value::Null));
         }
         let choice = payload["accountId"].as_str();
-        let candidates = self.domain_candidates(&host, choice).await?;
+        let mut candidates = self.domain_candidates(&host, choice).await?;
         let selected = if candidates.len() == 1 && choice.is_none() {
             candidates.first()
         } else {
             choice.and_then(|id| candidates.iter().find(|c| c.account_id == id))
         };
+        let mut refreshed = None;
         let mut checks = Vec::new();
         let mut plan = None;
         if candidates.is_empty() {
@@ -2151,9 +2745,49 @@ impl Backend {
                 account_choice_message(choice, &candidates),
             ));
         } else if let Some(c) = selected {
-            let (next_checks, path_risk) = self
-                .preflight(&c.account_id, &c.zone_id, &host, &prefix, None, dns_mode)
+            let mut c = c.clone();
+            let (mut next_checks, mut path_risk, refused) = self
+                .preflight_detailed(&c.account_id, &c.zone_id, &host, &prefix, dns_mode)
                 .await;
+            if refused || has_reason(&next_checks, ZONE_CACHE_STALE) {
+                // The cached zone ID may be gone: refresh this account once
+                // and match the domain again. After a 403 the original checks
+                // stay unless the refresh shows a new ID or a missing domain.
+                match self.refresh_stale_zone(&host, &c.account_id).await {
+                    Err(error) => {
+                        if !refused {
+                            next_checks =
+                                vec![domain_check::hard_check("云端域名归属", false, error)];
+                        }
+                    }
+                    Ok(fresh) => {
+                        let listed = fresh.iter().find(|f| f.account_id == c.account_id).cloned();
+                        let next = listed.as_ref().filter(|f| f.zone_id != c.zone_id).cloned();
+                        refreshed = Some(fresh);
+                        if let Some(next) = next {
+                            c = next;
+                            (next_checks, path_risk, _) = self
+                                .preflight_detailed(
+                                    &c.account_id,
+                                    &c.zone_id,
+                                    &host,
+                                    &prefix,
+                                    dns_mode,
+                                )
+                                .await;
+                        } else if refused && listed.is_none() {
+                            next_checks.retain(|check| check.label != "云端域名归属");
+                            next_checks.push(stale_zone_check());
+                        }
+                    }
+                }
+                for check in next_checks
+                    .iter_mut()
+                    .filter(|check| check.reason.as_deref() == Some(ZONE_CACHE_STALE))
+                {
+                    check.message = ZONE_CACHE_STALE_MESSAGE.into();
+                }
+            }
             checks = next_checks;
             if !checks
                 .iter()
@@ -2198,6 +2832,9 @@ impl Backend {
                     },
                 ));
             }
+        }
+        if let Some(fresh) = refreshed {
+            candidates = fresh;
         }
         Ok(serde_json::to_value(DomainPreparation {
             host,
@@ -2541,7 +3178,9 @@ impl Backend {
                 let id = field(payload, "accountId")?.to_owned();
                 let account = self.account(&id)?;
                 if self.has_selftest_rotation(&id) {
-                    return Err("此账号的自检密钥轮换尚未完成，请先从待处理操作恢复".into());
+                    return Err(format!(
+                        "此账号的自检密钥轮换尚未完成，请先用{RESUME_BAR}里这个账户的按钮把它做完"
+                    ));
                 }
                 let resources = account.resources.as_ref().ok_or("此账号没有已登记资源")?;
                 if self.db.domains.iter().any(|d| d.account_id == id) {
@@ -2562,7 +3201,9 @@ impl Backend {
                 let id = field(payload, "accountId")?.to_owned();
                 self.account(&id)?;
                 if self.has_selftest_rotation(&id) {
-                    return Err("此账号的自检密钥轮换尚未完成，请先从待处理操作恢复".into());
+                    return Err(format!(
+                        "此账号的自检密钥轮换尚未完成，请先用{RESUME_BAR}里这个账户的按钮把它做完"
+                    ));
                 }
                 (
                     "从账号找回",
@@ -2581,7 +3222,7 @@ impl Backend {
                     return Err("账号尚未创建专用转发程序".into());
                 }
                 if self.has_selftest_rotation(&id) {
-                    return Err("此账号已有未完成的自检密钥轮换，请从待处理操作恢复".into());
+                    return Err(format!("此账号已有未完成的自检密钥轮换，请先用{RESUME_BAR}里这个账户的按钮把它做完"));
                 }
                 (
                     "重置自检密钥",
@@ -2637,7 +3278,7 @@ impl Backend {
             "recover_selftest_rotation" => {
                 let id = field(payload, "accountId")?.to_owned();
                 let account = self.account(&id)?;
-                let resources = account.resources.as_ref().ok_or("本机缺少检测服务配置，请先使用“找回检测服务配置”；若入口不可用，请先核对其他待处理操作")?;
+                let resources = account.resources.as_ref().ok_or("本机缺少检测服务配置，请先用页面上方“……项变更可继续处理”那一栏里的「找回本机检测配置」按钮；若没有这个按钮，请先到页面上方「查看待处理记录」里核对其他记录")?;
                 let missing_staging = self
                     .db
                     .pending_selftest_rotations
@@ -2664,6 +3305,19 @@ impl Backend {
                         "仅在确认此计划后写入云端".into(),
                     ],
                     PlanKind::RecoverSelftestRotation { account_id: id },
+                )
+            }
+            "dismiss_pending_operation" => {
+                let entry = field(payload, "entry")?.to_owned();
+                self.require_dismissable(&entry)?;
+                (
+                    "清除待处理记录",
+                    vec![
+                        "只从本机删除这条记录，不改动云端".into(),
+                        format!("要清除的记录：{entry}"),
+                    ],
+                    vec!["请先确认这条记录对应的云端状态已经核对过".into()],
+                    PlanKind::DismissPendingOperation { entry },
                 )
             }
             _ => return Err("不支持此变更类型".into()),
@@ -2730,7 +3384,9 @@ impl Backend {
                     })
                     || self.has_selftest_rotation(id)
                 {
-                    return Err("此账号有未完成的云端操作，请先在待处理操作中恢复".into());
+                    return Err(format!(
+                        "此账号有未完成的云端操作，请先用{RESUME_BAR}里的按钮把它做完"
+                    ));
                 }
                 remove_current_credentials(id).await?;
                 let previous = self.db.clone();
@@ -2970,14 +3626,18 @@ impl Backend {
     ) -> Result<(), String> {
         self.require_no_worker_upgrade(account_id)?;
         let (token, zone_name) = self.confirmed_zone_token(account_id, zone_id, host).await?;
-        let current = self.exact_dns_records(&token, zone_id, host).await?;
+        let current = self
+            .exact_dns_records(&token, zone_id, host)
+            .await
+            .map_err(|(message, _)| message)?;
         match &snapshot {
             domain_check::DnsSnapshot::Missing(expected) => {
                 if &current != expected {
                     return Err("DNS 记录已变化，请重新准备修复计划".into());
                 }
                 self.placeholder_is_safe(&token, zone_id, &zone_name, host, expected)
-                    .await?;
+                    .await
+                    .map_err(|(message, _)| message)?;
             }
             domain_check::DnsSnapshot::EnableProxy(expected) => {
                 if &current != expected {
@@ -2990,7 +3650,8 @@ impl Backend {
                     return Err("DNS 代理状态已变化，请重新准备修复计划".into());
                 }
                 self.proxy_is_safe(&token, zone_id, &zone_name, host, expected)
-                    .await?;
+                    .await
+                    .map_err(|(message, _)| message)?;
             }
         }
 
@@ -3030,7 +3691,7 @@ impl Backend {
                         &journal,
                         "占位记录已提交但响应无法核实，请重新读取 DNS 后处理",
                     )?;
-                    return Err("DNS 占位记录已提交，但云端响应无法核实；请检查待处理操作".into());
+                    return Err("DNS 占位记录已提交，但云端响应无法核实；请到页面上方「查看待处理记录」里核对".into());
                 }
                 self.journal_end_dns(host, &journal)?;
             }
@@ -3115,23 +3776,25 @@ impl Backend {
                             return Err(dns_write_error(error));
                         }
                     };
-                    let updated =
-                        match domain_check::dns_fingerprint(&[response["result"].clone()], host) {
-                            Ok(value) => value,
-                            Err(_) => {
-                                self.journal_note(
-                                    &journal,
-                                    &format!(
-                                        "已提交第 {} 条记录但响应格式无效，请重新读取 DNS 后处理",
-                                        index + 1
-                                    ),
-                                )?;
-                                return Err(
-                                    "DNS 代理设置已提交，但云端响应无法核实；请检查待处理操作"
+                    let updated = match domain_check::dns_fingerprint(
+                        &[response["result"].clone()],
+                        host,
+                    ) {
+                        Ok(value) => value,
+                        Err(_) => {
+                            self.journal_note(
+                                &journal,
+                                &format!(
+                                    "已提交第 {} 条记录但响应格式无效，请重新读取 DNS 后处理",
+                                    index + 1
+                                ),
+                            )?;
+                            return Err(
+                                    "DNS 代理设置已提交，但云端响应无法核实；请到页面上方「查看待处理记录」里核对"
                                         .into(),
                                 );
-                            }
-                        };
+                        }
+                    };
                     if updated.len() != 1
                         || updated[0].id != record.id
                         || updated[0].record_type != record.record_type
@@ -3146,7 +3809,7 @@ impl Backend {
                             ),
                         )?;
                         return Err(
-                            "DNS 代理设置已提交，但云端响应无法核实；请检查待处理操作".into()
+                            "DNS 代理设置已提交，但云端响应无法核实；请到页面上方「查看待处理记录」里核对".into()
                         );
                     }
                     self.journal_note(
@@ -3564,7 +4227,8 @@ impl Backend {
     async fn ensure_domain_owned(&self, domain: &Domain, token: &str) -> Result<Resources, String> {
         let account = self.account(&domain.account_id)?;
         let resources = account.resources.clone().ok_or("账号资源未登记")?;
-        self.verify_resource_source(token, &account.id, &resources)
+        let VerifiedSource { manifest, settings } = self
+            .verify_resource_source(token, &account.id, &resources)
             .await?;
         if !account.zones.iter().any(|z| {
             z.id == domain.zone_id
@@ -3573,14 +4237,6 @@ impl Backend {
         }) {
             return Err("区域状态或域名归属已变化".into());
         }
-        let manifest = self
-            .cloud
-            .read_value(token, &account.id, &resources.namespace, MANIFEST_KEY)
-            .await
-            .map_err(problem)?
-            .ok_or("云端缺少资源清单")?;
-        let manifest: Value =
-            serde_json::from_str(&manifest).map_err(|_| "云端资源清单损坏".to_string())?;
         if manifest["schema"] != SCHEMA
             || manifest["script"] != resources.script
             || manifest["namespace"] != resources.namespace
@@ -3588,11 +4244,6 @@ impl Backend {
         {
             return Err("云端资源清单与本机不一致".into());
         }
-        let settings = self
-            .cloud
-            .script_settings(token, &account.id, &resources.script)
-            .await
-            .map_err(problem)?;
         let bindings = settings["result"]["bindings"]
             .as_array()
             .ok_or("无法验证 Worker 绑定")?;
@@ -3616,7 +4267,7 @@ impl Backend {
                     && r["script"].as_str() == Some(resources.script.as_str())
             })
         }) {
-            return Err("Worker 路由已变化，请刷新或找回".into());
+            return Err(DOMAIN_ROUTE_CHANGED.into());
         }
         let config = self
             .cloud
@@ -3628,7 +4279,7 @@ impl Backend {
             )
             .await
             .map_err(problem)?
-            .ok_or("云端域名配置已丢失")?;
+            .ok_or(DOMAIN_CONFIG_LOST)?;
         let config: Value =
             serde_json::from_str(&config).map_err(|_| "云端域名配置损坏".to_string())?;
         if config["prefix"].as_str() != Some(domain.prefix.as_str()) {
@@ -3637,12 +4288,15 @@ impl Backend {
         Ok(resources)
     }
 
+    /// Checks the owned manifest, Worker bindings and Worker source. Returns
+    /// the manifest and Worker settings it read so callers need not read them
+    /// again.
     async fn verify_resource_source(
         &self,
         token: &str,
         account_id: &str,
         resources: &Resources,
-    ) -> Result<(), String> {
+    ) -> Result<VerifiedSource, String> {
         self.require_no_worker_upgrade(account_id)?;
         let manifest = self
             .cloud
@@ -3710,7 +4364,7 @@ impl Backend {
         if hex::encode(Sha256::digest(&content)) != expected_hash {
             return Err("Worker 内容已变化，停止操作".into());
         }
-        Ok(())
+        Ok(VerifiedSource { manifest, settings })
     }
 
     async fn apply(
@@ -3852,7 +4506,36 @@ impl Backend {
             PlanKind::RecoverSelftestResources { account_id } => {
                 self.recover_selftest_resources(&account_id).await
             }
+            PlanKind::DismissPendingOperation { entry } => self.dismiss_pending_operation(&entry),
         }
+    }
+
+    /// A plain pending record may be dismissed by its exact text; records
+    /// with their own recovery entry must be handled there.
+    fn require_dismissable(&self, entry: &str) -> Result<(), String> {
+        if !self.db.pending_operations.iter().any(|e| e == entry) {
+            return Err(RECORD_GONE.into());
+        }
+        if let Some(hint) = self.db.dedicated_recovery_hint(entry) {
+            return Err(hint);
+        }
+        Ok(())
+    }
+
+    fn dismiss_pending_operation(&mut self, entry: &str) -> Result<(), String> {
+        self.require_dismissable(entry)?;
+        let index = self
+            .db
+            .pending_operations
+            .iter()
+            .position(|e| e == entry)
+            .ok_or(RECORD_GONE)?;
+        let removed = self.db.pending_operations.remove(index);
+        if let Err(error) = self.persist() {
+            self.db.pending_operations.insert(index, removed);
+            return Err(error);
+        }
+        Ok(())
     }
 
     async fn apply_domain(
@@ -3924,16 +4607,16 @@ impl Backend {
         }
         let token = read_account_token(account_id).await?;
         let existing = self.account(account_id)?.resources.clone();
+        // Leftovers of an earlier unfinished attempt on this host that this
+        // run can safely continue from (existing resources only).
+        let mut reuse_config = false;
+        let mut adopt_route = None::<String>;
+        // Links left in the cloud under a reused prefix config: they serve
+        // again once the route exists, but this computer does not list them.
+        let mut revived_links = 0_usize;
         if let Some(r) = &existing {
-            self.verify_resource_source(&token, account_id, r).await?;
-            let manifest = self
-                .cloud
-                .read_value(&token, account_id, &r.namespace, MANIFEST_KEY)
-                .await
-                .map_err(problem)?
-                .ok_or("云端资源清单缺失")?;
-            let manifest: Value =
-                serde_json::from_str(&manifest).map_err(|_| "云端资源清单损坏".to_string())?;
+            let VerifiedSource { manifest, settings } =
+                self.verify_resource_source(&token, account_id, r).await?;
             if manifest["schema"] != SCHEMA
                 || manifest["accountId"] != account_id
                 || manifest["script"] != r.script
@@ -3941,11 +4624,6 @@ impl Backend {
             {
                 return Err("云端资源归属与本机不一致".into());
             }
-            let settings = self
-                .cloud
-                .script_settings(&token, account_id, &r.script)
-                .await
-                .map_err(problem)?;
             if !settings["result"]["bindings"].as_array().is_some_and(|bs| {
                 bs.iter().any(|b| {
                     b["type"] == "kv_namespace"
@@ -3955,14 +4633,98 @@ impl Backend {
             }) {
                 return Err("Worker 的 KV 绑定已变化".into());
             }
-            if self
+            let config = self
                 .cloud
                 .read_value(&token, account_id, &r.namespace, &format!("c:{host}"))
                 .await
-                .map_err(problem)?
-                .is_some()
-            {
-                return Err("云端已有此主机名的配置，请先从账号找回，不能覆盖".into());
+                .map_err(problem)?;
+            let routes = self
+                .cloud
+                .get(&token, &format!("zones/{zone_id}/workers/routes"))
+                .await
+                .map_err(problem)?;
+            let routes = routes["result"]
+                .as_array()
+                .ok_or("云端转发规则列表格式无效")?;
+            let own_routes: Vec<&Value> = routes
+                .iter()
+                .filter(|route| route["script"].as_str() == Some(r.script.as_str()))
+                .collect();
+            let route_for_host = own_routes.iter().any(|route| {
+                route["pattern"]
+                    .as_str()
+                    .and_then(|p| p.split_once('/'))
+                    .is_some_and(|(route_host, _)| route_host == host)
+            });
+            let exact_route = own_routes
+                .iter()
+                .find(|route| {
+                    route["pattern"].as_str() == Some(route_pattern(host, prefix).as_str())
+                })
+                .and_then(|route| route["id"].as_str())
+                .filter(|id| valid_id(id))
+                .map(str::to_owned);
+            match config {
+                // Both halves exist: a complete earlier setup, maybe with links.
+                Some(_) if route_for_host => return Err(NEEDS_RECOVERY_MESSAGE.into()),
+                // Only the prefix config: left by an attempt that stopped
+                // before its route, or by a route that went away while links
+                // stayed. Keep it when the prefix is the same.
+                Some(raw) => {
+                    let links = self
+                        .cloud
+                        .list_keys(&token, account_id, &r.namespace, &format!("l:{host}:"))
+                        .await
+                        .map_err(problem)?;
+                    let stored = serde_json::from_str::<Value>(&raw).ok();
+                    reuse_config = stored
+                        .as_ref()
+                        .is_some_and(|v| *v == json!({"prefix":prefix}));
+                    if !links.is_empty() {
+                        let old = stored
+                            .as_ref()
+                            .filter(|v| v.as_object().is_some_and(|o| o.len() == 1))
+                            .and_then(|v| v["prefix"].as_str())
+                            .filter(|old| validate_prefix(old).is_ok());
+                        match old {
+                            _ if reuse_config => revived_links = links.len(),
+                            Some(old) => {
+                                return Err(format!(
+                                    "云端还留着这个主机名以前的 {} 条短链接，它们用的链接目录是「{old}」。请把链接目录改成「{old}」再添加；本次没有做任何改动",
+                                    links.len()
+                                ))
+                            }
+                            None => {
+                                return Err(format!(
+                                    "云端还留着这个主机名以前的 {} 条短链接，但它的前缀配置看不懂，不能确定它们用的链接目录。本次没有做任何改动，请联系维护的人",
+                                    links.len()
+                                ))
+                            }
+                        }
+                    }
+                }
+                // Only this tool's exact route: adopt it instead of a second.
+                // An interrupted removal whose config rollback failed may
+                // have left the host's links: they serve again once the
+                // config is written, so count them like the branch above.
+                None if exact_route.is_some() => {
+                    let links = self
+                        .cloud
+                        .list_keys(&token, account_id, &r.namespace, &format!("l:{host}:"))
+                        .await
+                        .map_err(problem)?;
+                    revived_links = links.len();
+                    adopt_route = exact_route;
+                }
+                // This tool's route for the host under another directory: a
+                // second route for the same host would break recovery.
+                None => {
+                    if let Some(stray) =
+                        own_route_under_other_directory(routes, &r.script, host, prefix)
+                    {
+                        return Err(stray_route_message(host, stray));
+                    }
+                }
             }
         }
         let names = if existing.is_none() {
@@ -4035,10 +4797,15 @@ impl Backend {
         let mut created_script = None::<String>;
         let mut wrote_config = false;
         let mut route_id = None::<String>;
+        let mut staged_key = false;
+        // True while a new account's KV, Worker or manifest write is in
+        // flight: an uncertain answer there is undone, not left behind.
+        let mut creating = false;
         let mut resources = existing.clone();
         let operation: Result<(), CloudError> = async {
             if resources.is_none() {
                 let (namespace_name, script) = names.clone().expect("new account resource names");
+                creating = true;
                 let ns = self
                     .cloud
                     .post(
@@ -4056,6 +4823,7 @@ impl Backend {
                     })?
                     .to_owned();
                 created_namespace = Some(namespace.clone());
+                creating = false;
                 self.journal_note(&journal, "已建 KV，正在上传 Worker")
                     .map_err(|m| CloudError {
                         message: m,
@@ -4070,10 +4838,13 @@ impl Backend {
                     uncertain: false,
                     network: false,
                 })?;
+                staged_key = true;
+                creating = true;
                 self.cloud
                     .upload_script(&token, account_id, &script, &namespace, &key_hex)
                     .await?;
                 created_script = Some(script.clone());
+                creating = false;
                 self.journal_note(&journal, "已建 Worker，正在写资源清单")
                     .map_err(|m| CloudError {
                         message: m,
@@ -4082,6 +4853,7 @@ impl Backend {
                     })?;
                 let manifest = json!({"schema":SCHEMA,"accountId":account_id,
                     "script":script,"namespace":namespace,"sourceHash":bundled_source_hash()});
+                creating = true;
                 self.cloud
                     .write_value(
                         &token,
@@ -4091,47 +4863,167 @@ impl Backend {
                         &manifest.to_string(),
                     )
                     .await?;
+                creating = false;
                 resources = Some(Resources { script, namespace });
             }
             let r = resources.as_ref().expect("created or existing");
-            self.cloud
-                .write_value(
-                    &token,
-                    account_id,
-                    &r.namespace,
-                    &format!("c:{host}"),
-                    &json!({"prefix":prefix}).to_string(),
-                )
-                .await?;
-            wrote_config = true;
+            let config_key = format!("c:{host}");
+            let config_value = json!({"prefix":prefix}).to_string();
+            if !reuse_config {
+                if let Err(error) = self
+                    .cloud
+                    .write_value(&token, account_id, &r.namespace, &config_key, &config_value)
+                    .await
+                {
+                    if !error.uncertain {
+                        return Err(error);
+                    }
+                    // Look before concluding: the write may have landed.
+                    match self
+                        .cloud
+                        .read_value(&token, account_id, &r.namespace, &config_key)
+                        .await
+                    {
+                        Ok(Some(value)) if value == config_value => {}
+                        Ok(None) => {
+                            return Err(CloudError {
+                                message: "这一步没有收到明确的答复，查看后发现前缀配置没有写进云端，请再试一次".into(),
+                                uncertain: false,
+                                network: false,
+                            })
+                        }
+                        _ => return Err(error),
+                    }
+                }
+                wrote_config = true;
+            }
             self.journal_note(&journal, "已写前缀配置，正在创建路由")
                 .map_err(|m| CloudError {
                     message: m,
                     uncertain: true,
                     network: false,
                 })?;
-            let route = self
+            if let Some(id) = &adopt_route {
+                // This tool's own leftover route for exactly this directory.
+                route_id = Some(id.clone());
+                return Ok(());
+            }
+            let pattern = route_pattern(host, prefix);
+            let created = match self
                 .cloud
                 .post(
                     &token,
                     &format!("zones/{zone_id}/workers/routes"),
-                    json!({"pattern":route_pattern(host,prefix),"script":r.script}),
+                    json!({"pattern":pattern,"script":r.script}),
                 )
-                .await?;
-            route_id = Some(
-                route["result"]["id"]
+                .await
+            {
+                Ok(route) => route["result"]["id"]
                     .as_str()
+                    .map(str::to_owned)
                     .ok_or_else(|| CloudError {
                         message: "路由响应缺少标识".into(),
                         uncertain: true,
                         network: false,
-                    })?
-                    .to_owned(),
-            );
+                    }),
+                Err(error) => Err(error),
+            };
+            route_id = Some(match created {
+                Ok(id) => id,
+                Err(error) if error.uncertain => {
+                    // Look before concluding: the route may exist already.
+                    match self
+                        .find_own_route(&token, zone_id, &pattern, &r.script)
+                        .await
+                    {
+                        Ok(Some(id)) => id,
+                        Ok(None) => {
+                            return Err(CloudError {
+                                message: "这一步没有收到明确的答复，查看后发现转发规则没有建成，请再试一次".into(),
+                                uncertain: false,
+                                network: false,
+                            })
+                        }
+                        Err(_) => return Err(error),
+                    }
+                }
+                Err(error) => return Err(error),
+            });
             Ok(())
         }
         .await;
         if let Err(error) = operation {
+            if error.uncertain && creating {
+                // A new account's first resources: undo whatever this run may
+                // have created, so a retry does not pile up unused sets.
+                let (namespace_name, script) = names.clone().expect("new account resource names");
+                let gone = |result: Result<Value, CloudError>| match result {
+                    Ok(_) => true,
+                    Err(error) => error.message.contains("HTTP 404"),
+                };
+                let mut left = Vec::new();
+                if staged_key
+                    && !gone(
+                        self.cloud
+                            .delete(
+                                &token,
+                                &format!("accounts/{account_id}/workers/scripts/{script}"),
+                            )
+                            .await,
+                    )
+                {
+                    left.push(format!("Worker {script}"));
+                }
+                // Without the create answer the KV is found by its planned title.
+                let namespaces = match &created_namespace {
+                    Some(id) => Ok(vec![id.clone()]),
+                    None => self
+                        .cloud
+                        .list_pages(
+                            &token,
+                            &format!("accounts/{account_id}/storage/kv/namespaces"),
+                        )
+                        .await
+                        .map(|items| {
+                            items
+                                .iter()
+                                .filter(|ns| ns["title"].as_str() == Some(namespace_name.as_str()))
+                                .filter_map(|ns| ns["id"].as_str())
+                                .filter(|id| valid_id(id))
+                                .map(str::to_owned)
+                                .collect()
+                        }),
+                };
+                match namespaces {
+                    Ok(ids) => {
+                        for id in ids {
+                            let path = format!("accounts/{account_id}/storage/kv/namespaces/{id}");
+                            if !gone(self.cloud.delete(&token, &path).await) {
+                                left.push(format!("KV {namespace_name}（ID {id}）"));
+                            }
+                        }
+                    }
+                    Err(_) => left.push(format!("KV {namespace_name}")),
+                }
+                if left.is_empty() {
+                    if staged_key {
+                        let _ = keyring_delete(account_id, "selftest");
+                    }
+                    self.journal_end(&journal)?;
+                    return Err(UNDONE_FIRST_SETUP.into());
+                }
+                self.journal_note(
+                    &journal,
+                    &format!(
+                        "云端结果不确定，需要人工核对；{UNDO_INCOMPLETE}，可能还留着 {}，请到 Cloudflare 后台核对后删除",
+                        left.join("、")
+                    ),
+                )?;
+                return Err(format!(
+                    "{}。这次建出的云端资源没能全部撤销，它们的名称写在页面上方「查看待处理记录」里",
+                    error.message
+                ));
+            }
             if error.uncertain {
                 self.journal_note(&journal, "云端结果不确定，需要人工核对")?;
                 return Err(error.message);
@@ -4180,8 +5072,11 @@ impl Backend {
                 self.journal_end(&journal)?;
                 return Err(error.message);
             }
-            self.journal_note(&journal, "失败且回滚未完全成功，需要人工核对")?;
-            return Err(format!("{}；回滚未完成，请检查操作记录", error.message));
+            self.journal_note(&journal, ROLLBACK_INCOMPLETE)?;
+            return Err(format!(
+                "{}；回滚未完成，请到页面上方「查看待处理记录」里核对",
+                error.message
+            ));
         }
         let r = resources.ok_or("资源创建结果不完整")?;
         if let Some(account) = self.db.accounts.iter_mut().find(|a| a.id == account_id) {
@@ -4197,8 +5092,52 @@ impl Backend {
             prefix: prefix.into(),
             route_id: route_id.ok_or("路由创建结果不完整")?,
         });
-        self.persist()?;
+        // The host is now set up: earlier unresolved attempts to add it are
+        // settled in the same commit.
+        let before_operations = self.db.pending_operations.clone();
+        clear_domain_leftovers(
+            &mut self.db.pending_operations,
+            &add_domain_prefixes(host),
+            &journal,
+        );
+        if let Err(error) = self.persist() {
+            self.db.pending_operations = before_operations;
+            return Err(error);
+        }
+        if revived_links > 0 {
+            // Recovery imports those links and settles this record.
+            self.journal_note(&journal, &revived_links_note(revived_links))?;
+            return Ok(());
+        }
         self.journal_end(&journal)
+    }
+
+    /// ID of this tool's route for exactly `pattern` in a zone, if any.
+    async fn find_own_route(
+        &self,
+        token: &str,
+        zone_id: &str,
+        pattern: &str,
+        script: &str,
+    ) -> Result<Option<String>, CloudError> {
+        let routes = self
+            .cloud
+            .get(token, &format!("zones/{zone_id}/workers/routes"))
+            .await?;
+        let items = routes["result"].as_array().ok_or_else(|| CloudError {
+            message: "云端转发规则列表格式无效".into(),
+            uncertain: false,
+            network: false,
+        })?;
+        Ok(items
+            .iter()
+            .find(|route| {
+                route["pattern"].as_str() == Some(pattern)
+                    && route["script"].as_str() == Some(script)
+            })
+            .and_then(|route| route["id"].as_str())
+            .filter(|id| valid_id(id))
+            .map(str::to_owned))
     }
 
     async fn apply_save_link(
@@ -4218,6 +5157,7 @@ impl Backend {
         self.require_no_worker_upgrade(&domain.account_id)?;
         let token = keyring_get(&domain.account_id, "token")?;
         let resources = self.ensure_domain_owned(&domain, &token).await?;
+        let mut listed_same_name = false;
         if !exact_edit {
             let prefix = format!("l:{}:", domain.host);
             let keys = self
@@ -4225,18 +5165,14 @@ impl Backend {
                 .list_keys(&token, &domain.account_id, &resources.namespace, &prefix)
                 .await
                 .map_err(problem)?;
-            if keys
+            // An exact same name is decided below, after reading its value:
+            // it may be this very save that already went through.
+            listed_same_name = keys
                 .iter()
-                .any(|key| key.strip_prefix(&prefix) == Some(slug))
-            {
-                return Err(format!(
-                    "云端已有同名链接 {} / {slug}（可能是上次保存实际已成功）。请在“Cloudflare 账户”页打开该账户的“管理账户”，点“从 Cloudflare 找回配置”核对；已有链接未修改",
-                    domain.host
-                ));
-            }
+                .any(|key| key.strip_prefix(&prefix) == Some(slug));
             if keys.iter().any(|key| {
                 key.strip_prefix(&prefix)
-                    .is_some_and(|remote| remote.eq_ignore_ascii_case(slug))
+                    .is_some_and(|remote| remote != slug && remote.eq_ignore_ascii_case(slug))
             }) {
                 return Err(
                     "云端已存在大小写相同的链接名称，请先找回或换一个名称；已有链接未修改".into(),
@@ -4254,26 +5190,7 @@ impl Backend {
             .read_value(&token, &domain.account_id, &resources.namespace, &key)
             .await
             .map_err(problem)?;
-        let local_previous = self
-            .db
-            .links
-            .iter()
-            .find(|l| l.domain_id == domain_id && l.slug == slug);
-        if previous.is_some() != local_previous.is_some() {
-            return Err("云端链接与本机记录不一致，请先找回".into());
-        }
-        if let (Some(raw), Some(local)) = (&previous, local_previous) {
-            let remote: Value =
-                serde_json::from_str(raw).map_err(|_| "云端链接格式无效".to_string())?;
-            if !remote_matches_link(&remote, local) {
-                return Err("云端链接目标已变化，请先找回".into());
-            }
-        }
-        if let Some(pool_id) = pool_id {
-            self.ensure_pool_on_account(pool_id, &domain.account_id, &token, &resources)
-                .await?;
-        }
-        let link = Link {
+        let mut link = Link {
             domain_id: domain_id.into(),
             slug: slug.into(),
             cn_url: if pool_id.is_some() {
@@ -4290,6 +5207,48 @@ impl Backend {
             pool_id: pool_id.map(str::to_owned),
             code: code.map(str::to_owned),
         };
+        // The cloud already holds exactly what this save would write: an
+        // earlier attempt went through although its answer was lost.
+        let already_saved = previous
+            .as_deref()
+            .is_some_and(|raw| same_link_content(raw, &link));
+        if !already_saved {
+            if listed_same_name {
+                return Err(format!(
+                    "云端已有同名链接 {} / {slug}，内容和这次要保存的不一样。请在“Cloudflare 账户”页打开该账户的“管理账户”，点“从 Cloudflare 找回配置”核对；已有链接未修改",
+                    domain.host
+                ));
+            }
+            let local_previous = self
+                .db
+                .links
+                .iter()
+                .find(|l| l.domain_id == domain_id && l.slug == slug);
+            if previous.is_some() != local_previous.is_some() {
+                return Err("云端链接与本机记录不一致，请先找回".into());
+            }
+            if let (Some(raw), Some(local)) = (&previous, local_previous) {
+                let remote: Value =
+                    serde_json::from_str(raw).map_err(|_| "云端链接格式无效".to_string())?;
+                if !remote_matches_link(&remote, local) {
+                    return Err("云端链接目标已变化，请先找回".into());
+                }
+            }
+        }
+        if let Some(pool_id) = pool_id {
+            self.ensure_pool_on_account(pool_id, &domain.account_id, &token, &resources)
+                .await?;
+        }
+        if already_saved {
+            if let Some(updated) = previous
+                .as_deref()
+                .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+                .and_then(|remote| remote["updated"].as_str().map(str::to_owned))
+            {
+                link.updated = updated;
+            }
+            return self.finish_saved_link(&domain.host, link, None);
+        }
         let journal = format!("保存链接 {} / {} ({})", domain.host, slug, random_id());
         self.journal_start(&journal)?;
         if let Err(e) = self
@@ -4303,13 +5262,37 @@ impl Backend {
             )
             .await
         {
-            if e.uncertain {
-                self.journal_note(&journal, "写入结果不确定，需要人工核对")?;
-            } else {
+            if !e.uncertain {
                 self.journal_end(&journal)?;
+                return Err(e.message);
             }
-            return Err(e.message);
+            // Read the value straight back: an identical value means the
+            // write went through although its answer was lost.
+            let landed = self
+                .cloud
+                .read_value(&token, &domain.account_id, &resources.namespace, &key)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+                .is_some_and(|remote| remote == kv_link(&link));
+            if !landed {
+                self.journal_note(&journal, "写入结果不确定，需要人工核对")?;
+                return Err(e.message);
+            }
         }
+        self.finish_saved_link(&domain.host, link, Some(&journal))
+    }
+
+    /// Records a link the cloud is known to hold and settles older records
+    /// for the same link in the same commit, then ends `journal` if given.
+    fn finish_saved_link(
+        &mut self,
+        host: &str,
+        link: Link,
+        journal: Option<&str>,
+    ) -> Result<(), String> {
+        let (domain_id, slug) = (link.domain_id.clone(), link.slug.clone());
         // Edit in place so the list keeps its order; drop any older duplicates.
         if let Some(index) = self
             .db
@@ -4335,15 +5318,18 @@ impl Backend {
         let before_operations = self.db.pending_operations.clone();
         clear_link_leftovers(
             &mut self.db.pending_operations,
-            &domain.host,
-            slug,
-            &journal,
+            host,
+            &slug,
+            journal.unwrap_or_default(),
         );
         if let Err(error) = self.persist() {
             self.db.pending_operations = before_operations;
             return Err(error);
         }
-        self.journal_end(&journal)
+        match journal {
+            Some(journal) => self.journal_end(journal),
+            None => Ok(()),
+        }
     }
 
     async fn ensure_pool_on_account(
@@ -4399,7 +5385,9 @@ impl Backend {
             .iter()
             .any(|s| s.account_id == account_id && s.status == "synced")
         {
-            return Err("已使用的平台地址在云端缺失，请先核对".into());
+            // Saving the pool again through 「编辑地址」 re-creates the copy
+            // (`apply_save_pool`), the same way out as the patrol names.
+            return Err(POOL_COPY_MISSING_FOR_LINK.into());
         }
         let monitor = self
             .monitor_config_for(account_id, token, &resources.namespace, pool_id)
@@ -4472,7 +5460,7 @@ impl Backend {
                     if let Err(persist_error) = self.persist() {
                         self.db = pending;
                         return Err(format!(
-                            "{}；{persist_error}，平台地址的待处理记录未能清除，请在待处理操作中继续处理",
+                            "{}；{persist_error}，平台地址的待处理记录未能清除，请用{RESUME_BAR}里的「继续同步」按钮继续处理",
                             error.message
                         ));
                     }
@@ -4686,14 +5674,11 @@ impl Backend {
                         monitor,
                         already_desired,
                     })
-                } else if old.as_ref().is_some_and(|prior| {
-                    prior
-                        .sync_status
-                        .iter()
-                        .any(|s| s.account_id == *id && s.status == "synced")
-                }) {
-                    Err("已同步平台地址在云端缺失，请先核对".into())
                 } else {
+                    // Nothing is there, so nothing can be overwritten. This
+                    // also re-creates a copy that went missing while this
+                    // computer still records it as synced: visitors cannot
+                    // open its links until it is written again.
                     Ok(Target {
                         account: id.clone(),
                         label: account.label.clone(),
@@ -4720,6 +5705,10 @@ impl Backend {
             .as_ref()
             .map(|p| p.journal.clone())
             .unwrap_or_else(|| format!("同步平台地址 {} ({})", pool.id, random_id()));
+        // Only a fresh start can be undone locally: on a retry an earlier
+        // attempt may already have changed the cloud.
+        let rollback = pending.is_none().then(|| self.db.clone());
+        let mut wrote_any = false;
         if pending.is_none() {
             self.journal_start(&journal)?;
             self.db.pending_pool_changes.push(PendingPoolChange {
@@ -4759,7 +5748,24 @@ impl Backend {
                 })
                 .ok_or("平台地址同步状态丢失")?;
             match result {
-                Ok(()) => {}
+                Ok(()) => wrote_any = true,
+                Err(e) if !e.uncertain && !wrote_any && rollback.is_some() => {
+                    // The very first write was refused: the cloud is unchanged,
+                    // so this operation's records are dropped again.
+                    let before = rollback.expect("checked above");
+                    let pending = std::mem::replace(&mut self.db, before);
+                    if let Err(persist_error) = self.persist() {
+                        self.db = pending;
+                        return Err(format!(
+                            "账户「{}」：{}；{persist_error}，平台地址的待处理记录未能清除，请用{RESUME_BAR}里的「继续同步」按钮继续处理",
+                            target.label, e.message
+                        ));
+                    }
+                    return Err(format!(
+                        "账户「{}」：{}；云端没有任何改动，这组平台地址没有保存，处理好原因后可以重新保存",
+                        target.label, e.message
+                    ));
+                }
                 Err(e) => {
                     status.status = if e.uncertain { "unknown" } else { "failed" }.into();
                     status.message = e.message.clone();
@@ -4911,7 +5917,15 @@ impl Backend {
                         monitor,
                         already_deleted: false,
                     }))
-                } else if pending.is_some() && pool.account_ids.contains(id) {
+                } else if pool.account_ids.contains(id)
+                    && (pending.is_some()
+                        || pool
+                            .sync_status
+                            .iter()
+                            .any(|s| s.account_id == *id && s.status == "synced"))
+                {
+                    // Gone already: an earlier attempt deleted it, or the copy
+                    // went missing while recorded as synced.
                     Ok(Some(Target {
                         account: id.clone(),
                         label: account.label.clone(),
@@ -5081,6 +6095,9 @@ impl Backend {
             .as_ref()
             .map(|p| p.journal.clone())
             .unwrap_or_else(|| format!("启用监测 {} ({})", account_id, random_id()));
+        // Only a fresh start can be undone locally: on a retry an earlier
+        // attempt may already have changed the cloud.
+        let rollback = pending.is_none().then(|| self.db.clone());
         if pending.is_none() {
             self.journal_start(&journal)?;
             self.db.pending_monitor_changes.push(PendingMonitorChange {
@@ -5096,6 +6113,23 @@ impl Backend {
             .set_probe_secret(&token, account_id, &resources.script, secret)
             .await
         {
+            // A definite refusal of the very first write changed nothing in
+            // the cloud: drop this operation's records instead of leaving a
+            // "continue" entry that can only be refused again.
+            if let (false, Some(before)) = (e.uncertain, rollback) {
+                let pending = std::mem::replace(&mut self.db, before);
+                if let Err(persist_error) = self.persist() {
+                    self.db = pending;
+                    return Err(format!(
+                        "{}；{persist_error}，启用监测的待处理记录未能清除，请用{RESUME_BAR}里的「继续处理监测」按钮继续处理",
+                        e.message
+                    ));
+                }
+                return Err(format!(
+                    "{}；云端没有任何改动，监测没有启用，处理好原因后可以重新启用",
+                    e.message
+                ));
+            }
             self.journal_note(&journal, "Worker 密钥写入未完成")?;
             return Err(e.message);
         }
@@ -5348,7 +6382,24 @@ impl Backend {
     async fn apply_remove_domain(&mut self, domain_id: &str) -> Result<(), String> {
         let domain = self.domain(domain_id)?.clone();
         let token = keyring_get(&domain.account_id, "token")?;
-        let resources = self.ensure_domain_owned(&domain, &token).await?;
+        let resources = match self.ensure_domain_owned(&domain, &token).await {
+            Ok(resources) => resources,
+            // An earlier removal may already have deleted the prefix config
+            // or the route (its answer was lost). Any other failure, such as
+            // a network error, is reported as it is without more reads.
+            Err(error) if error != DOMAIN_ROUTE_CHANGED && error != DOMAIN_CONFIG_LOST => {
+                return Err(error);
+            }
+            Err(error) => {
+                return match self.removal_leftover(&domain, &token).await {
+                    Some(leftover) => {
+                        self.finish_interrupted_removal(&domain, &token, leftover)
+                            .await
+                    }
+                    None => Err(error),
+                };
+            }
+        };
         let keys = self
             .cloud
             .list_keys(
@@ -5366,18 +6417,30 @@ impl Backend {
             .filter(|l| l.domain_id == domain_id)
             .map(|l| format!("l:{}:{}", domain.host, l.slug))
             .collect();
-        if keys.iter().any(|k| !expected.contains(k)) || keys.len() != expected.len() {
+        // Fewer links than this computer lists is what an earlier removal
+        // that stopped while deleting links leaves (or links deleted from
+        // another computer): continue with the rest. No earlier record is
+        // asked for, so a record cleared by hand costs nothing. A key this
+        // computer does not list is never deleted.
+        if keys.iter().any(|k| !expected.contains(k)) {
             return Err("云端链接清单与本机不同，请先找回再移除".into());
         }
+        // The key list above only serves to refuse keys this computer does
+        // not list. What to delete is read key by key from this computer's
+        // own list, so a key list that lags behind a recent save or delete
+        // neither leaves a link behind nor stops the removal.
+        let mut wanted: Vec<&String> = expected.iter().collect();
+        wanted.sort();
         let mut saved = Vec::new();
-        for key in &keys {
-            let value = self
+        for key in wanted {
+            if let Some(value) = self
                 .cloud
                 .read_value(&token, &domain.account_id, &resources.namespace, key)
                 .await
                 .map_err(problem)?
-                .ok_or("云端链接在预检后消失")?;
-            saved.push((key.clone(), value));
+            {
+                saved.push((key.clone(), value));
+            }
         }
         let config_key = format!("c:{}", domain.host);
         let config = self
@@ -5403,8 +6466,10 @@ impl Backend {
                 Ok(()) => deleted.push((key.clone(), value.clone())),
                 Err(e) => {
                     if e.uncertain {
+                        // The next removal continues from here (the subset
+                        // rule above, or `removal_leftover`).
                         self.journal_note(&journal, "链接删除结果不确定")?;
-                        return Err(e.message);
+                        return Err(format!("{}；{REMOVAL_RETRY_HINT}", e.message));
                     }
                     let restored = self
                         .restore_values(&token, &domain.account_id, &resources.namespace, &deleted)
@@ -5430,7 +6495,7 @@ impl Backend {
         {
             if e.uncertain {
                 self.journal_note(&journal, "前缀配置删除结果不确定")?;
-                return Err(e.message);
+                return Err(format!("{}；{REMOVAL_RETRY_HINT}", e.message));
             }
             let restored = self
                 .restore_values(&token, &domain.account_id, &resources.namespace, &deleted)
@@ -5455,7 +6520,7 @@ impl Backend {
         {
             if e.uncertain {
                 self.journal_note(&journal, "路由删除结果不确定")?;
-                return Err(e.message);
+                return Err(format!("{}；{REMOVAL_RETRY_HINT}", e.message));
             }
             let restored = self
                 .restore_values(&token, &domain.account_id, &resources.namespace, &deleted)
@@ -5478,10 +6543,154 @@ impl Backend {
             }
             return Err(e.message);
         }
-        self.db.links.retain(|l| l.domain_id != domain_id);
-        self.db.domains.retain(|d| d.id != domain_id);
-        self.persist()?;
-        self.journal_end(&journal)
+        self.forget_removed_domain(&domain, &journal)
+    }
+
+    /// Drops a domain the cloud no longer serves, together with its links,
+    /// and settles earlier unresolved removals of the same host in the same
+    /// commit; then ends `journal`.
+    fn forget_removed_domain(&mut self, domain: &Domain, journal: &str) -> Result<(), String> {
+        let before = self.db.clone();
+        self.db.links.retain(|l| l.domain_id != domain.id);
+        self.db.domains.retain(|d| d.id != domain.id);
+        clear_domain_leftovers(
+            &mut self.db.pending_operations,
+            &[format!("移除域名 {} (", domain.host)],
+            journal,
+        );
+        if let Err(error) = self.persist() {
+            self.db = before;
+            return Err(error);
+        }
+        self.journal_end(journal)
+    }
+
+    /// Read-only: when a removal of `domain` stopped after its prefix config
+    /// was deleted, says what is left to do: links still in the cloud (only
+    /// keys of this domain's local links) and whether this tool's route for
+    /// it is still there. `None` means the cloud is not in that state (or
+    /// could not be read), so the normal checks apply.
+    async fn removal_leftover(&self, domain: &Domain, token: &str) -> Option<RemovalLeftover> {
+        let resources = self.account(&domain.account_id).ok()?.resources.clone()?;
+        self.verify_resource_source(token, &domain.account_id, &resources)
+            .await
+            .ok()?;
+        let config_key = format!("c:{}", domain.host);
+        let config = self
+            .cloud
+            .read_value(token, &domain.account_id, &resources.namespace, &config_key)
+            .await
+            .ok()?;
+        if config.is_some() {
+            return None;
+        }
+        // Links go before the prefix config. Links left without the config
+        // (for example a route delete was refused and the config could not be
+        // put back) are finished only when every key is one of this domain's
+        // local links. No earlier record is asked for: the user is removing
+        // this domain, and a record cleared by hand must not leave a domain
+        // that can neither be removed nor recovered.
+        let links = self
+            .cloud
+            .list_keys(
+                token,
+                &domain.account_id,
+                &resources.namespace,
+                &format!("l:{}:", domain.host),
+            )
+            .await
+            .ok()?;
+        if !links.is_empty() {
+            let local: HashSet<String> = self
+                .db
+                .links
+                .iter()
+                .filter(|l| l.domain_id == domain.id)
+                .map(|l| format!("l:{}:{}", domain.host, l.slug))
+                .collect();
+            if links.iter().any(|key| !local.contains(key)) {
+                return None;
+            }
+        }
+        let routes = self
+            .cloud
+            .get(token, &format!("zones/{}/workers/routes", domain.zone_id))
+            .await
+            .ok()?;
+        let routes = routes["result"].as_array()?;
+        let route_left = match routes
+            .iter()
+            .find(|r| r["id"].as_str() == Some(domain.route_id.as_str()))
+        {
+            None => false,
+            Some(route)
+                if route["script"].as_str() == Some(resources.script.as_str())
+                    && route["pattern"].as_str()
+                        == Some(route_pattern(&domain.host, &domain.prefix).as_str()) =>
+            {
+                true
+            }
+            // The recorded route now belongs to something else: leave it.
+            Some(_) => return None,
+        };
+        Some(RemovalLeftover {
+            namespace: resources.namespace,
+            links,
+            route_left,
+        })
+    }
+
+    /// Finishes a removal whose prefix config is already gone: deletes the
+    /// links still left, then this tool's route if it is still there, then
+    /// forgets the domain locally. An uncertain delete keeps the record; a
+    /// definite failure reports the error and keeps the earlier record.
+    async fn finish_interrupted_removal(
+        &mut self,
+        domain: &Domain,
+        token: &str,
+        leftover: RemovalLeftover,
+    ) -> Result<(), String> {
+        let journal = format!("移除域名 {} ({})", domain.host, random_id());
+        self.journal_start(&journal)?;
+        for key in &leftover.links {
+            if let Err(e) = self
+                .cloud
+                .delete_value(token, &domain.account_id, &leftover.namespace, key)
+                .await
+            {
+                if !answered_not_found(&e) {
+                    if e.uncertain {
+                        self.journal_note(&journal, "链接删除结果不确定")?;
+                        return Err(format!("{}；{REMOVAL_RETRY_HINT}", e.message));
+                    }
+                    self.journal_end(&journal)?;
+                    return Err(e.message);
+                }
+            }
+        }
+        if leftover.route_left {
+            if let Err(e) = self
+                .cloud
+                .delete(
+                    token,
+                    &format!(
+                        "zones/{}/workers/routes/{}",
+                        domain.zone_id, domain.route_id
+                    ),
+                )
+                .await
+            {
+                if !answered_not_found(&e) {
+                    if e.uncertain {
+                        self.journal_note(&journal, "路由删除结果不确定")?;
+                        return Err(format!("{}；{REMOVAL_RETRY_HINT}", e.message));
+                    }
+                    self.journal_end(&journal)?;
+                    return Err(e.message);
+                }
+            }
+        }
+        self.forget_removed_domain(domain, &journal)
     }
 
     async fn restore_values(
@@ -5504,7 +6713,9 @@ impl Backend {
 
     async fn apply_cleanup(&mut self, account_id: &str) -> Result<(), String> {
         if self.has_selftest_rotation(account_id) {
-            return Err("此账号的自检密钥轮换尚未完成，请先从待处理操作恢复".into());
+            return Err(format!(
+                "此账号的自检密钥轮换尚未完成，请先用{RESUME_BAR}里这个账户的按钮把它做完"
+            ));
         }
         if self.account(account_id)?.monitor_enabled
             || self
@@ -5530,6 +6741,28 @@ impl Backend {
             .clone()
             .ok_or("没有可清理资源")?;
         let token = keyring_get(account_id, "token")?;
+        let prefix = format!("清理账号 {account_id} (");
+        let pending = self
+            .db
+            .pending_operations
+            .iter()
+            .find(|entry| entry.starts_with(&prefix))
+            .map(|entry| entry.split('：').next().unwrap_or(entry).to_owned());
+        // An earlier cleanup of this account checked the cloud data and got
+        // as far as deleting the Worker: finish the remaining steps.
+        if let Some(journal) = &pending {
+            if let Err(error) = self
+                .cloud
+                .script_settings(&token, account_id, &resources.script)
+                .await
+            {
+                if answered_not_found(&error) {
+                    return self
+                        .resume_cleanup(account_id, &resources, &token, journal)
+                        .await;
+                }
+            }
+        }
         self.verify_resource_source(&token, account_id, &resources)
             .await?;
         let manifest = self
@@ -5555,12 +6788,7 @@ impl Backend {
         // (p:) is allowed only when it is checked below against the local pool
         // library, so no unique data is deleted.
         if keys.iter().collect::<HashSet<_>>().len() != keys.len()
-            || keys.iter().any(|key| {
-                key != MANIFEST_KEY
-                    && key != "m:monitor:cursor"
-                    && !key.strip_prefix("h:").is_some_and(pools::valid_id)
-                    && !key.strip_prefix("p:").is_some_and(pools::valid_id)
-            })
+            || keys.iter().any(|key| !cleanup_may_remove_key(key))
         {
             return Err("KV 仍有业务或未知配置记录，停止清理".into());
         }
@@ -5602,11 +6830,16 @@ impl Backend {
                 .await
                 .map_err(problem)?;
             let items = routes["result"].as_array().ok_or("云端路由列表格式无效")?;
-            if items
+            if let Some(route) = items
                 .iter()
-                .any(|r| r["script"].as_str() == Some(resources.script.as_str()))
+                .find(|r| r["script"].as_str() == Some(resources.script.as_str()))
             {
-                return Err("仍有路由指向此 Worker，停止清理".into());
+                // Also what a skipped leftover of an interrupted removal
+                // looks like, so the text names the rule and the way out.
+                return Err(format!(
+                    "还有转发规则 {} 指向这个账户的云端跳转服务，所以这次没有清理。请先点「从 Cloudflare 找回配置」，把找回的域名移除；如果找回后列表里没有这个域名，就把它用同样的目录重新添加一次再移除。然后再点「删除云端短链接服务」",
+                    route["pattern"].as_str().unwrap_or("（未知）")
+                ));
             }
         }
         let latest_keys = self
@@ -5634,13 +6867,6 @@ impl Backend {
                 return Err("检测记录在核对中变化，停止清理".into());
             }
         }
-        let prefix = format!("清理账号 {account_id} (");
-        let pending = self
-            .db
-            .pending_operations
-            .iter()
-            .find(|entry| entry.starts_with(&prefix))
-            .map(|entry| entry.split('：').next().unwrap_or(entry).to_owned());
         let journal = pending
             .clone()
             .unwrap_or_else(|| format!("清理账号 {} ({})", account_id, random_id()));
@@ -5655,6 +6881,11 @@ impl Backend {
             // journal. Every retry must make its intent durable before DELETE.
             self.persist()?;
         }
+        // This run started the journal and nothing in the cloud has been
+        // deleted yet: a failure then ends the journal again instead of
+        // leaving a record that only a finished cleanup could clear.
+        let started_here = pending.is_none();
+        let mut deleted_any = false;
         for (key, expected) in &metadata {
             let latest = self
                 .cloud
@@ -5663,11 +6894,19 @@ impl Backend {
             match latest {
                 Ok(Some(raw)) if &raw == expected => {}
                 _ => {
+                    if started_here && !deleted_any {
+                        self.journal_end(&journal)?;
+                        return Err(format!(
+                            "遗留检测数据无法再次核实，停止清理；{CLEANUP_NOTHING_DELETED}"
+                        ));
+                    }
                     self.journal_note(
                         &journal,
                         "遗留检测数据读取失败或已变化；尚未删除 Worker/KV，请重新核对",
                     )?;
-                    return Err("遗留检测数据无法再次核实，停止清理".into());
+                    return Err(format!(
+                        "遗留检测数据无法再次核实，停止清理；{CLEANUP_RETRY_HINT}"
+                    ));
                 }
             }
             // A platform address copy goes away with the namespace. Deleting it
@@ -5681,12 +6920,17 @@ impl Backend {
                 .delete_value(&token, account_id, &resources.namespace, key)
                 .await
             {
+                if started_here && !deleted_any && !error.uncertain {
+                    self.journal_end(&journal)?;
+                    return Err(format!("{}；{CLEANUP_NOTHING_DELETED}", error.message));
+                }
                 self.journal_note(
                     &journal,
                     "遗留检测数据删除未完成或结果不确定；尚未删除 Worker/KV，可重新核对后继续清理",
                 )?;
-                return Err(error.message);
+                return Err(format!("{}；{CLEANUP_RETRY_HINT}", error.message));
             }
+            deleted_any = true;
         }
         if let Err(e) = self
             .cloud
@@ -5696,15 +6940,14 @@ impl Backend {
             )
             .await
         {
-            self.journal_note(
-                &journal,
-                if e.uncertain {
-                    "Worker 删除结果不确定，请核对后继续清理"
-                } else {
-                    "Worker 删除被拒绝，账号清理尚未完成"
-                },
-            )?;
-            return Err(e.message);
+            let (note, message) = cleanup_worker_delete_failure(&e, started_here && !deleted_any);
+            match note {
+                None => self.journal_end(&journal)?,
+                Some(note) => {
+                    self.journal_note(&journal, note)?;
+                }
+            }
+            return Err(message);
         }
         self.journal_note(&journal, "Worker 已删，正在删除 KV")?;
         if let Err(e) = self
@@ -5720,11 +6963,92 @@ impl Backend {
         {
             self.journal_note(&journal, "Worker 已删除，KV 删除未完成或结果不确定")?;
             return Err(format!(
-                "{}；Worker 已删除，请按操作记录核对剩余 KV",
+                "{}；Worker 已删除，KV 还没删完。{CLEANUP_RETRY_HINT}",
                 e.message
             ));
         }
-        keyring_delete(account_id, "selftest")?;
+        self.finish_cleanup(account_id, &journal)
+    }
+
+    /// Continues a cleanup whose Worker is already deleted: the earlier run
+    /// checked that the KV held only removable records. Deletes the KV if it
+    /// is still there, then finishes locally.
+    async fn resume_cleanup(
+        &mut self,
+        account_id: &str,
+        resources: &Resources,
+        token: &str,
+        journal: &str,
+    ) -> Result<(), String> {
+        self.require_no_worker_upgrade(account_id)?;
+        // An earlier persistence failure may have left only an in-memory
+        // journal. Make the intent durable before the next DELETE.
+        self.persist()?;
+        let kv_path = format!(
+            "accounts/{account_id}/storage/kv/namespaces/{}",
+            resources.namespace
+        );
+        let namespaces = self
+            .cloud
+            .list_pages(
+                token,
+                &format!("accounts/{account_id}/storage/kv/namespaces"),
+            )
+            .await
+            .map_err(|e| {
+                format!(
+                    "{}；Worker 已删除，KV 还没删完。{CLEANUP_RETRY_HINT}",
+                    e.message
+                )
+            })?;
+        if namespaces
+            .iter()
+            .any(|ns| ns["id"].as_str() == Some(resources.namespace.as_str()))
+        {
+            // The Worker may also have been deleted outside this app after an
+            // earlier cleanup stopped before its own delete. Look at the key
+            // names once more: a link or prefix config is never deleted here.
+            match self
+                .cloud
+                .list_keys(token, account_id, &resources.namespace, "")
+                .await
+            {
+                Ok(keys) if keys.iter().all(|key| cleanup_may_remove_key(key)) => {}
+                Ok(_) => {
+                    return Err(
+                        "云端跳转服务已经删除，但这个账户的云端存储里还有链接或域名记录，为了不误删没有动它。请联系维护的人核对后处理"
+                            .into(),
+                    )
+                }
+                // Gone between the two reads: nothing is left to delete.
+                Err(e) if answered_not_found(&e) => {
+                    return self.finish_cleanup(account_id, journal)
+                }
+                Err(e) => {
+                    return Err(format!(
+                        "{}；Worker 已删除，KV 还没删完。{CLEANUP_RETRY_HINT}",
+                        e.message
+                    ))
+                }
+            }
+            self.journal_note(journal, "Worker 已删，正在删除 KV")?;
+            if let Err(e) = self.cloud.delete(token, &kv_path).await {
+                if !answered_not_found(&e) {
+                    self.journal_note(journal, "Worker 已删除，KV 删除未完成或结果不确定")?;
+                    return Err(format!(
+                        "{}；Worker 已删除，KV 还没删完。{CLEANUP_RETRY_HINT}",
+                        e.message
+                    ));
+                }
+            }
+        }
+        self.finish_cleanup(account_id, journal)
+    }
+
+    /// Local end of an account cleanup once the Worker and KV are gone.
+    fn finish_cleanup(&mut self, account_id: &str, journal: &str) -> Result<(), String> {
+        keyring_delete(account_id, "selftest")
+            .map_err(|e| format!("{e}；云端已清理完。{CLEANUP_RETRY_HINT}"))?;
         let before_finish = self.db.clone();
         for pool in &mut self.db.pools {
             pool.account_ids.retain(|id| id != account_id);
@@ -5736,7 +7060,7 @@ impl Backend {
             a.has_resources = false;
             a.needs_selftest_key = false;
         }
-        if let Err(error) = self.journal_end(&journal) {
+        if let Err(error) = self.journal_end(journal) {
             self.db = before_finish;
             return Err(error);
         }
@@ -5775,13 +7099,15 @@ impl Backend {
             .any(|pending| pending.account_id == account_id)
             && !(recovering_legacy && missing_staging)
         {
-            return Err("此账号已有未完成的自检密钥轮换，请从待处理操作恢复".into());
+            return Err(format!(
+                "此账号已有未完成的自检密钥轮换，请先用{RESUME_BAR}里这个账户的按钮把它做完"
+            ));
         }
         if !missing_staging && recovering_legacy != self.has_legacy_selftest_rotation(account_id) {
             return Err(if recovering_legacy {
                 "此账号没有需要旧版恢复的自检密钥操作"
             } else {
-                "此账号有未完成的旧版自检密钥操作，请从待处理操作恢复"
+                "此账号有未完成的旧版自检密钥操作，请先用页面上方“……项变更可继续处理”那一栏里这个账户的按钮把它做完"
             }
             .into());
         }
@@ -6095,7 +7421,7 @@ impl Backend {
         self.require_credentials(account_id)?;
         if !self.db.can_recover_selftest_resources(account_id) {
             return Err(
-                "仅能为缺少本机检测配置的旧版恢复记录找回资源；请先核对该账户其他待处理操作".into(),
+                "仅能为缺少本机检测配置的旧版恢复记录找回资源；请先到页面上方「查看待处理记录」里核对该账户的其他记录".into(),
             );
         }
         Ok(())
@@ -6154,7 +7480,8 @@ impl Backend {
             return Err("当前令牌可见的区域未覆盖本机已登记域名，停止找回以保留现有记录".into());
         }
         let mut recovered_domains = Vec::new();
-        let mut recovered_hosts = HashSet::new();
+        // Host -> pattern of this tool's first route seen for it.
+        let mut recovered_hosts = std::collections::HashMap::<String, String>::new();
         for zone in &fresh_zones {
             let owner = self
                 .cloud
@@ -6192,11 +7519,16 @@ impl Backend {
                     || validate_prefix(prefix).is_err()
                     || !(host == zone.name || host.ends_with(&format!(".{}", zone.name)))
                     || !valid_id(route_id)
-                    || !recovered_hosts.insert(host.to_owned())
                 {
                     return Err("此 Worker 的路由无效或主机名重复，停止找回以保留现有记录".into());
                 }
-                let raw = self
+                // Two routes of this tool for one host: recovery cannot tell
+                // which one to keep. Nothing local has changed yet.
+                if let Some(first) = recovered_hosts.get(host) {
+                    return Err(duplicate_route_message(host, first, pattern));
+                }
+                recovered_hosts.insert(host.to_owned(), pattern.to_owned());
+                let Some(raw) = self
                     .cloud
                     .read_value(
                         &token,
@@ -6206,7 +7538,37 @@ impl Backend {
                     )
                     .await
                     .map_err(problem)?
-                    .ok_or("路由对应的前缀记录缺失")?;
+                else {
+                    // A route whose prefix config is gone is what an
+                    // interrupted removal leaves behind. It serves nothing;
+                    // skip it and recover the other domains, unless this
+                    // computer lists the domain for this account and links of
+                    // the host are still there: skipping would drop the local
+                    // copy of the domain and its links. A host this computer
+                    // does not list has nothing local to lose.
+                    let links = self
+                        .cloud
+                        .list_keys(
+                            &token,
+                            account_id,
+                            &resources.namespace,
+                            &format!("l:{host}:"),
+                        )
+                        .await
+                        .map_err(problem)?;
+                    if !links.is_empty()
+                        && self
+                            .db
+                            .domains
+                            .iter()
+                            .any(|d| d.host == host && d.account_id == account_id)
+                    {
+                        return Err(format!(
+                            "域名 {host} 的转发规则还在，但前缀配置已经不在，云端还留着它的短链接。为了不丢本机记录，这次没有找回。如果这个域名本来就是要移除的，请到「域名管理」对它再点一次「移除域名」；否则请联系维护的人"
+                        ));
+                    }
+                    continue;
+                };
                 let config: Value =
                     serde_json::from_str(&raw).map_err(|_| "前缀记录格式无效".to_string())?;
                 if config["prefix"].as_str() != Some(prefix) {
@@ -6361,6 +7723,25 @@ impl Backend {
         let monitor_key_missing =
             monitor_enabled && keyring_get_optional(account_id, "probe")?.is_none();
         let before_finish = self.db.clone();
+        // Recovery has just compared this account with the cloud, so earlier
+        // add/remove-domain and save/delete-link records for hosts in its
+        // zones are settled in the same commit.
+        let other_hosts: HashSet<String> = self
+            .db
+            .domains
+            .iter()
+            .filter(|d| d.account_id != account_id)
+            .map(|d| d.host.clone())
+            .collect();
+        self.db.pending_operations.retain(|entry| {
+            names_leftover_resources(entry)
+                || !journal_host(entry).is_some_and(|host| {
+                    !other_hosts.contains(host)
+                        && fresh_zones.iter().any(|zone| {
+                            host == zone.name || host.ends_with(&format!(".{}", zone.name))
+                        })
+                })
+        });
         let old_ids: HashSet<_> = self
             .db
             .domains
@@ -6952,21 +8333,81 @@ async fn dispatch(
     }
     if action == "selftest_link" {
         let mode = requested_dns_mode(&payload)?;
-        let snapshot = {
+        let (snapshot, key_missing) = {
             let backend = lock_backend(&state, &action).await?;
-            backend.selftest_snapshot(field(&payload, "domainId")?, field(&payload, "slug")?)?
+            let domain_id = field(&payload, "domainId")?;
+            let snapshot = backend.selftest_snapshot(domain_id, field(&payload, "slug")?)?;
+            (snapshot, backend.selftest_unavailable_message(domain_id))
         };
         return match snapshot {
             Some(snapshot) => match mode {
                 local_check::DnsMode::System => run_selftest(snapshot).await,
                 local_check::DnsMode::Public => run_selftest_with_mode(snapshot, mode).await,
             },
-            None => Ok(json!({"status":"key_missing",
-                "message":"本机没有自检密钥，请先单独确认重置密钥","checks":[] })),
+            None => Ok(json!({"status":"key_missing","message":key_missing,"checks":[] })),
         };
     }
     let mut backend = lock_backend(&state, &action).await?;
     backend.dispatch(&action, &payload).await
+}
+
+/// Why a self-test cannot run without a key, and where to go next.
+fn selftest_key_missing_message(rotation_pending: bool) -> &'static str {
+    if rotation_pending {
+        // Resetting is refused while an earlier key update is unfinished.
+        "这个账户的检测密钥上次没更新完，现在不能检测，也不用重置密钥。请先到页面上方“……项变更可继续处理”那一栏找到这个账户，点它旁边的按钮（「继续修复」「查看修复计划」或「找回本机检测配置」）把它做完，再检测"
+    } else {
+        "本机没有自检密钥，请先单独确认重置密钥"
+    }
+}
+
+/// Name of the app in the Dock and the window title.
+const APP_NAME: &str = "短连接生成器";
+/// Both names of the app, for the startup failure text.
+const APP_NAMES: &str = "短连接生成器（窗口里叫“短链接工作台”）";
+
+/// What the user reads when local startup fails, by cause. Kept free of UI
+/// calls so every branch can be tested. The app is called 短连接生成器 in the
+/// Dock and the window title and 短链接工作台 inside the window.
+fn startup_failure_message(error: &str) -> String {
+    if error.contains("另一个本机客户端正在运行") {
+        return format!(
+            "{APP_NAMES}已经开着了，请切换到已打开的窗口；如果找不到，请退出后重新打开。"
+        );
+    }
+    // Only a newer version writes a credential format this one does not know.
+    if error.contains("本机凭据格式版本不受支持") {
+        return format!(
+            "{APP_NAMES}读不了本机的配置文件（{error}）。配置文件没有被改动。它可能是更新的版本写的，请安装最新版；如果还是打不开，请联系维护的人。"
+        );
+    }
+    // Reinstalling does not change the configuration file.
+    if ["无法读取本机配置", "本机配置格式无效"]
+        .iter()
+        .any(|cause| error.contains(cause))
+    {
+        return format!(
+            "{APP_NAMES}读不了本机的配置文件（{error}）。配置文件没有被改动，重新安装也不会改变它。请联系维护的人处理。"
+        );
+    }
+    format!("{APP_NAMES}没能打开：{error}")
+}
+
+/// Shows why startup failed, then exits once the user closes the message.
+/// The open windows are hidden first so nothing half-started can be used.
+/// The dialog runs on the event loop; `blocking_show` must not be used here
+/// because setup runs on the main thread.
+fn show_startup_failure(app: &tauri::App, error: &str) {
+    use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
+    for window in app.webview_windows().values() {
+        let _ = window.hide();
+    }
+    let handle = app.handle().clone();
+    app.dialog()
+        .message(startup_failure_message(error))
+        .title(format!("{APP_NAME}没能打开"))
+        .kind(MessageDialogKind::Error)
+        .show(move |_| handle.exit(1));
 }
 
 pub fn run() {
@@ -6986,7 +8427,13 @@ pub fn run() {
                 }
             }
             let dir = app.path().app_data_dir()?;
-            let backend = Backend::load(dir.join("state.json")).map_err(std::io::Error::other)?;
+            let backend = match Backend::load(dir.join("state.json")) {
+                Ok(backend) => backend,
+                Err(error) => {
+                    show_startup_failure(app, &error);
+                    return Ok(());
+                }
+            };
             app.manage(AppState(Mutex::new(backend)));
             app.manage(updater_service::Service::default());
             let handle = app.handle().clone();
@@ -7014,8 +8461,10 @@ pub fn run() {
                 let handle = window.app_handle().clone();
                 // Finish a current cloud operation safely before clearing its plans.
                 tauri::async_runtime::spawn(async move {
-                    let state = handle.state::<AppState>();
-                    state.0.lock().await.plans.clear();
+                    // Absent only when startup failed and the app is exiting.
+                    if let Some(state) = handle.try_state::<AppState>() {
+                        state.0.lock().await.plans.clear();
+                    }
                     clear_credential_cache();
                 });
             }
@@ -7063,7 +8512,7 @@ mod tests {
         let state = AppState(Mutex::new(backend));
         let busy_guard = state.0.lock().await;
         let install_lock = tokio::time::timeout(
-            Duration::from_millis(100),
+            Duration::from_secs(5),
             lock_backend(&state, "install_update"),
         )
         .await;
@@ -7145,7 +8594,7 @@ mod tests {
         assert_eq!(persisted.accounts[0].label, "Changed");
     }
 
-    fn url_link(slug: &str, cn: &str, default: &str) -> Link {
+    pub(super) fn url_link(slug: &str, cn: &str, default: &str) -> Link {
         Link {
             domain_id: "domain1".into(),
             slug: slug.into(),
@@ -7316,7 +8765,7 @@ mod tests {
         assert!(!error.contains("test-token-value"));
     }
 
-    fn ok(result: Value) -> ResponseTemplate {
+    pub(super) fn ok(result: Value) -> ResponseTemplate {
         ResponseTemplate::new(200)
             .set_body_json(json!({"success":true,"result":result,"result_info":{"cursor":""}}))
     }
@@ -7517,7 +8966,11 @@ mod tests {
             .await;
     }
 
-    async fn mount_domain_hard_checks(server: &MockServer, dns_records: Value, routes: Value) {
+    pub(super) async fn mount_domain_hard_checks(
+        server: &MockServer,
+        dns_records: Value,
+        routes: Value,
+    ) {
         Mock::given(method("GET"))
             .and(path("/client/v4/zones/zone1"))
             .respond_with(ok(json!({"id":"zone1","status":"active",
@@ -7536,7 +8989,7 @@ mod tests {
             .await;
     }
 
-    async fn mount_domain_probes(
+    pub(super) async fn mount_domain_probes(
         server: &MockServer,
         root: ResponseTemplate,
         child: ResponseTemplate,
@@ -7580,7 +9033,7 @@ mod tests {
             .await;
     }
 
-    async fn mount_existing_resource_domain_write(server: &MockServer) {
+    pub(super) async fn mount_existing_resource_domain_write(server: &MockServer) {
         mount_resource(server, include_str!("../../edge/worker.mjs")).await;
         Mock::given(method("GET"))
             .and(path(
@@ -8344,7 +9797,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn repeated_domain_operations_fail_promptly_instead_of_queuing_authorization() {
+    async fn busy_foreground_operations_wait_briefly_then_give_up() {
         let (_server, backend, _dir) = fixture().await;
         let state = AppState(Mutex::new(backend));
         let guard = state.0.lock().await;
@@ -8361,15 +9814,33 @@ mod tests {
             "remove_account",
             "import_config",
         ] {
-            let result =
-                tokio::time::timeout(Duration::from_millis(100), lock_backend(&state, action))
-                    .await
-                    .unwrap();
-            assert!(result.err().unwrap().contains("上一个操作仍在进行"));
+            let started = Instant::now();
+            let result = tokio::time::timeout(Duration::from_secs(5), lock_backend(&state, action))
+                .await
+                .unwrap();
+            assert!(started.elapsed() >= BUSY_WAIT, "{action} gave up too early");
+            let error = result.err().unwrap();
+            assert_eq!(error, BUSY_MESSAGE);
+        }
+        assert!(BUSY_MESSAGE.starts_with("上一个操作还没结束"));
+        for word in ["令牌", "凭据", "授权", "权限"] {
+            assert!(!BUSY_MESSAGE.contains(word), "{word}");
         }
         assert!(mock_key_reads().lock().unwrap().is_empty());
         drop(guard);
         assert!(lock_backend(&state, "refresh_domains").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn busy_foreground_operation_runs_once_the_previous_one_ends() {
+        let (_server, backend, _dir) = fixture().await;
+        let state = AppState(Mutex::new(backend));
+        let guard = state.0.lock().await;
+        let (result, _) = tokio::join!(lock_backend(&state, "prepare_domain"), async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            drop(guard);
+        });
+        assert!(result.is_ok());
     }
 
     #[tokio::test]
@@ -9480,7 +10951,7 @@ mod tests {
         let zone_check = &prepared["checks"][1];
         assert_eq!(zone_check["label"], "云端域名归属");
         assert!(zone_check["message"].as_str().unwrap().contains("HTTP 403"));
-        assert!(zone_check.get("reason").is_none());
+        assert_eq!(zone_check["reason"], CLOUD_REFUSED);
 
         // A readable zone in the wrong state keeps the ownership wording.
         server.reset().await;
@@ -9528,7 +10999,7 @@ mod tests {
         let message = dns["message"].as_str().unwrap();
         assert!(message.starts_with("无法读取 DNS 记录："), "{message}");
         assert!(message.contains("HTTP 403"), "{message}");
-        assert!(dns.get("reason").is_none());
+        assert_eq!(dns["reason"], CLOUD_REFUSED);
         assert!(checks
             .iter()
             .any(|check| check["label"] == "转发规则" && check["level"] == "pass"));
@@ -9538,6 +11009,143 @@ mod tests {
             .unwrap()
             .iter()
             .any(|request| request.method.as_str() == "HEAD"));
+    }
+
+    /// The checks that fail because this computer cannot use the saved
+    /// authorization carry `credential`; a 401 or 403 answer carries
+    /// `cloud_refused`. Both in domain and DNS preparation.
+    #[tokio::test]
+    async fn preparation_marks_local_authorization_and_cloud_refusals() {
+        let (server, mut backend, _dir) = fixture().await;
+        for action in ["prepare_domain", "prepare_domain_dns"] {
+            backend.db.accounts[0].token_import_pending = true;
+            let prepared = backend
+                .dispatch(action, &json!({"input":"example.com","prefix":"go"}))
+                .await
+                .unwrap();
+            let check = prepared["checks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|c| c["label"] == "本机授权")
+                .unwrap_or_else(|| panic!("{action}: {prepared}"));
+            assert_eq!(check["level"], "error");
+            assert_eq!(check["reason"], CREDENTIAL, "{action}");
+            backend.db.accounts[0].token_import_pending = false;
+
+            keyring_delete("acct1", "token").unwrap();
+            let prepared = backend
+                .dispatch(action, &json!({"input":"example.com","prefix":"go"}))
+                .await
+                .unwrap();
+            let check = prepared["checks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|c| c["label"] == "凭据")
+                .unwrap_or_else(|| panic!("{action}: {prepared}"));
+            assert_eq!(check["reason"], CREDENTIAL, "{action}");
+            keyring_set("acct1", "token", "test-token-value").unwrap();
+        }
+        assert!(server.received_requests().await.unwrap().is_empty());
+
+        // HTTP 401 on the zone read, and on the DNS read of a DNS check.
+        Mock::given(method("GET"))
+            .and(path("/client/v4/zones/zone1"))
+            .respond_with(ResponseTemplate::new(401))
+            .up_to_n_times(2)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        mount_zone_owner(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/client/v4/zones/zone1/dns_records"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/client/v4/zones/zone1/workers/routes"))
+            .respond_with(ok(json!([])))
+            .mount(&server)
+            .await;
+        for action in ["prepare_domain", "prepare_domain_dns"] {
+            let prepared = backend
+                .dispatch(action, &json!({"input":"example.com","prefix":"go"}))
+                .await
+                .unwrap();
+            let check = prepared["checks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|c| c["label"] == "云端域名归属")
+                .unwrap();
+            assert!(check["message"].as_str().unwrap().contains("HTTP 401"));
+            assert_eq!(check["reason"], CLOUD_REFUSED, "{action}");
+        }
+        let prepared = backend
+            .dispatch("prepare_domain_dns", &json!({"input":"example.com"}))
+            .await
+            .unwrap();
+        let dns = prepared["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["label"] == "DNS")
+            .unwrap();
+        assert!(dns["message"].as_str().unwrap().contains("HTTP 401"));
+        assert_eq!(dns["reason"], CLOUD_REFUSED);
+        // The DNS check reads the zone's whole record list a second time
+        // (the safety check before a fix). A 403 there is a refusal too,
+        // both with no address record and with an unproxied one.
+        let grey = json!({"id":"dns-one","name":"example.com","type":"A",
+            "content":"192.0.2.10","proxied":false,"proxiable":true});
+        for exact in [json!([]), json!([grey])] {
+            server.reset().await;
+            mount_zone_owner(&server).await;
+            Mock::given(method("GET"))
+                .and(path("/client/v4/zones/zone1/dns_records"))
+                .and(query_param("name", "example.com"))
+                .respond_with(ok(exact.clone()))
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/client/v4/zones/zone1/dns_records"))
+                .and(query_param_is_missing("name"))
+                .respond_with(ResponseTemplate::new(403))
+                .mount(&server)
+                .await;
+            let prepared = backend
+                .dispatch("prepare_domain_dns", &json!({"input":"example.com"}))
+                .await
+                .unwrap();
+            assert_eq!(prepared["canApply"], false, "{exact}");
+            let dns = prepared["checks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|c| c["label"] == "DNS")
+                .unwrap_or_else(|| panic!("{exact}: {prepared}"));
+            assert!(
+                dns["message"].as_str().unwrap().contains("HTTP 403"),
+                "{dns}"
+            );
+            assert_eq!(dns["reason"], CLOUD_REFUSED, "{exact}");
+        }
+        // A 500 is neither.
+        server.reset().await;
+        Mock::given(method("GET"))
+            .and(path("/client/v4/zones/zone1"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let prepared = backend
+            .dispatch(
+                "prepare_domain",
+                &json!({"input":"example.com","prefix":"go"}),
+            )
+            .await
+            .unwrap();
+        assert!(prepared["checks"][1].get("reason").is_none(), "{prepared}");
     }
 
     #[tokio::test]
@@ -10146,9 +11754,14 @@ mod tests {
                 {"name":"example.com","type":"TXT","proxied":false}])))
             .mount(&server)
             .await;
+        // A complete earlier setup of this host (config plus this tool's
+        // route, under another directory) is not on this computer.
         Mock::given(method("GET"))
             .and(path("/client/v4/zones/zone1/workers/routes"))
-            .respond_with(ok(json!([])))
+            .respond_with(ok(
+                json!([{"id":"route-old","pattern":"example.com/other/*",
+                "script":"edge-one"}]),
+            ))
             .mount(&server)
             .await;
         Mock::given(method("HEAD"))
@@ -10188,6 +11801,10 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.contains("已有此主机名"));
+        assert!(
+            error.contains("“管理账户”，点“从 Cloudflare 找回配置”"),
+            "{error}"
+        );
         let requests = server.received_requests().await.unwrap();
         assert!(!requests
             .iter()
@@ -10739,6 +12356,47 @@ mod tests {
             .any(|id| id.contains("acct2")));
     }
 
+    /// A pool recorded as synced whose cloud copy is gone: saving a link says
+    /// how to re-create the copy (「编辑地址」→ save) and writes nothing.
+    #[tokio::test]
+    async fn link_save_on_a_synced_pool_missing_in_the_cloud_names_the_way_out() {
+        let (server, mut backend, _dir) = fixture().await;
+        backend.db.domains.push(domain());
+        let mut pool = sample_pool();
+        pool.sync_status = vec![PoolSyncStatus {
+            account_id: "acct1".into(),
+            status: "synced".into(),
+            message: "已同步".into(),
+        }];
+        backend.db.pools.push(pool);
+        mount_resource(&server, include_str!("../../edge/worker.mjs")).await;
+        mount_owned_domain(&server).await;
+        Mock::given(method("GET"))
+            .and(path_regex("/values/(p%3Apool1|l%3Aexample.com%3Aglobal)$"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        let plan = backend.prepare_change(&json!({"kind":"save_link","domainId":"domain1","slug":"global","poolId":"pool1","code":"DEMO"})).unwrap();
+        let error = backend
+            .dispatch("apply_plan", &json!({"planId":plan["id"]}))
+            .await
+            .unwrap_err();
+        assert_eq!(error, POOL_COPY_MISSING_FOR_LINK);
+        assert!(
+            error.contains("「平台地址」页点这组地址的「编辑地址」"),
+            "{error}"
+        );
+        assert!(error.contains("不用改内容，直接保存一次"), "{error}");
+        assert!(backend.db.links.is_empty());
+        assert!(backend.db.pending_pool_changes.is_empty());
+        assert!(!server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .any(|r| matches!(r.method.as_str(), "PUT" | "POST" | "DELETE")));
+    }
+
     #[tokio::test]
     async fn global_pool_failed_first_use_keeps_intent_and_does_not_write_link() {
         let (server, mut backend, _dir) = fixture().await;
@@ -10789,6 +12447,78 @@ mod tests {
         backend.apply_save_pool(pending).await.unwrap();
         assert!(backend.db.pending_pool_changes.is_empty());
         assert_eq!(backend.db.pools[0].sync_status[0].status, "synced");
+        assert!(server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .all(|r| r.method.as_str() == "GET"));
+    }
+
+    /// The cloud copy of a pool this computer records as synced went missing:
+    /// saving it again without changes re-creates the copy, and deleting it
+    /// counts that account as already done.
+    #[tokio::test]
+    async fn pool_whose_synced_cloud_copy_is_missing_can_be_saved_or_deleted() {
+        let (server, mut backend, _dir) = fixture().await;
+        let mut pool = sample_pool();
+        pool.sync_status = vec![PoolSyncStatus {
+            account_id: "acct1".into(),
+            status: "synced".into(),
+            message: "已同步".into(),
+        }];
+        backend.db.pools.push(pool.clone());
+        backend.persist().unwrap();
+        mount_resource(&server, include_str!("../../edge/worker.mjs")).await;
+        Mock::given(method("GET"))
+            .and(path_regex("/values/p%3Apool1$"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path_regex("/values/p%3Apool1$"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        // The edit form sends the same content back; preparing accepts it.
+        let plan = backend
+            .prepare_change(&json!({"kind":"save_pool","pool":pool}))
+            .unwrap();
+        backend
+            .dispatch("apply_plan", &json!({"planId":plan["id"]}))
+            .await
+            .unwrap();
+        assert!(backend.db.pending_pool_changes.is_empty());
+        assert!(backend.db.pending_operations.is_empty());
+        assert_eq!(backend.db.pools[0].sync_status[0].status, "synced");
+        let puts: Vec<_> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.method.as_str() == "PUT")
+            .collect();
+        assert_eq!(puts.len(), 1);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&puts[0].body).unwrap(),
+            pools::cloud_value(&backend.db.pools[0])
+        );
+        server.reset().await;
+
+        mount_resource(&server, include_str!("../../edge/worker.mjs")).await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/client/v4/accounts/acct1/storage/kv/namespaces/ns1/keys",
+            ))
+            .and(query_param("prefix", "l:"))
+            .respond_with(ok(json!([])))
+            .mount(&server)
+            .await;
+        backend.apply_delete_pool("pool1").await.unwrap();
+        assert!(backend.db.pools.is_empty());
+        assert!(backend.db.pending_pool_changes.is_empty());
+        assert!(backend.db.pending_operations.is_empty());
         assert!(server
             .received_requests()
             .await
@@ -12290,11 +14020,10 @@ mod tests {
             .up_to_n_times(1)
             .mount(&server)
             .await;
-        assert!(backend
-            .apply_cleanup("acct1")
-            .await
-            .unwrap_err()
-            .contains("503"));
+        let error = backend.apply_cleanup("acct1").await.unwrap_err();
+        assert!(error.contains("503"), "{error}");
+        // A later cleanup finishes it, so the error says so.
+        assert!(error.ends_with(CLEANUP_RETRY_HINT), "{error}");
         assert!(backend.db.accounts[0].resources.is_some());
         assert_eq!(backend.db.pending_operations.len(), 1);
         assert!(!store.lock().unwrap().contains_key("h:pool1"));
@@ -12310,6 +14039,124 @@ mod tests {
             1
         );
     }
+    /// A cleanup that started its own record and deleted nothing ends that
+    /// record on failure; a record from an earlier run is kept.
+    #[tokio::test]
+    async fn cleanup_that_deleted_nothing_ends_its_own_record() {
+        // The re-read after the record was written fails.
+        for resumed in [false, true] {
+            let (server, mut backend, _dir) = fixture().await;
+            mount_cleanup_cloud(&server, vec![("h:pool1", cleanup_health())]).await;
+            let reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            Mock::given(method("GET"))
+                .and(path(
+                    "/client/v4/accounts/acct1/storage/kv/namespaces/ns1/values/h%3Apool1",
+                ))
+                .respond_with(move |_: &wiremock::Request| {
+                    if reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= 2 {
+                        ResponseTemplate::new(500)
+                    } else {
+                        ResponseTemplate::new(200).set_body_string(cleanup_health())
+                    }
+                })
+                .mount(&server)
+                .await;
+            let earlier = "清理账号 acct1 (old)：Worker 删除结果不确定，请核对后继续清理";
+            if resumed {
+                backend.db.pending_operations = vec![earlier.into()];
+                backend.persist().unwrap();
+            }
+            let error = backend.apply_cleanup("acct1").await.unwrap_err();
+            assert!(error.contains("遗留检测数据无法再次核实"), "{error}");
+            assert!(server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .all(|r| r.method.as_str() == "GET"));
+            let saved: Database =
+                serde_json::from_slice(&std::fs::read(&backend.path).unwrap()).unwrap();
+            if resumed {
+                assert_eq!(backend.db.pending_operations.len(), 1);
+                assert!(backend.db.pending_operations[0].starts_with("清理账号 acct1 (old)："));
+                assert!(!error.contains(CLEANUP_NOTHING_DELETED), "{error}");
+                assert!(error.ends_with(CLEANUP_RETRY_HINT), "{error}");
+            } else {
+                assert!(error.contains(CLEANUP_NOTHING_DELETED), "{error}");
+                assert!(backend.db.pending_operations.is_empty());
+            }
+            assert_eq!(saved.pending_operations, backend.db.pending_operations);
+        }
+
+        // The first delete is the Worker's and it is refused.
+        let (server, mut backend, _dir) = fixture().await;
+        mount_cleanup_cloud(&server, vec![]).await;
+        Mock::given(method("DELETE"))
+            .and(path("/client/v4/accounts/acct1/workers/scripts/edge-one"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&server)
+            .await;
+        let error = backend.apply_cleanup("acct1").await.unwrap_err();
+        assert!(error.contains("HTTP 403"), "{error}");
+        assert!(error.contains(CLEANUP_NOTHING_DELETED), "{error}");
+        assert!(backend.db.pending_operations.is_empty());
+        assert!(backend.db.accounts[0].resources.is_some());
+        drop((server, backend, _dir));
+
+        // A refused first metadata delete deleted nothing either.
+        let (server, mut backend, _dir) = fixture().await;
+        mount_cleanup_cloud(&server, vec![("h:pool1", cleanup_health())]).await;
+        Mock::given(method("DELETE"))
+            .and(path(
+                "/client/v4/accounts/acct1/storage/kv/namespaces/ns1/values/h%3Apool1",
+            ))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&server)
+            .await;
+        let error = backend.apply_cleanup("acct1").await.unwrap_err();
+        assert!(error.contains(CLEANUP_NOTHING_DELETED), "{error}");
+        assert!(backend.db.pending_operations.is_empty());
+    }
+
+    #[test]
+    fn cleanup_worker_delete_that_never_connected_is_not_called_refused() {
+        let never_sent = CloudError {
+            message: "连不上云端，这一步没有发出去，请检查网络后重试".into(),
+            uncertain: false,
+            network: true,
+        };
+        let (note, error) = cleanup_worker_delete_failure(&never_sent, false);
+        let note = note.unwrap();
+        assert!(!note.contains("被拒绝"), "{note}");
+        assert!(note.contains("连不上云端"), "{note}");
+        assert!(!error.contains("被拒绝"), "{error}");
+        assert!(error.contains("没有发出去"), "{error}");
+        assert!(error.ends_with(CLEANUP_RETRY_HINT), "{error}");
+        // Nothing deleted yet: the record is ended and the text says so.
+        let (note, error) = cleanup_worker_delete_failure(&never_sent, true);
+        assert!(note.is_none());
+        assert!(error.contains(CLEANUP_NOTHING_DELETED), "{error}");
+        assert!(error.ends_with(CLEANUP_RETRY_HINT), "{error}");
+        // A real refusal after earlier deletes keeps its wording.
+        let refused = CloudError {
+            message: "云端请求失败（HTTP 403），请检查令牌权限与资源状态".into(),
+            uncertain: false,
+            network: false,
+        };
+        let (note, error) = cleanup_worker_delete_failure(&refused, false);
+        assert_eq!(note, Some("Worker 删除被拒绝，账号清理尚未完成"));
+        assert_eq!(error, refused.message);
+        // An uncertain delete always keeps the record.
+        let unclear = CloudError {
+            message: "云端写入结果不确定".into(),
+            uncertain: true,
+            network: true,
+        };
+        let (note, error) = cleanup_worker_delete_failure(&unclear, true);
+        assert_eq!(note, Some("Worker 删除结果不确定，请核对后继续清理"));
+        assert!(error.ends_with(CLEANUP_RETRY_HINT), "{error}");
+    }
+
     pub(super) async fn mount_recovery_without_pool(server: &MockServer, with_link: bool) {
         mount_resource(server, include_str!("../../edge/worker.mjs")).await;
         mount_owned_domain(server).await;
@@ -12362,6 +14209,48 @@ mod tests {
             .respond_with(ok(json!({"schedules":[]})))
             .mount(server)
             .await;
+    }
+
+    /// Two routes of this tool for one host: recovery names both patterns and
+    /// changes nothing on this computer. Other invalid routes keep the old
+    /// sentence.
+    #[tokio::test]
+    async fn recovery_with_two_own_routes_for_one_host_names_both_and_changes_nothing() {
+        for (routes, expected) in [
+            (
+                json!([{"id":"route1","pattern":"example.com/go/*","script":"edge-one"},
+                    {"id":"route2","pattern":"example.com/other/*","script":"edge-one"}]),
+                "域名 example.com 上有两条本工具的转发规则（example.com/go/*、example.com/other/*），没法确定该用哪一条，所以这次没有找回，本机记录没有改动。请联系维护的人处理",
+            ),
+            (
+                json!([{"id":"route1","pattern":"example.org/go/*","script":"edge-one"}]),
+                "此 Worker 的路由无效或主机名重复，停止找回以保留现有记录",
+            ),
+        ] {
+            let (server, mut backend, _dir) = fixture().await;
+            backend.db.domains.push(domain());
+            backend.db.pending_operations = vec!["添加域名 example.com (v)：旧记录".into()];
+            backend.persist().unwrap();
+            let before = serde_json::to_value(&backend.db).unwrap();
+            let before_disk = std::fs::read(&backend.path).unwrap();
+            Mock::given(method("GET"))
+                .and(path("/client/v4/zones/zone1/workers/routes"))
+                .respond_with(ok(routes))
+                .with_priority(1)
+                .mount(&server)
+                .await;
+            mount_recovery_without_pool(&server, false).await;
+            let error = backend.recover_account("acct1").await.unwrap_err();
+            assert_eq!(error, expected);
+            assert_eq!(serde_json::to_value(&backend.db).unwrap(), before);
+            assert_eq!(std::fs::read(&backend.path).unwrap(), before_disk);
+            assert!(!server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .any(|r| matches!(r.method.as_str(), "PUT" | "POST" | "DELETE")));
+        }
     }
 
     #[tokio::test]

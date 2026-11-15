@@ -389,8 +389,27 @@ async fn service_failure_stops_the_import_and_is_not_called_a_permission_problem
         .unwrap_err();
     assert!(error.contains("HTTP 500"));
     assert!(!error.contains("缺少"));
+    // With several accounts the failure names the one it was about.
+    assert!(
+        error.starts_with("读取账户「Example Account」时出错："),
+        "{error}"
+    );
+    assert!(error.contains("这次一个账户都没有导入"), "{error}");
     assert!(keyring_get("acct3", "token").is_err());
     assert_eq!(backend.database_snapshot(), before);
+}
+
+#[tokio::test]
+async fn service_failure_of_a_single_account_keeps_its_plain_message() {
+    let (server, mut backend, _guard) = tests::fixture().await;
+    backend.persist().unwrap();
+    authorize_except(&server, &["acct2"], &["acct2"], 500).await;
+    let error = backend
+        .import_token(&"n".repeat(35), false, None)
+        .await
+        .unwrap_err();
+    assert!(error.contains("HTTP 500"));
+    assert!(!error.contains("读取账户「"), "{error}");
 }
 
 #[tokio::test]

@@ -86,3 +86,17 @@ it("keeps detail buttons disabled while the overview is still reading", () => {
   fireEvent.click(ready);
   expect(onOpenLinkStats).toHaveBeenCalledWith(items[0].link, items[0].domain);
 });
+
+it("keeps statistics text at 11px or larger", async () => {
+  // Vitest blanks imported CSS, so read the source files; the module names are
+  // kept dynamic because the app's type setup has no Node typings.
+  const [fsModule, processModule] = ["node:fs", "node:process"];
+  const { readFileSync } = await import(/* @vite-ignore */ fsModule);
+  const { cwd } = await import(/* @vite-ignore */ processModule);
+  for (const name of ["StatsCenter.css", "StatsAllLinks.css", "ClickStats.css"]) {
+    const css: string = readFileSync(`${cwd()}/src/${name}`, "utf8");
+    const sizes = [...css.matchAll(/font-size:\s*([\d.]+)px/g)].map((match) => Number(match[1]));
+    expect(sizes.length, name).toBeGreaterThan(0);
+    expect(sizes.filter((size) => size < 11), name).toEqual([]);
+  }
+});

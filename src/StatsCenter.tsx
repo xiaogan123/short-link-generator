@@ -3,6 +3,7 @@ import { ArrowClockwise, ArrowSquareOut, CaretLeft, CaretRight } from "@phosphor
 import { dispatch, errorMessage, preview } from "./bridge";
 import type {
   Account,
+  Action,
   ClickStatsDays,
   ClickStatsTotals,
   Domain,
@@ -23,9 +24,54 @@ const ranges: { value: ClickStatsDays; label: string }[] = [
   { value: 30, label: "近 30 天" },
 ];
 
+const BUSY_RETRY_DELAY_MS = 2_000;
+const BUSY_RETRY_LIMIT = 5;
+export const STATS_BUSY_GIVE_UP = "后台还在忙，请过一会儿再点『读取统计』。";
+// After an overview finishes, the read button is labelled "刷新统计".
+const OVERVIEW_BUSY_GIVE_UP = "后台还在忙，请过一会儿再点『刷新统计』。";
+export const STATS_BUSY_WAITING = "上一次读取还在收尾，稍等…";
+
+/** The backend's "still finishing the previous operation" reply: wait, then retry. */
+export function isBusyError(message: string) {
+  return /^上一个操作(还没结束|仍在进行)/.test(message.trim());
+}
+
+/** Busy, network or expired-session failures: retrying may help; nothing needs disabling. */
+export function isTemporaryReadError(message: string) {
+  return isBusyError(message) || /后台还在忙|网络|超时|连不上|会话已过期/.test(message);
+}
+
+/**
+ * Sends a read and, while the backend is still finishing an earlier request
+ * (for example right after "停止等待"), waits 2 seconds and sends it again,
+ * at most 5 times (or `retries` times). Then throws `giveUp`.
+ *
+ * The backend itself waits up to 8 seconds (BUSY_WAIT in src-tauri/src/lib.rs)
+ * before each busy reply, so in the worst case 6 tries take about
+ * 6 x 8 s + 5 x 2 s, close to a minute, before `giveUp` is shown.
+ */
+export async function readWhenFree<T>(
+  action: Action,
+  payload: Record<string, unknown>,
+  options: { alive: () => boolean; onWait?: () => void; giveUp: string; retries?: number },
+): Promise<T> {
+  const limit = options.retries ?? BUSY_RETRY_LIMIT;
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      return await dispatch<T>(action, payload);
+    } catch (error) {
+      if (!isBusyError(errorMessage(error)) || !options.alive()) throw error;
+      if (attempt >= limit) throw new Error(options.giveUp);
+      options.onWait?.();
+      await new Promise<void>((resolve) => window.setTimeout(resolve, BUSY_RETRY_DELAY_MS));
+      if (!options.alive()) throw error;
+    }
+  }
+}
+
 type ViewState =
   | { kind: "idle"; message?: string }
-  | { kind: "loading" }
+  | { kind: "loading"; waiting?: boolean }
   | { kind: "report"; report: StatsCenterReport }
   | { kind: "error"; message: string };
 
@@ -34,7 +80,26 @@ type OverviewEntry =
   | { kind: "migration" }
   | { kind: "token-recovery" }
   | { kind: "error"; message: string };
-type OverviewState = { kind: "idle" | "loading" | "complete"; entries: Record<string, OverviewEntry>; completed: number; identity?: string; stopped?: boolean; progress?: {accountId:string;page:number;pages:number} };
+type OverviewState = { kind: "idle" | "loading" | "complete"; entries: Record<string, OverviewEntry>; completed: number; identity?: string; stopped?: boolean; readAt?: string; progress?: {accountId:string;page:number;pages:number;waiting?:boolean} };
+
+const idleOverview = (): OverviewState => ({ kind: "idle", entries: {}, completed: 0 });
+
+// Finished overviews survive leaving the page or drilling into an account for
+// this app run only. A changed account, domain, link set or revision misses.
+let overviewCache: { identity: string; byDays: Map<ClickStatsDays, OverviewState> } | null = null;
+let lastDays: ClickStatsDays = 7;
+function cachedOverview(identity: string, days: ClickStatsDays) {
+  return overviewCache?.identity === identity ? overviewCache.byDays.get(days) : undefined;
+}
+function rememberOverview(identity: string, days: ClickStatsDays, state: OverviewState) {
+  if (overviewCache?.identity !== identity) overviewCache = { identity, byDays: new Map() };
+  overviewCache.byDays.set(days, state);
+}
+/** Test helper: forget overviews kept for this app run. */
+export function resetStatsCenterCache() {
+  overviewCache = null;
+  lastDays = 7;
+}
 
 type Props = {
   accounts: Account[];
@@ -44,7 +109,7 @@ type Props = {
   busy?: boolean;
   configurationError?: { accountId: string; message: string } | null;
   onConfigure: (account: Account, enabled: boolean) => void;
-  onOpenLinkStats: (link: Link, domain: Domain) => void;
+  onOpenLinkStats: (link: Link, domain: Domain, days: ClickStatsDays) => void;
   onScopeInvalidate?: () => void;
 };
 
@@ -210,14 +275,16 @@ export default function StatsCenter({
 }: Props) {
   const [accountId, setAccountId] = useState("");
   const [domainId, setDomainId] = useState("");
-  const [days, setDays] = useState<ClickStatsDays>(7);
+  const [days, setDays] = useState<ClickStatsDays>(() => lastDays);
   const [page, setPage] = useState(1);
   const [view, setView] = useState<ViewState>({ kind: "idle" });
-  const [overview, setOverview] = useState<OverviewState>({ kind: "idle", entries: {}, completed: 0 });
+  const [overview, setOverview] = useState<OverviewState>(idleOverview);
   const [knownTotalLinks, setKnownTotalLinks] = useState<number | null>(null);
   const [openerError, setOpenerError] = useState("");
   const requestSequence = useRef(0);
   const readSession = useRef<string|undefined>(undefined);
+  // Every page of one account, already read by the overview: page locally.
+  const localRows = useRef<{ accountId: string; days: ClickStatsDays; report: StatsCenterReport; rows: StatsCenterRow[] } | null>(null);
   const mounted = useRef(false);
   const onScopeInvalidateRef = useRef(onScopeInvalidate);
   onScopeInvalidateRef.current = onScopeInvalidate;
@@ -242,8 +309,9 @@ export default function StatsCenter({
   function invalidate(clearCount = true) {
     requestSequence.current += 1;
     readSession.current = undefined;
+    localRows.current = null;
     setView({ kind: "idle" });
-    setOverview({ kind: "idle", entries: {}, completed: 0 });
+    setOverview(idleOverview());
     setOpenerError("");
     if (clearCount) setKnownTotalLinks(null);
   }
@@ -260,8 +328,9 @@ export default function StatsCenter({
   useEffect(() => {
     requestSequence.current += 1;
     readSession.current = undefined;
+    localRows.current = null;
     setView({ kind: "idle" });
-    setOverview({ kind: "idle", entries: {}, completed: 0 });
+    setOverview(cachedOverview(dataIdentity, days) ?? idleOverview());
     setKnownTotalLinks(null);
     setPage(1);
     if (accountId && !accounts.some((account) => account.id === accountId)) {
@@ -280,10 +349,18 @@ export default function StatsCenter({
     setAccountId(nextAccountId);
     setDomainId("");
     setPage(1);
+    if (!nextAccountId) {
+      const kept = cachedOverview(dataIdentity, days);
+      if (kept) setOverview(kept);
+    }
     if (cached?.kind === "report" && cached.report.domainId === null && cached.report.days === days && cached.report.page === 1) {
       readSession.current = cached.report.readSessionId;
       setKnownTotalLinks(cached.report.totalLinks);
       setView({ kind: "report", report: cached.report });
+      const scope = overviewScopeLinks(nextAccountId, domains, links);
+      if (!cached.detailError && cached.allRows.length === scope.length && cached.report.totalLinks === scope.length) {
+        localRows.current = { accountId: nextAccountId, days, report: cached.report, rows: cached.allRows };
+      }
     }
   };
   const chooseDomain = (nextDomainId: string) => {
@@ -296,11 +373,26 @@ export default function StatsCenter({
     onScopeInvalidate?.();
     invalidate();
     setDays(nextDays);
+    lastDays = nextDays;
     setPage(1);
+    if (!currentAccount) {
+      const kept = cachedOverview(dataIdentity, nextDays);
+      if (kept) setOverview(kept);
+    }
   };
 
   const load = async (requestedPage = 1, continuation = false) => {
     if (!currentAccount || currentAccount.needsCredentialMigration || currentAccount.needsTokenRecovery) return;
+    const local = localRows.current;
+    if (continuation && local && local.accountId === currentAccount.id && local.days === days && !effectiveDomainId) {
+      // The overview already read every page of this account: no request.
+      requestSequence.current += 1;
+      setPage(requestedPage);
+      setOpenerError("");
+      setView({ kind: "report", report: { ...local.report, page: requestedPage, rows: local.rows.slice((requestedPage - 1) * PAGE_SIZE, requestedPage * PAGE_SIZE) } });
+      return;
+    }
+    if (!continuation) localRows.current = null;
     const sessionId = continuation ? readSession.current : undefined;
     if (!continuation) readSession.current = undefined;
     const expected = {
@@ -311,18 +403,19 @@ export default function StatsCenter({
     };
     const sequence = ++requestSequence.current;
     const requestDataIdentity = dataIdentity;
+    const alive = () => mounted.current && sequence === requestSequence.current && requestDataIdentity === latestDataIdentity.current;
     setPage(requestedPage);
     setView({ kind: "loading" });
     setOpenerError("");
     try {
-      const report = await dispatch<StatsCenterReport>("get_stats_center", {
+      const report = await readWhenFree<StatsCenterReport>("get_stats_center", {
         accountId: expected.accountId,
         ...(expected.domainId ? { domainId: expected.domainId } : {}),
         days: expected.days,
         page: requestedPage,
         pageSize: PAGE_SIZE,
         ...(sessionId ? {readSessionId:sessionId} : {}),
-      });
+      }, { alive, giveUp: STATS_BUSY_GIVE_UP, onWait: () => setView({ kind: "loading", waiting: true }) });
       if (!mounted.current || sequence !== requestSequence.current || requestDataIdentity !== latestDataIdentity.current) return;
       if (!validReport(report, expected, domains, links) || (sessionId !== undefined && report.readSessionId !== sessionId)) {
         readSession.current = undefined;
@@ -362,6 +455,26 @@ export default function StatsCenter({
     const publishProgress = () => {
       if (current()) setOverview({ kind: "loading", entries: { ...entries }, completed, identity: requestDataIdentity, progress });
     };
+    // Once one read has used up its waits, later reads try once each, so a
+    // backend that stays busy does not cost a full wait per account.
+    let gaveUp = false;
+    const read = async (payload: Record<string, unknown>) => {
+      try {
+        const report = await readWhenFree<StatsCenterReport>("get_stats_center", payload, {
+          alive: current,
+          giveUp: OVERVIEW_BUSY_GIVE_UP,
+          retries: gaveUp ? 0 : undefined,
+          onWait: () => { if (progress) progress = { ...progress, waiting: true }; publishProgress(); },
+        });
+        gaveUp = false;
+        return report;
+      } catch (error) {
+        if (errorMessage(error) === OVERVIEW_BUSY_GIVE_UP) gaveUp = true;
+        throw error;
+      } finally {
+        if (progress?.waiting) progress = { ...progress, waiting: false };
+      }
+    };
     for (const account of accounts) {
       if (!current()) return;
       let entry: OverviewEntry;
@@ -375,7 +488,7 @@ export default function StatsCenter({
         progress = {accountId:account.id,page:1,pages:Math.max(1,Math.ceil(scope.length/PAGE_SIZE))};
         publishProgress();
         try {
-          const report = await dispatch<StatsCenterReport>("get_stats_center", {
+          const report = await read({
             accountId: account.id, days, page: 1, pageSize: PAGE_SIZE,
           });
           if (!current()) return;
@@ -387,22 +500,35 @@ export default function StatsCenter({
             publishProgress();
             // Bound the queue by current local identities, never a remote count.
             const pages = Math.ceil(scope.length / PAGE_SIZE);
+            let sessionId = report.readSessionId;
             for (let nextPage = 2; nextPage <= pages; nextPage += 1) {
               if (!current()) return;
               progress = {accountId:account.id,page:nextPage,pages};
               publishProgress();
               try {
-                const next = await dispatch<StatsCenterReport>("get_stats_center", {
+                const pagePayload = (id?: string) => ({
                   accountId: account.id, days, page: nextPage, pageSize: PAGE_SIZE,
-                  ...(report.readSessionId ? {readSessionId:report.readSessionId} : {}),
+                  ...(id ? {readSessionId:id} : {}),
                 });
+                let requestedSession = sessionId;
+                let next: StatsCenterReport;
+                try {
+                  next = await read(pagePayload(requestedSession));
+                } catch (error) {
+                  // An expired session only ends the snapshot: reread this page
+                  // without it, then follow the new session for later pages.
+                  if (!current() || !requestedSession || !errorMessage(error).includes(SESSION_EXPIRED)) throw error;
+                  requestedSession = undefined;
+                  next = await read(pagePayload());
+                }
                 if (!current()) return;
                 if (!validReport(next, { ...expected, page: nextPage }, domains, links)
-                  || (report.readSessionId !== undefined && next.readSessionId !== report.readSessionId)
+                  || (requestedSession !== undefined && next.readSessionId !== requestedSession)
                   || !completeOverviewPage(next, scope)
                   || (next.status !== "ready" && next.status !== "no_data")) {
                   throw new Error("部分链接明细未能完整读取，请刷新重试。未读取的链接不显示为零。");
                 }
+                sessionId = next.readSessionId;
                 // Each page repeats the full-scope summary. Keep only the first
                 // summary; append validated, disjoint local-link pages only.
                 entry = { ...entry, allRows: [...entry.allRows, ...(next.rows || [])] };
@@ -424,12 +550,20 @@ export default function StatsCenter({
       completed += 1;
       publishProgress();
     }
-    if (current()) setOverview({ kind: "complete", entries: { ...entries }, completed: accounts.length, identity: requestDataIdentity });
+    if (current()) {
+      const finished: OverviewState = { kind: "complete", entries: { ...entries }, completed: accounts.length, identity: requestDataIdentity, readAt: new Date().toISOString() };
+      rememberOverview(requestDataIdentity, days, finished);
+      setOverview(finished);
+    }
   };
 
   const stopOverview = () => {
     requestSequence.current += 1;
-    setOverview((state) => ({ ...state, kind: "complete", stopped: true }));
+    setOverview((state) => {
+      const stopped: OverviewState = { ...state, kind: "complete", stopped: true, progress: undefined, readAt: new Date().toISOString() };
+      if (stopped.identity === latestDataIdentity.current) rememberOverview(stopped.identity, days, stopped);
+      return stopped;
+    });
   };
 
   const openTokenSettings = async () => {
@@ -456,6 +590,7 @@ export default function StatsCenter({
     }
   };
 
+  const openLinkStats = (link: Link, domain: Domain) => onOpenLinkStats(link, domain, days);
   const report = view.kind === "report" ? view.report : undefined;
   const rows = report?.rows || [];
   const pageCount = Math.max(1, Math.ceil((knownTotalLinks || 0) / PAGE_SIZE));
@@ -463,7 +598,7 @@ export default function StatsCenter({
   const configurationNeedsAnalyticsRead = /AccountAnalyticsRead|Account Analytics Read|账户分析|帐户分析|统计读取权限|analytics.*read/i.test(visibleConfigurationError);
   const canConfigure = Boolean(currentAccount && !currentAccount.needsCredentialMigration && !currentAccount.needsTokenRecovery && !busy);
   const configurationMode = report?.status === "disabled" ? "enable"
-    : report?.status === "no_data" || view.kind === "error" ? "check-disable"
+    : report?.status === "no_data" || (view.kind === "error" && !isTemporaryReadError(view.message)) ? "check-disable"
       : report ? "disable"
         : null;
   const scopeLabel = currentDomain
@@ -495,11 +630,18 @@ export default function StatsCenter({
 
   const body = (() => {
     if (accounts.length === 0) return <Notice title="还没有可查询的账户" tone="warning">请先导入一个 Cloudflare 账户，再从这里读取访问统计。</Notice>;
-    if (!currentAccount) return <AccountsOverview accounts={accounts} domains={domains} links={links} days={days} overview={overview} onSelect={chooseAccount} onOpenLinkStats={onOpenLinkStats} onStop={stopOverview} />;
+    if (!currentAccount) return <AccountsOverview accounts={accounts} domains={domains} links={links} days={days} overview={overview} onSelect={chooseAccount} onOpenLinkStats={openLinkStats} onStop={stopOverview} />;
     if (currentAccount.needsTokenRecovery) return <Notice title="令牌导入未完成" tone="warning">请到“Cloudflare 账户”重试导入或更新令牌，再读取统计。</Notice>;
     if (currentAccount.needsCredentialMigration) return <Notice title="需要先更新本机授权" tone="warning">请先到“Cloudflare 账户”完成此账户的本机授权迁移，再读取或配置访问统计。</Notice>;
-    if (view.kind === "loading") return <div className="scenter-loading" role="status">正在读取所选账户的第 {page} 页统计…</div>;
-    if (view.kind === "error") return <Notice title="统计读取失败" tone="error">{view.message || "操作未完成，请重试。"}</Notice>;
+    if (view.kind === "loading") return <div className="scenter-loading" role="status">{view.waiting ? STATS_BUSY_WAITING : `正在读取所选账户的第 ${page} 页统计…`}</div>;
+    if (view.kind === "error") return (
+      <Notice title="统计读取失败" tone="error">
+        <p>{view.message || "操作未完成，请重试。"}</p>
+        <div className="scenter-notice-actions">
+          <button type="button" className="button bordered" onClick={() => void load(page)}><ArrowClockwise size={14} aria-hidden="true" />重试</button>
+        </div>
+      </Notice>
+    );
     if (!report) return <Notice title={view.kind === "idle" && view.message ? "已停止等待" : "等待读取"}>{view.kind === "idle" && view.message || "筛选变化会隐藏上一范围的数据。确认范围后点击“读取统计”，不会自动查询其他账户。"}</Notice>;
     if (report.status === "disabled") return (
       <Notice title="此账户的统计采集尚未开启" tone="warning">
@@ -528,7 +670,7 @@ export default function StatsCenter({
       <>
         <Notice title="当前没有可汇总的结果"><p>{report.message}</p><p>这不代表历史访问为零；汇总数字保持隐藏。</p></Notice>
         {contextDetails}
-        {rows.length > 0 && <StatsTable report={report} domains={domains} links={links} onOpenLinkStats={onOpenLinkStats} />}
+        {rows.length > 0 && <StatsTable report={report} domains={domains} links={links} onOpenLinkStats={openLinkStats} />}
       </>
     );
     if (!report.totals) return null;
@@ -572,7 +714,7 @@ export default function StatsCenter({
         </section>
         <p className="scenter-dedup" aria-label="约 30 分钟访问去重估算">约 30 分钟去重估算：首次 <strong>{dedup ? number(dedup.first) : "—"}</strong> · 重复 <strong>{dedup ? number(dedup.repeat) : "—"}</strong> · 测量覆盖 <strong>{dedup ? `${number(dedup.measured)} / ${number(totals.total)}` : "未覆盖"}</strong> 次访问。{dedupNote}</p>
         {contextDetails}
-        <StatsTable report={report} domains={domains} links={links} onOpenLinkStats={onOpenLinkStats} />
+        <StatsTable report={report} domains={domains} links={links} onOpenLinkStats={openLinkStats} />
       </>
     );
   })();
@@ -646,8 +788,8 @@ export default function StatsCenter({
         <div className="scenter-pagination" aria-label="统计结果分页">
           <span>当前本机短链接 {number(knownTotalLinks)} 条 · 第 {page} / {pageCount} 页</span>
           <div>
-            <button type="button" className="button ghost" aria-label="上一页统计" disabled={page <= 1} onClick={() => void load(page - 1, true)}><CaretLeft size={14} aria-hidden="true" />上一页</button>
-            <button type="button" className="button ghost" aria-label="下一页统计" disabled={page >= pageCount} onClick={() => void load(page + 1, true)}>下一页<CaretRight size={14} aria-hidden="true" /></button>
+            <button type="button" className="button ghost" aria-label="上一页统计" disabled={view.kind === "loading" || page <= 1} onClick={() => void load(page - 1, true)}><CaretLeft size={14} aria-hidden="true" />上一页</button>
+            <button type="button" className="button ghost" aria-label="下一页统计" disabled={view.kind === "loading" || page >= pageCount} onClick={() => void load(page + 1, true)}>下一页<CaretRight size={14} aria-hidden="true" /></button>
           </div>
         </div>
       )}
@@ -714,7 +856,8 @@ function AccountsOverview({ accounts, domains, links, days, overview, onSelect, 
     {overview.kind !== "idle" && <>
     <div className="scenter-overview-status" role="status">
       <span>已处理 {overview.completed} / {accounts.length} 个账户 · 可汇总 {ready.length} 个</span>
-      {overview.kind === "loading" && overview.progress && <span>正在读取 {byAccount.get(overview.progress.accountId)?.label || "所选账户"} · 第 {overview.progress.page} / {overview.progress.pages} 页</span>}
+      {overview.kind === "loading" && overview.progress && <span>{overview.progress.waiting ? STATS_BUSY_WAITING : `正在读取 ${byAccount.get(overview.progress.accountId)?.label || "所选账户"} · 第 ${overview.progress.page} / ${overview.progress.pages} 页`}</span>}
+      {overview.kind === "complete" && overview.readAt && <span className="scenter-overview-read-at">读取时间：{formatTime(overview.readAt)} · 点“刷新统计”可重新读取</span>}
       {overview.kind === "loading" && <button type="button" className="button ghost" onClick={onStop}>停止读取</button>}
     </div>
     {ready.length > 0 && aggregate && <section className="scenter-overview-summary" aria-label="全部账户估算汇总">
@@ -757,6 +900,8 @@ function AccountsOverview({ accounts, domains, links, days, overview, onSelect, 
   </>;
 }
 
+type DetailSort = "total" | "human" | "name";
+
 function StatsTable({ report, domains, links, onOpenLinkStats }: {
   report: StatsCenterReport;
   domains: Domain[];
@@ -764,19 +909,50 @@ function StatsTable({ report, domains, links, onOpenLinkStats }: {
   onOpenLinkStats: (link: Link, domain: Domain) => void;
 }) {
   const rows = report.rows || [];
+  const [query, setQuery] = useState("");
+  const [sort, setSort] = useState<DetailSort>("total");
+  const visible = useMemo(() => {
+    const byId = new Map(domains.map((domain) => [domain.id, domain]));
+    const term = query.trim().toLocaleLowerCase();
+    const items = rows.map((row) => ({ row, domain: byId.get(row.domainId) }))
+      .filter(({ row, domain }) => !term || [domain?.host || "", domain?.prefix || "", row.slug, domain ? `${domain.host}/${domain.prefix}/${row.slug}` : ""]
+        .some((value) => value.toLocaleLowerCase().includes(term)));
+    const name = (item: (typeof items)[number]) => `${item.domain?.host || ""}/${item.domain?.prefix || ""}/${item.row.slug}`;
+    return items.sort((left, right) => {
+      if (sort !== "name") {
+        const key = sort === "total" ? "total" : "likelyHuman";
+        if (left.row.totals[key] !== right.row.totals[key]) return right.row.totals[key] - left.row.totals[key];
+      }
+      return name(left).localeCompare(name(right));
+    });
+  }, [rows, domains, query, sort]);
   return (
     <section className="scenter-detail" aria-label="短链接明细">
       <div className="scenter-detail-head">
         <strong>短链接明细</strong>
         <span>当前本机共 {number(report.totalLinks)} 条 · 本页 {number(rows.length)} 条</span>
       </div>
-      {rows.length === 0 ? <div className="scenter-table-empty">这一页没有当前本机短链接。</div> : (
+      {rows.length > 0 && (
+        <div className="scenter-detail-controls">
+          <label>在本页搜索
+            <input type="search" value={query} placeholder="域名或路径" onChange={(event) => setQuery(event.target.value)} />
+          </label>
+          <label>本页排序
+            <select value={sort} onChange={(event) => setSort(event.target.value as DetailSort)}>
+              <option value="total">总次数从高到低</option>
+              <option value="human">疑似真人从高到低</option>
+              <option value="name">按域名和路径</option>
+            </select>
+          </label>
+          <small>只在本页已读到的 {number(rows.length)} 条里搜索和排序；要在全部链接里排，请切回“全部账户”。</small>
+        </div>
+      )}
+      {rows.length === 0 ? <div className="scenter-table-empty">这一页没有当前本机短链接。</div> : visible.length === 0 ? <div className="scenter-table-empty">本页没有匹配的短链接。</div> : (
         <div className="scenter-table-scroll">
           <table className="scenter-table" aria-label="当前本机短链接统计">
             <thead><tr><th>域名</th><th>短链接</th><th>疑似真人</th><th>疑似机器人</th><th>未知</th><th>总次数</th><th>操作</th></tr></thead>
             <tbody>
-              {rows.map((row) => {
-                const domain = domains.find((item) => item.id === row.domainId);
+              {visible.map(({ row, domain }) => {
                 const link = links.find((item) => item.domainId === row.domainId && item.slug === row.slug);
                 return (
                   <tr key={`${row.domainId}:${row.slug}`}>

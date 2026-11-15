@@ -4,6 +4,21 @@
 const PREFIX = /^[a-z0-9-]{1,12}$/;
 const SLUG = /^[A-Za-z0-9_-]{1,32}$/;
 const ROUTE = /^\/([a-z0-9-]{1,12})\/([A-Za-z0-9_-]{1,32})$/;
+// Room for one trailing slash plus a few (percent-encoded) punctuation marks
+// that chat apps sometimes include at the end of a link.
+const MAX_RAW_PATH = 128;
+// The second row holds the full-width CJK forms (full stop, comma, semicolon,
+// colon, exclamation mark, question mark, closing brackets and quotes, and the
+// enumeration comma). They are written as escapes so this file stays ASCII:
+// the deployed bytes are hash-compared after a round trip through the API.
+const TRAILING_MARKS = ['.', ',', ';', ':', '!', '?', ')', ']', '}', "'", '"',
+  '\u3002', '\uFF0C', '\uFF1B', '\uFF1A', '\uFF01', '\uFF1F', '\uFF09',
+  '\u3011', '\u300B', '\u300D', '\u300F', '\u201D', '\u2019', '\u3001'];
+const TRAILING_PUNCTUATION = new RegExp(`(?:${TRAILING_MARKS.flatMap(mark => [
+  mark.replace(/[.?)\]}]/g, '\\$&'),
+  Array.from(new TextEncoder().encode(mark), byte => `%${byte.toString(16).padStart(2, '0')}`).join(''),
+]).join('|')})+$`, 'i');
+const DOT_SEGMENT = /^(?:\.|%2e){2,}$/i;
 const SELFTEST = /^([0-9]{1,16})\.([A-Z]{2})\.([0-9a-f]{64})$/;
 const HEX_KEY = /^[0-9a-fA-F]{64}$/;
 const CACHE_TTL_MS = 60_000;
@@ -672,7 +687,7 @@ function requestParts(rawUrl) {
   const raw = rawUrl.match(/^https?:\/\/([^/?#]+)([^?#]*)/i);
   if (!raw || raw[1].includes('@')) return null;
   const path = raw[2] || '/';
-  if (path.length > 46) return null;
+  if (path.length > MAX_RAW_PATH) return null;
   let url;
   try {
     url = new URL(rawUrl);
@@ -686,6 +701,22 @@ function requestParts(rawUrl) {
   return { host, path };
 }
 
+function stripTrailing(path) {
+  const kept = path.replace(TRAILING_PUNCTUATION, '');
+  // "/.." after a slash is a dot segment (the parent directory), not punctuation.
+  return kept.endsWith('/') && DOT_SEGMENT.test(path.slice(kept.length)) ? null : kept;
+}
+
+// Drops trailing punctuation, one trailing slash, then trailing punctuation
+// again. Name characters (letters, digits, "_" and "-") are never removed.
+// Paths that still do not match ROUTE afterwards stay 404.
+function routePath(path) {
+  const first = stripTrailing(path);
+  if (first === null) return path;
+  const second = stripTrailing(first.endsWith('/') ? first.slice(0, -1) : first);
+  return second ?? path;
+}
+
 export default {
   async fetch(request, env, ctx) {
     const head = request.method === 'HEAD';
@@ -693,11 +724,12 @@ export default {
       return response(405, 'Method Not Allowed', false, { Allow: 'GET, HEAD' });
     }
     const parts = requestParts(request.url);
-    const route = parts?.path.match(ROUTE);
+    const path = parts ? routePath(parts.path) : null;
+    const route = path?.match(ROUTE);
     if (!route || !PREFIX.test(route[1]) || !SLUG.test(route[2])) {
       return response(404, 'Not Found', head);
     }
-    const { host, path } = parts;
+    const { host } = parts;
     const selftest = await selftestCountry(request, env, host, path);
     const country = selftest ?? (request.cf?.country === 'CN' ? 'CN' : '');
     if (!await allowClick(env, request, host, route[1], route[2], selftest)) {
@@ -717,13 +749,13 @@ export default {
       if (validTemplateLink(link)) {
         const pool = await readKV(env.LINKS, `p:${link.poolId}`, MAX_POOL_BYTES,
           selftest !== null, validPool);
-        if (pool === null) return response(503, 'Service Unavailable', head);
+        if (pool === null) return response(503, 'Service Unavailable', head, { 'X-Reason': 'pool_missing' });
         let template = pool.official;
         if (country === 'CN') {
           const health = await readKV(env.LINKS, `h:${link.poolId}`, MAX_HEALTH_BYTES,
             selftest !== null, validHealth);
           template = chooseCandidate(pool, health, Math.floor(Date.now() / 1000));
-          if (!template) return response(503, 'Service Unavailable', head);
+          if (!template) return response(503, 'Service Unavailable', head, { 'X-Reason': 'no_candidate' });
         }
         destination = compose(template, link.code);
       } else {
@@ -749,7 +781,7 @@ export default {
       }
       return redirect;
     } catch {
-      return response(503, 'Service Unavailable', head);
+      return response(503, 'Service Unavailable', head, { 'X-Reason': 'internal' });
     }
   },
   async scheduled(_event, env) {

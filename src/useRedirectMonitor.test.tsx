@@ -1,6 +1,6 @@
 import {act,cleanup,renderHook} from '@testing-library/react';
 import {afterEach,beforeEach,expect,it,vi} from 'vitest';
-import {CONFIRM_DELAY_MS,MONITOR_INTERVAL_MS,STALE_AFTER_MS,monitorIdentity,useRedirectMonitor} from './useRedirectMonitor';
+import {BUSY_BACKOFF_MS,CONFIRM_DELAY_MS,MONITOR_INTERVAL_MS,STALE_AFTER_MS,monitorIdentity,useRedirectMonitor} from './useRedirectMonitor';
 import type {RedirectCheck,State} from './types';
 
 const base:State = {accounts:[],domains:[{id:'d',accountId:'a',zoneId:'z',host:'go.example.com',prefix:'r',routeId:'route'}],links:[{domainId:'d',slug:'one',cnUrl:'https://example.com/a',defaultUrl:'https://example.org/b',updated:'u1'}],pools:[],pendingOperations:[],pendingActions:[]};
@@ -91,7 +91,7 @@ it('handles blocked storage and invalid reports as attention without persisting 
   getter.mockRestore();setter.mockRestore();
 });
 
-it('keeps busy responses quiet, retries once, and lets healthy results expire',async()=>{
+it('keeps busy responses quiet, retries after a one-minute wait, and lets healthy results expire',async()=>{
   const check=vi.fn().mockResolvedValueOnce(report('unknown','busy')).mockResolvedValueOnce(report('passed'));
   const {result,rerender}=renderHook(({paused})=>useRedirectMonitor({state:base,paused,ready:true,check}),{initialProps:{paused:false}});
   act(()=>result.current.setEnabled(true));await tick();
@@ -517,4 +517,162 @@ it('does not fill an interrupted new round with old healthy records after an edi
   expect(result.current.active).toBe(false);
   expect(result.current.getRecord(state.links[1])?.phase).toBe('healthy');
   expect(result.current.resultStatus).toBe('unverified');
+});
+
+const threeLinks:State = {...base,links:[base.links[0],{...base.links[0],slug:'two'},{...base.links[0],slug:'three'}]};
+
+it('keeps busy links in the round, backs off 1, 3 and 10 minutes, and completes only after they are checked',async()=>{
+  expect(BUSY_BACKOFF_MS).toEqual([60_000,180_000,600_000]);
+  let busyLeft=3;
+  const check=vi.fn(async(_domainId:string,slug:string)=>slug==='two'&&busyLeft-->0?report('unknown','busy'):report('passed'));
+  const {result}=renderHook(()=>useRedirectMonitor({state:threeLinks,paused:false,ready:true,check}));
+  act(()=>result.current.setEnabled(true));await tick(250);
+  const slugs=()=>check.mock.calls.map(call=>call[1]);
+  expect(slugs()).toEqual(['one','two']);
+  expect(result.current.lastCompletion).toBeNull();
+  expect(result.current.waitingForBackend).toBe(true);
+  expect(result.current.resultStatus).toBe('unverified');
+  const wait=Date.parse(result.current.nextCheckAt!)-Date.now();
+  expect(wait).toBeGreaterThan(0);
+  expect(wait).toBeLessThanOrEqual(60_000);
+  await tick(59_000);
+  expect(slugs()).toEqual(['one','two']);
+  await tick(1_000);
+  expect(slugs()).toEqual(['one','two','two']);
+  await tick(179_000);
+  expect(slugs()).toHaveLength(3);
+  await tick(1_000);
+  expect(slugs()).toEqual(['one','two','two','two']);
+  expect(result.current.lastCompletion).toBeNull();
+  await tick(599_000);
+  expect(slugs()).toHaveLength(4);
+  await tick(1_000);await tick(250);
+  expect(slugs()).toEqual(['one','two','two','two','two','three']);
+  expect(result.current.waitingForBackend).toBe(false);
+  expect(result.current.lastCompletion).not.toBeNull();
+  expect(result.current.resultStatus).toBe('healthy');
+  expect(localStorage.getItem('redirect-monitor-preview-enabled-completed-at')).not.toBeNull();
+  // The round waited 14 minutes in total; the next one counts 48 hours from its start.
+  const next=Date.parse(result.current.nextCheckAt!)-Date.now();
+  const waited=BUSY_BACKOFF_MS.reduce((sum,value)=>sum+value,0);
+  expect(next).toBeGreaterThan(MONITOR_INTERVAL_MS-waited-60_000);
+  expect(next).toBeLessThanOrEqual(MONITOR_INTERVAL_MS-waited);
+});
+
+it('keeps a busy confirmation pending instead of dropping it',async()=>{
+  const check=vi.fn().mockResolvedValueOnce(report('failed'))
+    .mockResolvedValueOnce(report('unknown','busy'))
+    .mockResolvedValueOnce(report('failed'));
+  const {result}=renderHook(()=>useRedirectMonitor({state:base,paused:false,ready:true,check}));
+  act(()=>result.current.setEnabled(true));await tick();
+  expect(result.current.getRecord(base.links[0])?.phase).toBe('pending');
+  await tick(CONFIRM_DELAY_MS);
+  expect(check).toHaveBeenCalledTimes(2);
+  expect(result.current.getRecord(base.links[0])?.phase).toBe('pending');
+  await tick(BUSY_BACKOFF_MS[0]);
+  expect(check).toHaveBeenCalledTimes(3);
+  expect(result.current.getRecord(base.links[0])?.phase).toBe('alert');
+});
+
+it('lets a manual run skip the busy wait',async()=>{
+  const check=vi.fn().mockResolvedValueOnce(report('unknown','busy')).mockResolvedValue(report('passed'));
+  const {result}=renderHook(()=>useRedirectMonitor({state:base,paused:false,ready:true,check}));
+  act(()=>result.current.setEnabled(true));await tick();
+  expect(result.current.waitingForBackend).toBe(true);
+  act(()=>result.current.runNow());await tick();
+  expect(check).toHaveBeenCalledTimes(2);
+  expect(result.current.lastCompletion).not.toBeNull();
+});
+
+it('resumes an interrupted full round from where it stopped instead of starting over',async()=>{
+  let finish:((value:RedirectCheck)=>void)|null=null;
+  let held=false;
+  const check=vi.fn((_domainId:string,slug:string)=>{
+    if(slug==='two'&&!held){held=true;return new Promise<RedirectCheck>(resolve=>{finish=resolve;});}
+    return Promise.resolve(report('passed'));
+  });
+  const {result,rerender}=renderHook(({paused})=>useRedirectMonitor({state:threeLinks,paused,ready:true,check}),{initialProps:{paused:false}});
+  act(()=>result.current.setEnabled(true));await tick(250);
+  expect(check.mock.calls.map(call=>call[1])).toEqual(['one','two']);
+  rerender({paused:true});
+  await act(async()=>finish!(report('passed')));await tick();
+  expect(result.current.lastCompletion).toBeNull();
+  rerender({paused:false});await tick();
+  expect(result.current.progress).toEqual({done:3,total:3});
+  expect(check.mock.calls.map(call=>call[1])).toEqual(['one','two','three']);
+  expect(result.current.lastCompletion).not.toBeNull();
+  expect(result.current.resultStatus).toBe('healthy');
+});
+
+it('marks a restored healthy result as the previous run until this session checks again',async()=>{
+  const saved='2026-10-16T12:00:00.000Z';
+  localStorage.setItem('redirect-monitor-preview-enabled','true');
+  localStorage.setItem('redirect-monitor-preview-enabled-completed-at',saved);
+  const check=vi.fn(()=>Promise.resolve(report('passed')));
+  const {result}=renderHook(()=>useRedirectMonitor({state:base,paused:false,ready:true,check}));
+  await tick();
+  expect(check).not.toHaveBeenCalled();
+  expect(result.current.resultStatus).toBe('healthy');
+  expect(result.current.previousRunAt).toBe(saved);
+  act(()=>result.current.runNow());await tick();
+  expect(result.current.resultStatus).toBe('healthy');
+  expect(result.current.previousRunAt).toBeNull();
+});
+
+it('keeps a busy changed link queued and checks it after the wait',async()=>{
+  const check=vi.fn().mockResolvedValueOnce(report('passed'))
+    .mockResolvedValueOnce(report('unknown','busy'))
+    .mockResolvedValue(report('passed'));
+  const {result,rerender}=renderHook(({state})=>useRedirectMonitor({state,paused:false,ready:true,check}),{initialProps:{state:base}});
+  act(()=>result.current.setEnabled(true));await tick();
+  const edited={...base,links:[{...base.links[0],updated:'u2'}]};
+  rerender({state:edited});await tick();
+  expect(check).toHaveBeenCalledTimes(2);
+  expect(result.current.pendingChanges).toBe(1);
+  await tick(BUSY_BACKOFF_MS[0]-1_000);
+  expect(check).toHaveBeenCalledTimes(2);
+  await tick(1_000);
+  expect(check).toHaveBeenCalledTimes(3);
+  expect(result.current.pendingChanges).toBe(0);
+  expect(result.current.getRecord(edited.links[0])?.phase).toBe('healthy');
+});
+
+it('schedules the round after a resumed one from when that round started, so its early results are rechecked before they expire',async()=>{
+  let finish:((value:RedirectCheck)=>void)|null=null;
+  let held=false;
+  const check=vi.fn((_domainId:string,slug:string)=>{
+    if(slug==='two'&&!held){held=true;return new Promise<RedirectCheck>(resolve=>{finish=resolve;});}
+    return Promise.resolve(report('passed'));
+  });
+  const {result,rerender}=renderHook(({paused})=>useRedirectMonitor({state:threeLinks,paused,ready:true,check}),{initialProps:{paused:false}});
+  act(()=>result.current.setEnabled(true));await tick(250);
+  rerender({paused:true});
+  await act(async()=>finish!(report('passed')));
+  const pausedFor=60*60_000;
+  await tick(pausedFor);
+  rerender({paused:false});await tick(250);
+  expect(check.mock.calls.map(call=>call[1])).toEqual(['one','two','three']);
+  expect(result.current.lastCompletion).not.toBeNull();
+  const wait=Date.parse(result.current.nextCheckAt!)-Date.now();
+  expect(wait).toBeGreaterThan(MONITOR_INTERVAL_MS-pausedFor-60_000);
+  expect(wait).toBeLessThanOrEqual(MONITOR_INTERVAL_MS-pausedFor);
+  await tick(wait);
+  expect(result.current.getRecord(threeLinks.links[0])?.stale).toBe(false);
+  await tick(1_000);
+  expect(check.mock.calls.map(call=>call[1])).toEqual(['one','two','three','one','two','three']);
+  expect(Date.parse(result.current.nextCheckAt!)-Date.now()).toBeGreaterThan(MONITOR_INTERVAL_MS-60_000);
+});
+
+it('treats the three worker failure reasons as ordinary failures and keeps the backend text',async()=>{
+  for(const reason of ['worker_pool_missing','worker_no_candidate','worker_internal']){
+    const message=`访客现在打不开这条链接（${reason}）`;
+    const check=vi.fn(async():Promise<RedirectCheck>=>({...report('failed',reason),message}));
+    const {result,unmount}=renderHook(()=>useRedirectMonitor({state:base,paused:false,ready:true,check}));
+    act(()=>result.current.setEnabled(true));await tick();
+    expect(result.current.getRecord(base.links[0])).toMatchObject({phase:'pending',message});
+    await tick(CONFIRM_DELAY_MS);
+    expect(result.current.getRecord(base.links[0])).toMatchObject({phase:'alert',message,unresolvedAlert:true});
+    expect(result.current.waitingForBackend).toBe(false);
+    unmount();localStorage.clear();
+  }
 });

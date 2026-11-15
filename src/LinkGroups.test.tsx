@@ -1,4 +1,5 @@
-import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { StrictMode } from "react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, expect, it, vi } from "vitest";
 import LinkGroups from "./LinkGroups";
 import type { Domain, Link, Pool } from "./types";
@@ -107,7 +108,7 @@ it("offers an expandable full value for a long target address", () => {
   expect(disclosure.querySelector("code")?.textContent).toBe(longUrl);
 });
 
-it("paginates each domain at 25/50/100 and resets on changed filtered or deleted links", () => {
+it("paginates each domain at 25/50/100 and keeps a valid page when links change", () => {
   const links = Array.from({ length: 61 }, (_, index) => ({ ...manual, slug: `item-${String(index + 1).padStart(2, "0")}` }));
   const { rerender } = render(view([{ domain, links }]));
   const group = groupFor(domain.host);
@@ -211,4 +212,78 @@ it('keeps the page and open details when an edited link only moves within the sa
   expect(within(rowFor(domain.host,'item-27')).getByRole('button',{name:'详情 item-27'}).getAttribute('aria-expanded')).toBe('true');
   rerender(view([{domain,links:[...links,{...manual,slug:'item-62'}]}]));
   expect(within(group).getByText('显示 1–25 / 共 62 条')).toBeTruthy();
+});
+
+function manyLinks(count: number) {
+  return Array.from({ length: count }, (_, index) => ({ ...manual, slug: `item-${String(index + 1).padStart(2, "0")}` }));
+}
+function viewWith(links: Link[], extra: Partial<Parameters<typeof LinkGroups>[0]> = {}) {
+  return <LinkGroups groups={[{ domain, links }]} pools={[]} getDetection={detection}
+    onCopy={onCopy} onCheck={onCheck} onEdit={onEdit} onDelete={onDelete} onCreate={onCreate} {...extra} />;
+}
+it("stays on the current page and keeps open details after a link is deleted", () => {
+  const links = manyLinks(61);
+  const { rerender } = render(viewWith(links));
+  const group = groupFor(domain.host);
+  fireEvent.click(within(group).getByRole("button", { name: `${domain.host} 下一页` }));
+  fireEvent.click(within(group).getByRole("button", { name: `${domain.host} 下一页` }));
+  expect(within(group).getByText("显示 51–61 / 共 61 条")).toBeTruthy();
+  fireEvent.click(within(rowFor(domain.host, "item-55")).getByRole("button", { name: "详情 item-55" }));
+  fireEvent.click(within(rowFor(domain.host, "item-57")).getByRole("button", { name: "详情 item-57" }));
+  rerender(viewWith(links.filter((link) => link.slug !== "item-57")));
+  expect(within(group).getByText("显示 51–60 / 共 60 条")).toBeTruthy();
+  expect(within(rowFor(domain.host, "item-55")).getByRole("button", { name: "详情 item-55" }).getAttribute("aria-expanded")).toBe("true");
+  expect(within(group).queryByRole("row", { name: "https://go.example.com/r/item-57" })).toBeNull();
+});
+it("moves back one page only when the deleted link was the last one on its page", () => {
+  const links = manyLinks(26);
+  const { rerender } = render(viewWith(links));
+  const group = groupFor(domain.host);
+  fireEvent.click(within(group).getByRole("button", { name: `${domain.host} 下一页` }));
+  expect(within(group).getByText("显示 26–26 / 共 26 条")).toBeTruthy();
+  rerender(viewWith(links.slice(0, 25)));
+  expect(within(group).getAllByRole("row")).toHaveLength(26);
+  expect(within(group).getByRole("row", { name: "https://go.example.com/r/item-25" })).toBeTruthy();
+});
+it("returns to page 1 and closes details when the search or filter changes", () => {
+  const links = manyLinks(61);
+  const { rerender } = render(viewWith(links, { resetKey: "a" }));
+  const group = groupFor(domain.host);
+  fireEvent.click(within(group).getByRole("button", { name: `${domain.host} 下一页` }));
+  fireEvent.click(within(rowFor(domain.host, "item-30")).getByRole("button", { name: "详情 item-30" }));
+  rerender(viewWith(links.slice(0, 55), { resetKey: "b" }));
+  expect(within(group).getByText("显示 1–25 / 共 55 条")).toBeTruthy();
+  fireEvent.click(within(group).getByRole("button", { name: `${domain.host} 下一页` }));
+  expect(within(rowFor(domain.host, "item-30")).getByRole("button", { name: "详情 item-30" }).getAttribute("aria-expanded")).toBe("false");
+});
+it("shows 已复制 ✓ on the copied row only after copying succeeded, then returns to 复制", async () => {
+  const copied = vi.fn(async () => true);
+  const { rerender } = render(viewWith([manual, { ...manual, slug: "second" }], { onCopy: copied }));
+  const button = within(rowFor(domain.host, "manual")).getByRole("button", { name: "复制 manual" });
+  await act(async () => { fireEvent.click(button); });
+  expect(button.textContent).toBe("已复制 ✓");
+  expect(within(rowFor(domain.host, "second")).getByRole("button", { name: "复制 second" }).textContent).toBe("复制");
+  await waitFor(() => expect(button.textContent).toBe("复制"), { timeout: 3000 });
+  rerender(viewWith([manual], { onCopy: async () => false }));
+  const again = within(rowFor(domain.host, "manual")).getByRole("button", { name: "复制 manual" });
+  await act(async () => { fireEvent.click(again); });
+  expect(again.textContent).toBe("复制");
+});
+it("marks a link whose check is still running as in progress without disabling the button", () => {
+  render(viewWith([manual, { ...manual, slug: "idle" }], { isChecking: (link) => link.slug === "manual" }));
+  const busyButton = within(rowFor(domain.host, "manual")).getByRole("button", { name: "检测 manual" }) as HTMLButtonElement;
+  expect(busyButton.textContent).toBe("检测中…");
+  expect(busyButton.getAttribute("aria-busy")).toBe("true");
+  expect(busyButton.disabled).toBe(false);
+  fireEvent.click(busyButton);
+  expect(onCheck).toHaveBeenCalledWith(manual, domain);
+  const idle = within(rowFor(domain.host, "idle")).getByRole("button", { name: "检测 idle" });
+  expect(idle.textContent).toBe("检测");
+  expect(idle.getAttribute("aria-busy")).toBeNull();
+});
+it("also shows 已复制 ✓ under StrictMode, which the app entry and the local preview use", async () => {
+  render(<StrictMode>{viewWith([manual], { onCopy: async () => true })}</StrictMode>);
+  const button = within(rowFor(domain.host, "manual")).getByRole("button", { name: "复制 manual" });
+  await act(async () => { fireEvent.click(button); });
+  expect(button.textContent).toBe("已复制 ✓");
 });

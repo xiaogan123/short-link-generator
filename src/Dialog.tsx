@@ -1,4 +1,4 @@
-import { useLayoutEffect, useRef, type ReactNode } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react';
 import { X, WarningCircle } from '@phosphor-icons/react';
 
 type Modal = { element: HTMLDivElement; scrim: HTMLDivElement; previous: HTMLElement | null };
@@ -32,10 +32,17 @@ function focusable(element: HTMLElement) {
   return [...element.querySelectorAll<HTMLElement>(focusSelector)].filter(isAvailable);
 }
 
+const textInputTypes = ['text', 'search', 'url', 'email', 'password', 'tel', 'number'];
+function isTextField(item: HTMLElement) {
+  return item instanceof HTMLTextAreaElement || (item instanceof HTMLInputElement && textInputTypes.includes(item.type));
+}
+
 function focusInitial(modal: Modal) {
   const items = focusable(modal.element);
   // React's autoFocus does not leave an attribute, so a field can opt in with data-autofocus.
+  // Otherwise typing should land in a text field before a dropdown or checkbox.
   const first = items.find(item => item.hasAttribute('autofocus') || item.hasAttribute('data-autofocus'))
+    || items.find(isTextField)
     || items.find(item => item.matches('input, select, textarea')) || items[0];
   (first || modal.element).focus();
 }
@@ -72,15 +79,41 @@ type Props = {
   errorAction?: ReactNode;
   status?: ReactNode;
   dismissDisabled?: boolean;
+  /** True when the user has typed something that closing would throw away. */
+  hasUserInput?: boolean;
+  /** What the first Escape says when closing would throw away something other than typing. */
+  escapeHint?: string;
 };
 
-export default function Dialog({ title, children, onClose, footer, wide = false, error, errorAction, status, dismissDisabled = false }: Props) {
+// A second Escape within this window discards what the user typed.
+const ESCAPE_CONFIRM_MS = 3000;
+
+export default function Dialog({ title, children, onClose, footer, wide = false, error, errorAction, status, dismissDisabled = false, hasUserInput = false, escapeHint }: Props) {
   const dialog = useRef<HTMLDivElement>(null);
   const scrim = useRef<HTMLDivElement>(null);
   const closeRef = useRef(onClose);
   const dismissDisabledRef = useRef(dismissDisabled);
+  const hasUserInputRef = useRef(hasUserInput);
+  const escapeTimer = useRef<number | null>(null);
+  const [escapeWarning, setEscapeWarning] = useState(false);
+  const escapeArmed = useRef(false);
   closeRef.current = onClose;
   dismissDisabledRef.current = dismissDisabled;
+  hasUserInputRef.current = hasUserInput;
+  function disarmEscape() {
+    if (escapeTimer.current !== null) window.clearTimeout(escapeTimer.current);
+    escapeTimer.current = null;
+    escapeArmed.current = false;
+    setEscapeWarning(false);
+  }
+  const disarmRef = useRef(disarmEscape);
+  disarmRef.current = disarmEscape;
+  useEffect(() => {
+    if (!hasUserInput) disarmRef.current();
+  }, [hasUserInput]);
+  useEffect(() => () => {
+    if (escapeTimer.current !== null) window.clearTimeout(escapeTimer.current);
+  }, []);
 
   useLayoutEffect(() => {
     const modal: Modal = { element: dialog.current!, scrim: scrim.current!, previous: document.activeElement as HTMLElement | null };
@@ -91,9 +124,23 @@ export default function Dialog({ title, children, onClose, footer, wide = false,
     const onKey = (event: KeyboardEvent) => {
       if (topModal() !== modal) return;
       if (event.key === 'Escape') {
+        // An input method uses Escape to drop its candidates; that is not a request to close.
+        if (event.isComposing || event.keyCode === 229) return;
         event.preventDefault();
         event.stopPropagation();
-        if (!dismissDisabledRef.current) closeRef.current();
+        if (dismissDisabledRef.current) return;
+        // Holding the key down repeats it; only a separate press may discard typed content.
+        if (hasUserInputRef.current && event.repeat) return;
+        if (hasUserInputRef.current && !escapeArmed.current) {
+          // The first Escape only warns, so a stray key press does not throw away typed content.
+          escapeArmed.current = true;
+          setEscapeWarning(true);
+          if (escapeTimer.current !== null) window.clearTimeout(escapeTimer.current);
+          escapeTimer.current = window.setTimeout(() => disarmRef.current(), ESCAPE_CONFIRM_MS);
+          return;
+        }
+        disarmRef.current();
+        closeRef.current();
         return;
       }
       if (event.key !== 'Tab') return;
@@ -142,12 +189,11 @@ export default function Dialog({ title, children, onClose, footer, wide = false,
     if (!dialog.current?.contains(current) || (current instanceof HTMLElement && current.matches(':disabled'))) dialog.current?.focus();
   });
 
-  return <div ref={scrim} className="dialog-scrim" onMouseDown={event => {
-    if (!dismissDisabled && topModal()?.element === dialog.current && event.target === event.currentTarget) onClose();
-  }}>
+  // Clicking the dimmed background never closes a dialog: use 取消, 关闭 or Escape.
+  return <div ref={scrim} className="dialog-scrim">
     <div className={`dialog ${wide ? 'dialog-wide' : ''}`} role="dialog" aria-modal="true" aria-label={title} tabIndex={-1} ref={dialog}>
       <div className="dialog-head"><div><h2>{title}</h2></div><button type="button" className="icon-button" onClick={onClose} aria-label="关闭" disabled={dismissDisabled}><X size={18} /></button></div>
-      {(error || status) && <div className="dialog-status">{error && <div role="alert" className="dialog-error"><WarningCircle size={17} /><span>{error}</span>{errorAction}</div>}{status}</div>}
+      {(error || status || escapeWarning) && <div className="dialog-status">{escapeWarning && <div role="status" className="dialog-escape-warning">{escapeHint || "再按一次 Esc 放弃已填的内容。"}</div>}{error && <div role="alert" className="dialog-error"><WarningCircle size={17} /><span>{error}</span>{errorAction}</div>}{status}</div>}
       <div className="dialog-body">{children}</div>
       {footer && <div className="dialog-footer">{footer}</div>}
     </div>

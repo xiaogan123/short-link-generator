@@ -438,7 +438,7 @@ async fn resource_recovery_does_not_relax_normal_recovery_or_rotate_the_key() {
     assert!(backend
         .prepare_change(&json!({"kind":"recover_selftest_rotation","accountId":"acct1"}))
         .unwrap_err()
-        .contains("找回检测服务配置"));
+        .contains("「找回本机检测配置」按钮"));
     assert!(mock_key_reads().lock().unwrap().is_empty());
     assert!(mock_key_mutations().lock().unwrap().is_empty());
     assert!(server.received_requests().await.unwrap().is_empty());

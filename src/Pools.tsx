@@ -21,23 +21,27 @@ export function poolValidation(pool: Pool): string | null {
     }
     return null;
 }
-function AddressPaste({ label, onApply }: {
+function AddressPaste({ label, onApply, onTextChange }: {
     label: string;
     onApply: (parts: InvitationParts) => void;
+    onTextChange?: (hasText: boolean) => void;
 }) {
     const [full, setFull] = useState('');
     const [parts, setParts] = useState<InvitationParts | null>(null);
     const [message, setMessage] = useState('');
     const messageId = useId();
+    // A recognised link fills the address right away; the user only checks the result.
     function parse() { try {
-        setParts(splitInvitationLink(full));
-        setMessage('');
+        const next = splitInvitationLink(full);
+        setParts(next);
+        onApply(next);
+        setMessage('已去掉邀请码，并填好下面的链接地址。请核对后再保存。');
     }
     catch (error) {
         setParts(null);
         setMessage(error instanceof Error ? error.message : '无法识别链接。');
     } }
-    return <div className="address-paste"><label>{label}的完整邀请链接<input aria-label={`${label} 完整邀请链接`} type="text" inputMode="url" aria-invalid={Boolean(message && !parts)} aria-describedby={message ? messageId : undefined} value={full} onChange={event => { setFull(event.target.value); setParts(null); setMessage(''); }} placeholder="https://example.com/join/CODE"/></label><button type="button" className="button ghost" onClick={parse}>识别</button>{message && <p id={messageId} className="inline-warning" role={parts ? 'status' : 'alert'}>{message}</p>}{parts && <div className="address-paste-result"><span>邀请码：<strong>{parts.code}</strong></span><button type="button" className="button secondary" onClick={() => { onApply(parts); setMessage('已去掉邀请码并填入链接地址，请核对后保存。'); }}>填入链接地址</button></div>}</div>;
+    return <div className="address-paste"><label>{label}的完整邀请链接<input aria-label={`${label} 完整邀请链接`} type="text" inputMode="url" aria-invalid={Boolean(message && !parts)} aria-describedby={message ? messageId : undefined} value={full} onChange={event => { setFull(event.target.value); setParts(null); setMessage(''); onTextChange?.(Boolean(event.target.value.trim())); }} onKeyDown={event => { if (event.key === 'Enter' && !event.nativeEvent.isComposing && event.keyCode !== 229) { event.preventDefault(); parse(); } }} placeholder="https://example.com/join/CODE"/></label><button type="button" className="button ghost" onClick={parse}>识别</button>{message && <p id={messageId} className="inline-warning" role={parts ? 'status' : 'alert'}>{message}</p>}{parts && <div className="address-paste-result"><span>邀请码：<strong>{parts.code}</strong></span></div>}</div>;
 }
 export default function Pools({ pools, accounts, linkCount, onSave, onDelete, busy, health, onCheckHealth, planOpen, savedRevision, serverError = "", onDraftChange, errorAction, dismissDisabled = false }: {
     pools: Pool[];
@@ -61,6 +65,9 @@ export default function Pools({ pools, accounts, linkCount, onSave, onDelete, bu
     const accountById = useMemo(() => new Map(accounts.map(account => [account.id, account])), [accounts]);
     const [, setClock] = useState(Date.now());
     const draftGeneration = useRef(0);
+    // What the editor held when it opened, to tell whether closing would discard typing.
+    const [draftBaseline, setDraftBaseline] = useState('');
+    const [pasteTexts, setPasteTexts] = useState<Record<string, boolean>>({});
     useEffect(() => { replaceDraft(null); }, [savedRevision]);
     useEffect(() => { const timer = window.setInterval(() => setClock(Date.now()), 60000); return () => window.clearInterval(timer); }, []);
     function replaceDraft(next: Pool | null) { draftGeneration.current += 1; setDraft(next); setError(''); setFieldErrors({}); onDraftChange?.(); }
@@ -87,7 +94,9 @@ export default function Pools({ pools, accounts, linkCount, onSave, onDelete, bu
         if (statuses.includes('unhealthy')) return '有失败目标';
         return statuses.length > 0 && statuses.every(status => status === 'healthy') ? '全部目标检测通过' : '状态未知或已过期';
     }
-    function open(pool?: Pool) { setError(''); replaceDraft(pool ? structuredClone(pool) : { id: '', name: '', official: { prefix: '', suffix: '' }, candidates: [candidate()], updated: '', accountIds: [] }); }
+    function open(pool?: Pool) { setError(''); const next = pool ? structuredClone(pool) : { id: '', name: '', official: { prefix: '', suffix: '' }, candidates: [candidate()], updated: '', accountIds: [] }; setDraftBaseline(JSON.stringify(next)); setPasteTexts({}); replaceDraft(next); }
+    const setPasteText = (key: string) => (hasText: boolean) => setPasteTexts(current => current[key] === hasText ? current : { ...current, [key]: hasText });
+    const hasUserInput = Boolean(draft && (JSON.stringify(draft) !== draftBaseline || Object.values(pasteTexts).some(Boolean)));
     function patch(index: number, fields: Partial<PoolCandidate>) { if (draft)
         replaceDraft({ ...draft, candidates: draft.candidates.map((c, i) => i === index ? { ...c, ...fields } : c) }); }
     function move(index: number, delta: number) { if (!draft)
@@ -148,13 +157,13 @@ export default function Pools({ pools, accounts, linkCount, onSave, onDelete, bu
    </article>)}</div>}
   </section>
   <p className="page-footnote"><WarningCircle size={16}/>未配置检测服务时，备用地址状态为未知。状态过期或检测失败也不会被显示为可用；全部备用地址明确失败时，短链接会暂时不可用。</p>
-  {draft && !planOpen && <Dialog title={draft.id ? '编辑平台地址' : '添加平台地址'} wide error={error || serverError} errorAction={errorAction} dismissDisabled={dismissDisabled} onClose={() => { if (!dismissDisabled)
+  {draft && !planOpen && <Dialog title={draft.id ? '编辑平台地址' : '添加平台地址'} wide error={error || serverError} errorAction={errorAction} dismissDisabled={dismissDisabled} hasUserInput={hasUserInput} onClose={() => { if (!dismissDisabled)
             replaceDraft(null); }} footer={<><button className="button ghost" disabled={dismissDisabled} onClick={() => replaceDraft(null)}>取消</button><button className="button primary" form="pool-form" type="submit" disabled={busy}>下一步，核对内容</button></>}>
    <form noValidate id="pool-form" className="form-grid" onSubmit={event => void save(event)}>
     <label>名称<input {...fieldProps('pool-name', fieldErrors)} value={draft.name} onChange={event => replaceDraft({ ...draft, name: event.target.value })} placeholder="例如：常用平台 A" maxLength={60} required/><FieldError name="pool-name" errors={fieldErrors}/><small>仅用于本机区分，不影响链接地址。</small></label>
-    <div className="template-card"><div className="template-heading"><h3>官网链接（中国大陆以外访客使用）</h3><span>必填</span></div><AddressPaste label="官网链接" onApply={parts => applySplit('official', parts)}/><label>链接地址（不含邀请码）<input {...fieldProps('pool-official-prefix', fieldErrors)} value={draft.official.prefix} onChange={event => replaceDraft({ ...draft, official: { ...draft.official, prefix: event.target.value } })} placeholder="https://example.com/join/" required/><FieldError name="pool-official-prefix" errors={fieldErrors}/></label><details className="advanced"><summary>高级设置：额外参数</summary><label>额外参数（可选）<input {...fieldProps('pool-official-suffix', fieldErrors)} value={draft.official.suffix} onChange={event => replaceDraft({ ...draft, official: { ...draft.official, suffix: event.target.value } })} placeholder="例如 ?lang=zh"/><FieldError name="pool-official-suffix" errors={fieldErrors}/></label></details></div>
+    <div className="template-card"><div className="template-heading"><h3>官网链接（中国大陆以外访客使用）</h3><span>必填</span></div><AddressPaste label="官网链接" onApply={parts => applySplit('official', parts)} onTextChange={setPasteText('official')}/><label>链接地址（不含邀请码）<input {...fieldProps('pool-official-prefix', fieldErrors)} value={draft.official.prefix} onChange={event => replaceDraft({ ...draft, official: { ...draft.official, prefix: event.target.value } })} placeholder="https://example.com/join/" required/><FieldError name="pool-official-prefix" errors={fieldErrors}/></label><details className="advanced"><summary>高级设置：额外参数</summary><label>额外参数（可选）<input {...fieldProps('pool-official-suffix', fieldErrors)} value={draft.official.suffix} onChange={event => replaceDraft({ ...draft, official: { ...draft.official, suffix: event.target.value } })} placeholder="例如 ?lang=zh"/><FieldError name="pool-official-suffix" errors={fieldErrors}/></label></details></div>
     <div className="template-heading" id="pool-candidates" tabIndex={-1} aria-describedby={fieldErrors['pool-candidates'] ? 'pool-candidates-error' : undefined}><h3>大陆访问地址</h3><span>按首选、备用顺序选择；至少启用一个</span></div><FieldError name="pool-candidates" errors={fieldErrors}/>
-    {draft.candidates.map((c, index) => <div className="template-card" key={c.id}><div className="template-heading"><label className="checkbox-row"><input type="checkbox" checked={c.enabled} onChange={event => patch(index, { enabled: event.target.checked })}/>大陆访问地址（{index === 0 ? '首选' : `备用 ${index}`}）</label><div className="template-actions"><button type="button" disabled={index === 0} onClick={() => move(index, -1)}>上移</button><button type="button" disabled={index === draft.candidates.length - 1} onClick={() => move(index, 1)}>下移</button><button type="button" disabled={draft.candidates.length === 1} onClick={() => replaceDraft({ ...draft, candidates: draft.candidates.filter(item => item.id !== c.id) })}>移除</button></div></div><AddressPaste label={`大陆访问地址（${index === 0 ? '首选' : `备用 ${index}`}）`} onApply={parts => applySplit(c.id, parts)}/><label>链接地址（不含邀请码）<input {...fieldProps(`pool-${c.id}-prefix`, fieldErrors)} value={c.prefix} onChange={event => patch(index, { prefix: event.target.value })} placeholder="https://example.org/join/" required/><FieldError name={`pool-${c.id}-prefix`} errors={fieldErrors}/></label><details className="advanced"><summary>高级设置：额外参数</summary><label>额外参数（可选）<input {...fieldProps(`pool-${c.id}-suffix`, fieldErrors)} value={c.suffix} onChange={event => patch(index, { suffix: event.target.value })} placeholder="例如 ?lang=zh"/><FieldError name={`pool-${c.id}-suffix`} errors={fieldErrors}/></label></details></div>)}
+    {draft.candidates.map((c, index) => <div className="template-card" key={c.id}><div className="template-heading"><label className="checkbox-row"><input type="checkbox" checked={c.enabled} onChange={event => patch(index, { enabled: event.target.checked })}/>大陆访问地址（{index === 0 ? '首选' : `备用 ${index}`}）</label><div className="template-actions"><button type="button" disabled={index === 0} onClick={() => move(index, -1)}>上移</button><button type="button" disabled={index === draft.candidates.length - 1} onClick={() => move(index, 1)}>下移</button><button type="button" disabled={draft.candidates.length === 1} onClick={() => replaceDraft({ ...draft, candidates: draft.candidates.filter(item => item.id !== c.id) })}>移除</button></div></div><AddressPaste label={`大陆访问地址（${index === 0 ? '首选' : `备用 ${index}`}）`} onApply={parts => applySplit(c.id, parts)} onTextChange={setPasteText(c.id)}/><label>链接地址（不含邀请码）<input {...fieldProps(`pool-${c.id}-prefix`, fieldErrors)} value={c.prefix} onChange={event => patch(index, { prefix: event.target.value })} placeholder="https://example.org/join/" required/><FieldError name={`pool-${c.id}-prefix`} errors={fieldErrors}/></label><details className="advanced"><summary>高级设置：额外参数</summary><label>额外参数（可选）<input {...fieldProps(`pool-${c.id}-suffix`, fieldErrors)} value={c.suffix} onChange={event => patch(index, { suffix: event.target.value })} placeholder="例如 ?lang=zh"/><FieldError name={`pool-${c.id}-suffix`} errors={fieldErrors}/></label></details></div>)}
     <button type="button" className="button secondary add-candidate" disabled={draft.candidates.length >= 10} onClick={() => replaceDraft({ ...draft, candidates: [...draft.candidates, candidate()] })}><Plus size={16}/>添加大陆访问地址</button>
     <p className="form-note">确认前会列出关联链接与同步账户。地址只能是 HTTPS，邀请码位于域名后的路径或参数中。</p>
    </form>

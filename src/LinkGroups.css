@@ -148,3 +148,5 @@
   .slg-candidate { grid-template-columns: 1fr; gap: 4px; }
   .slg-long-url > summary { flex-wrap: wrap; gap: 2px 8px; }
 }
+.slg-actions .slg-copy.slg-copied { background: #d3ecda; color: #145236; }
+.slg-actions .slg-checking { color: #5d7a68; cursor: progress; }

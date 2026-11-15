@@ -1,4 +1,5 @@
 use super::*;
+use crate::lock_backend;
 use base64::{engine::general_purpose::STANDARD, Engine};
 use tauri::test::{mock_builder, mock_context, noop_assets};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -235,12 +236,31 @@ async fn download_leaves_backend_available_but_install_and_cancel_are_exclusive(
     .unwrap();
     assert!(state.0.try_lock().is_ok());
     let held = state.0.lock().await;
-    assert!(install_exclusively::<()>(&state, || panic!(
-        "must not install during a backend mutation"
-    ))
+    let error = install_exclusively::<()>(&state, || {
+        panic!("must not install during a backend mutation")
+    })
     .await
-    .is_err());
+    .unwrap_err();
+    assert!(error.starts_with("上一个操作还没结束"), "{error}");
     drop(held);
+}
+
+#[tokio::test]
+async fn verified_install_waits_for_a_short_backend_operation() {
+    let (_server, backend, _fixture) = crate::tests::fixture().await;
+    let state = AppState(Mutex::new(backend));
+    let held = state.0.lock().await;
+    let (installed, _) = tokio::join!(
+        install_exclusively(&state, || {
+            assert!(state.0.try_lock().is_err());
+            Ok("installed")
+        }),
+        async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            drop(held);
+        }
+    );
+    assert_eq!(installed.unwrap(), "installed");
 }
 
 #[test]

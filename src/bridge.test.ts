@@ -171,3 +171,16 @@ it('refuses to prepare a preview service cleanup while the account still has dom
   await expect(dispatch('prepare_change',{kind:'cleanup_account',accountId:'demo-a'})).rejects.toThrow('此账号还有域名，请先移除域名');
   await expect(dispatch('prepare_change',{kind:'cleanup_account',accountId:'demo-b'})).resolves.toMatchObject({title:'清理远端资源'});
 });
+
+it('lets the preview clear one pending record through a plan, and refuses an unknown record', async () => {
+  window.history.replaceState({}, '', '/?preview=1&pendingPreview=1');
+  const {dispatch} = await import('./bridge');
+  const before = await dispatch<import('./types').State>('get_state');
+  expect(before.pendingOperations).toHaveLength(1);
+  const entry = before.pendingOperations[0];
+  await expect(dispatch('prepare_change',{kind:'dismiss_pending_operation',entry:'不存在的记录'})).rejects.toThrow('这条记录已经不在了');
+  const plan = await dispatch<{id:string;title:string}>('prepare_change',{kind:'dismiss_pending_operation',entry});
+  expect(plan.title).toBe('清除待处理记录');
+  const after = await dispatch<import('./types').State>('apply_plan',{planId:plan.id});
+  expect(after.pendingOperations).toEqual([]);
+});

@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { cleanup, fireEvent, render, screen, within } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import Dialog from './Dialog';
@@ -85,10 +85,90 @@ it('uses rendered geometry and includes fixed-position controls in the focus loo
   expect(document.activeElement).toBe(input);
 });
 
-it('starts on a field marked data-autofocus, otherwise on the first field', () => {
-  const { unmount } = render(<Dialog title="选择" onClose={() => {}}><select aria-label="账户"><option>甲</option></select><input aria-label="域名" data-autofocus /></Dialog>);
+it('starts on a field marked data-autofocus, then a text field, then a dropdown or other control', () => {
+  const { unmount } = render(<Dialog title="选择" onClose={() => {}}><input aria-label="名称" /><input aria-label="域名" data-autofocus /></Dialog>);
   expect(document.activeElement).toBe(screen.getByRole('textbox', {name:'域名'}));
   unmount();
-  render(<Dialog title="选择" onClose={() => {}}><select aria-label="账户"><option>甲</option></select><input aria-label="域名" /></Dialog>);
-  expect(document.activeElement).toBe(screen.getByRole('combobox', {name:'账户'}));
+  const second = render(<Dialog title="选择" onClose={() => {}}><select aria-label="账户"><option>甲</option></select><input type="checkbox" aria-label="公共 DNS" /><input aria-label="域名" /></Dialog>);
+  expect(document.activeElement).toBe(screen.getByRole('textbox', {name:'域名'}));
+  second.unmount();
+  const third = render(<Dialog title="选择" onClose={() => {}}><select aria-label="账户"><option>甲</option></select><textarea aria-label="备注" /></Dialog>);
+  expect(document.activeElement).toBe(screen.getByRole('textbox', {name:'备注'}));
+  third.unmount();
+  render(<Dialog title="选择" onClose={() => {}}><input type="checkbox" aria-label="公共 DNS" /><select aria-label="账户"><option>甲</option></select></Dialog>);
+  expect(document.activeElement).toBe(screen.getByRole('checkbox', {name:'公共 DNS'}));
+});
+
+it('never closes when the dimmed background is clicked', () => {
+  const onClose = vi.fn();
+  render(<Dialog title="表单" onClose={onClose}><input aria-label="名称" /></Dialog>);
+  const scrim = screen.getByRole('dialog').parentElement!;
+  fireEvent.mouseDown(scrim);
+  fireEvent.click(scrim);
+  expect(onClose).not.toHaveBeenCalled();
+});
+
+it('closes on the first Escape when nothing has been typed', () => {
+  const onClose = vi.fn();
+  render(<Dialog title="表单" onClose={onClose} hasUserInput={false}><input aria-label="名称" /></Dialog>);
+  fireEvent.keyDown(document, {key:'Escape'});
+  expect(onClose).toHaveBeenCalledTimes(1);
+});
+
+it('asks for a second Escape within 3 seconds before discarding typed content', () => {
+  vi.useFakeTimers();
+  try {
+    const onClose = vi.fn();
+    render(<Dialog title="表单" onClose={onClose} hasUserInput><input aria-label="名称" /></Dialog>);
+    const dialog = screen.getByRole('dialog');
+    fireEvent.keyDown(document, {key:'Escape'});
+    expect(onClose).not.toHaveBeenCalled();
+    expect(within(dialog).getByRole('status').textContent).toContain('再按一次 Esc 放弃已填的内容');
+    act(() => { vi.advanceTimersByTime(3100); });
+    expect(within(dialog).queryByText(/再按一次 Esc/)).toBeNull();
+    fireEvent.keyDown(document, {key:'Escape'});
+    expect(onClose).not.toHaveBeenCalled();
+    act(() => { vi.advanceTimersByTime(1000); });
+    fireEvent.keyDown(document, {key:'Escape'});
+    expect(onClose).toHaveBeenCalledTimes(1);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+it('does not close on Escape while dismissing is disabled, even with typed content', () => {
+  const onClose = vi.fn();
+  render(<Dialog title="表单" onClose={onClose} hasUserInput dismissDisabled><input aria-label="名称" /></Dialog>);
+  fireEvent.keyDown(document, {key:'Escape'});
+  fireEvent.keyDown(document, {key:'Escape'});
+  expect(onClose).not.toHaveBeenCalled();
+  expect(screen.queryByText(/再按一次 Esc/)).toBeNull();
+});
+
+it('does not treat a held-down Escape as the second press', () => {
+  const onClose = vi.fn();
+  render(<Dialog title="表单" onClose={onClose} hasUserInput><input aria-label="名称" /></Dialog>);
+  fireEvent.keyDown(document, {key:'Escape'});
+  fireEvent.keyDown(document, {key:'Escape', repeat:true});
+  fireEvent.keyDown(document, {key:'Escape', repeat:true});
+  expect(onClose).not.toHaveBeenCalled();
+  expect(screen.getByText(/再按一次 Esc/)).toBeTruthy();
+  fireEvent.keyDown(document, {key:'Escape'});
+  expect(onClose).toHaveBeenCalledTimes(1);
+});
+
+it('leaves an Escape that only cancels input-method candidates to the input method', () => {
+  const onClose = vi.fn();
+  const { unmount } = render(<Dialog title="表单" onClose={onClose} hasUserInput><input aria-label="名称" /></Dialog>);
+  fireEvent.keyDown(document, {key:'Escape', isComposing:true});
+  expect(screen.queryByText(/再按一次 Esc/)).toBeNull();
+  fireEvent.keyDown(document, {key:'Escape'});
+  fireEvent.keyDown(document, {key:'Escape', keyCode:229});
+  expect(onClose).not.toHaveBeenCalled();
+  unmount();
+  render(<Dialog title="表单" onClose={onClose}><input aria-label="名称" /></Dialog>);
+  fireEvent.keyDown(document, {key:'Escape', isComposing:true});
+  expect(onClose).not.toHaveBeenCalled();
+  fireEvent.keyDown(document, {key:'Escape'});
+  expect(onClose).toHaveBeenCalledTimes(1);
 });

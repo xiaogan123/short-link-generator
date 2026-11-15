@@ -9,7 +9,8 @@ const demoState: State = {
   appVersion: '0.0.0-preview',
   accounts: [
     { id: 'demo-a', label: '示例账户 · 团队', cloudflareName: 'Example team', zones: [{id:'demo-zone-1',name:'example.com',status:'active'},{id:'demo-zone-2',name:'example.org',status:'active'}], zoneCount: 2, checkedAt: now(), hasResources: true, needsSelftestKey: false, needsCredentialMigration: new URLSearchParams(window.location.search).get('legacyCredentials') === '1' },
-    { id: 'demo-b', label: '示例账户 · 个人', cloudflareName: 'Example personal', zones: [{id:'demo-zone-3',name:'example.net',status:'active'}], zoneCount: 1, checkedAt: now(), hasResources: false, needsSelftestKey: true, needsCredentialMigration: false },
+    // The extra zones let the batch dialog show every outcome: takeover skip, missing DNS, proxy skip and a slow network.
+    { id: 'demo-b', label: '示例账户 · 个人', cloudflareName: 'Example personal', zones: [{id:'demo-zone-3',name:'example.net',status:'active'},{id:'demo-zone-4',name:'old.example.com',status:'active'},{id:'demo-zone-5',name:'missing.example.net',status:'active'},{id:'demo-zone-6',name:'grey.example.net',status:'active'},{id:'demo-zone-7',name:'slow.example.net',status:'active'}], zoneCount: 5, checkedAt: now(), hasResources: false, needsSelftestKey: true, needsCredentialMigration: false },
   ],
   domains: [
     { id: 'demo-d1', accountId: 'demo-a', zoneId: 'demo-zone-1', host: 'go.example.com', prefix: 'r', routeId: 'demo-route-1' },
@@ -28,6 +29,10 @@ let local: State = structuredClone(demoState);
 const previewStatsAccounts = new Set<string>();
 const previewReadSessions = new Map<string,{scope:string;createdAt:number;queriedAt:string}>();
 let previewUpdatePending: {timer:number;cancel:()=>void}|null = null;
+// Optional example of an uncertain write that only the user can confirm and clear.
+if (preview && new URLSearchParams(window.location.search).get('pendingPreview') === '1') {
+  local.pendingOperations.push('添加域名 new.example.net：云端结果不确定，需要人工核对');
+}
 if (preview && new URLSearchParams(window.location.search).get('tokenRecoveryPreview') === '1') {
   local.accounts[0] = {...local.accounts[0],needsTokenRecovery:true};
 }
@@ -73,6 +78,11 @@ if (preview && new URLSearchParams(window.location.search).get('manyLinks') === 
   }
 }
 const plans = new Map<string, { plan: Plan; action: string; payload: Record<string, unknown> }>();
+// Preview-only DNS story: missing./grey. hosts lack a website record until a DNS plan is applied;
+// a fresh placeholder and slow. hosts each fail one network check first, like a certificate still being issued.
+const previewDnsFixed = new Set<string>();
+const previewNetworkHiccup = new Set<string>();
+const previewSlowSeen = new Set<string>();
 const clone = ():State => {const state=structuredClone(local);state.links=state.links.map(link=>{if(!link.poolId)return link;const pool=state.pools?.find(p=>p.id===link.poolId);if(!pool)return link;const code=encodeURIComponent(link.code||'');const candidate=pool.candidates.find(c=>c.enabled);return {...link,cnUrl:candidate?candidate.prefix+code+candidate.suffix:'',defaultUrl:pool.official.prefix+code+pool.official.suffix};});return state;};
 function makePlan(title: string, steps: string[], warnings: string[], action: string, payload: Record<string, unknown>, domainTakeoverConfirmation?: string): Plan {
   const plan: Plan = { id: uid(), title, steps, warnings, expiresAt: new Date(Date.now() + 300000).toISOString(), ...(domainTakeoverConfirmation ? { domainTakeoverConfirmation } : {}) };
@@ -112,7 +122,8 @@ function previewDispatch(action: Action, payload: Record<string, unknown>): unkn
     let readSessionId = requestedSession as string|undefined;
     let session = readSessionId ? previewReadSessions.get(readSessionId) : undefined;
     if (readSessionId && (!session || session.scope !== sessionScope || Date.now() < session.createdAt || Date.now()-session.createdAt >= 60000)) {
-      throw new Error('统计读取会话已过期或范围已变化，请刷新统计。');
+      // Same text as SESSION_EXPIRED in src-tauri/src/click_stats.rs, so StatsCenter's automatic re-read runs here too.
+      throw new Error('统计读取会话已过期或范围发生变化，请刷新后重新读取');
     }
     if (!session) {
       readSessionId = crypto.randomUUID();
@@ -195,7 +206,7 @@ function previewDispatch(action: Action, payload: Record<string, unknown>): unkn
     const managedDomain = local.domains.find(domain => domain.host === host);
     const isManaged = Boolean(managedDomain);
     const needsTakeover = !isManaged && host.endsWith('.example.com');
-    const checks = [
+    const checks: DomainPreparation['checks'] = [
       { label: '域名格式', ok: true, level: 'pass' as const, message: '格式有效。' },
       { label: '区域与代理', ok: true, level: 'pass' as const, message: '示例数据：已启用域名与代理状态。' },
       isManaged
@@ -204,6 +215,15 @@ function previewDispatch(action: Action, payload: Record<string, unknown>): unkn
           ? { label: '现有网页', ok: true, level: 'warning' as const, message: `示例数据：${host}/${prefix}/ 及随机子路径返回 HTTP 200，确认后可将该目录用于短链接。` }
           : { label: '链接目录', ok: true, level: 'pass' as const, message: '示例数据：目录与随机子路径均返回 404；未发起真实探测。' },
     ];
+    const dnsMissing = !isManaged && (host.startsWith('missing.') || host.startsWith('grey.')) && !previewDnsFixed.has(host);
+    if (dnsMissing) checks[1] = { label: 'DNS', ok: false, level: 'error' as const, message: '示例数据：这个主机名还没有开启代理的网站解析。' };
+    let slowFirst = false;
+    if (!isManaged && !dnsMissing) {
+      if (previewNetworkHiccup.delete(host)) slowFirst = true;
+      else if (host.startsWith('slow.') && !previewSlowSeen.has(host)) { previewSlowSeen.add(host); slowFirst = true; }
+    }
+    if (slowFirst) checks[2] = { label: '链接目录', ok: false, level: 'error', reason: 'probe_timeout', message: '示例数据：访问检查超时，再查一次通常就好。' };
+    if (dnsMissing || slowFirst) return { host, prefix, candidates, checks, canApply: false } satisfies DomainPreparation;
     const candidate = candidates.length === 1 ? candidates[0] : undefined;
     const confirmation = needsTakeover ? `确认将 ${host}/${prefix}/ 及其所有下级内容改作短链接。原该目录内网页将不能继续按原方式访问。` : undefined;
     const plan = candidate && !isManaged ? makePlan(`添加 ${host}`, [`在 ${candidate.label} 上配置 ${host}/${prefix}/*`, '保存域名与路由关系'], ['本地预览使用示例数据，不会连接云服务。'], 'add_domain', { host, prefix, accountId: candidate.accountId, zoneId: candidate.zoneId }, confirmation) : undefined;
@@ -211,9 +231,10 @@ function previewDispatch(action: Action, payload: Record<string, unknown>): unkn
   }
   if (action === 'prepare_domain_dns') {
     const host = normalizeHost(String(payload.input || ''));
-    const candidates = local.accounts.filter(a => !payload.accountId || a.id === payload.accountId).flatMap(a => (a.zones || []).filter(zone => zone.status === 'active' && (host === zone.name || host.endsWith(`.${zone.name}`))).map(zone => ({accountId:a.id,label:a.label,zoneId:zone.id,status:zone.status})));
+    // Like Cloudflare, a host belongs to the most specific zone of an account.
+    const candidates = local.accounts.filter(a => !payload.accountId || a.id === payload.accountId).flatMap(a => (a.zones || []).filter(zone => zone.status === 'active' && (host === zone.name || host.endsWith(`.${zone.name}`))).sort((x, y) => y.name.length - x.name.length).slice(0, 1).map(zone => ({accountId:a.id,label:a.label,zoneId:zone.id,status:zone.status})));
     const selected = candidates.length === 1 ? candidates[0] : undefined;
-    const status = host.startsWith('missing.') ? 'missing' : host.startsWith('grey.') ? 'dnsOnly' : 'ready';
+    const status = previewDnsFixed.has(host) ? 'ready' : host.startsWith('missing.') ? 'missing' : host.startsWith('grey.') ? 'dnsOnly' : 'ready';
     const actions = status === 'missing' ? [{kind:'createPlaceholder' as const,recordType:'AAAA',name:host}] : status === 'dnsOnly' ? [{kind:'enableProxy' as const,recordType:'A',name:host}] : [];
     const checks = status === 'ready' ? [{label:'DNS 与代理',ok:true,level:'pass' as const,message:'示例数据：当前主机已使用代理。'}] : status === 'missing' ? [{label:'DNS 记录',ok:false,level:'error' as const,message:'示例数据：精确主机名没有 DNS 记录。可创建一条代理 AAAA 占位记录。'}] : [{label:'DNS 代理',ok:false,level:'error' as const,message:'示例数据：精确主机名的记录未启用代理。可保持记录内容不变，只开启代理。'}];
     const plan = selected && status !== 'ready' ? makePlan(`修复 ${host} 的 DNS 与代理`, actions.map(item => item.kind === 'createPlaceholder' ? `为 ${item.name} 创建代理 ${item.recordType} 占位记录` : `为 ${item.name} 的 ${item.recordType} 记录开启代理`), ['这只修改此精确主机名的 DNS/代理状态，不会接入短链接目录。'], 'fix_domain_dns', {host,accountId:selected.accountId,zoneId:selected.zoneId}) : undefined;
@@ -258,6 +279,11 @@ function previewDispatch(action: Action, payload: Record<string, unknown>): unkn
       if (!account || account.hasResources || !local.pendingActions.some(a => a.kind === kind && a.accountId === account.id)) throw new Error('当前账户无需找回检测配置，请重新核对状态。');
       return makePlan('找回检测服务配置', ['只读核对云端唯一的检测服务及其归属', '登记本机检测配置，保留已有密钥与待处理记录', '完成后另行确认恢复检测密钥'], ['本地预览只模拟找回配置，不读取真实凭据或访问云服务。'], kind, {accountId:account.id});
     }
+    if (kind === 'dismiss_pending_operation') {
+      const entry = typeof payload.entry === 'string' ? payload.entry : '';
+      if (!entry || !local.pendingOperations.includes(entry)) throw new Error('这条记录已经不在了，可能已经被自动清掉。请点一下「刷新数据」看最新情况');
+      return makePlan('清除待处理记录', ['只从本机删除这条记录，不改动云端', `要清除的记录：${entry}`], ['请先确认这条记录对应的云端状态已经核对过', '本地预览只模拟操作，不连接云端。'], kind, {entry});
+    }
     if (kind === 'upgrade_worker' || kind === 'resume_worker_upgrade' || kind === 'dismiss_worker_upgrade') {
       if (!local.accounts.some(a => a.id === payload.accountId && a.hasResources)) throw new Error('账户尚未部署短链接服务。');
       return makePlan(kind === 'dismiss_worker_upgrade' ? '解除本机升级记录' : '升级云端跳转服务',
@@ -277,6 +303,11 @@ function previewDispatch(action: Action, payload: Record<string, unknown>): unkn
     if (item.plan.domainTakeoverConfirmation && payload.acknowledgeDomainTakeover !== true) throw new Error('请先确认链接目录的接管范围。');
     if (item.action === 'migrate_credentials' && payload.acknowledgeCredentialMigration !== true) throw new Error('请先确认更新本机授权。');
     plans.delete(item.plan.id);
+    if (item.action === 'dismiss_pending_operation') {
+      const index = local.pendingOperations.indexOf(String(p.entry));
+      if (index < 0) throw new Error('这条记录已经不在了，可能已经被自动清掉。请点一下「刷新数据」看最新情况');
+      local.pendingOperations = local.pendingOperations.filter((_, i) => i !== index);
+    }
     if (item.action === 'migrate_credentials') local.accounts = local.accounts.map(a => a.id === p.accountId ? {...a, needsCredentialMigration:false} : a);
     if (item.action === 'enable_click_stats') previewStatsAccounts.add(String(p.accountId));
     if (item.action === 'disable_click_stats') previewStatsAccounts.delete(String(p.accountId));
@@ -289,6 +320,7 @@ function previewDispatch(action: Action, payload: Record<string, unknown>): unkn
       local.accounts = local.accounts.map(a => a.id === account.id ? {...a,hasResources:true} : a);
       local.pendingActions = local.pendingActions.map(a => a.kind === item.action && a.accountId === account.id ? {...a,kind:'recover_selftest_rotation',label:'恢复旧版自检密钥操作'} : a);
     }
+    if (item.action === 'fix_domain_dns') { previewDnsFixed.add(String(p.host)); previewNetworkHiccup.add(String(p.host)); }
     if (item.action === 'add_domain') local.domains.push({ id: uid(), host: String(p.host), prefix: String(p.prefix), accountId: String(p.accountId), zoneId: String(p.zoneId), routeId: `demo-route-${uid()}` });
     if (item.action === 'save_link') {
       if (p.createOnly === true && local.links.some(l => l.domainId === p.domainId && l.slug.toLowerCase() === String(p.slug).toLowerCase())) throw new Error('这个名称已被使用，请换一个名称。现有链接不会被覆盖。');

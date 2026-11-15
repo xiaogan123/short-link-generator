@@ -57,6 +57,29 @@ async fn send_read(
     }
 }
 
+/// A write whose connection never opened (connect or TLS failure) did not
+/// reach Cloudflare, so its outcome is known: this request changed nothing.
+/// The text speaks only about this step: earlier steps of the same operation
+/// may already be applied, and their rollback may fail on the same network.
+/// Any other transport error happened after the request may have been sent.
+fn write_transport_error(error: &reqwest::Error, uncertain_message: &str) -> CloudError {
+    if error.is_connect() {
+        CloudError::no_response("连不上云端，这一步没有发出去，请检查网络后重试", false)
+    } else {
+        CloudError::no_response(uncertain_message, true)
+    }
+}
+
+/// A non-2xx write response. A 5xx or 408 may hide an applied write and uses
+/// the same wording as `send()`; other statuses keep the caller's text.
+fn write_status_error(status: StatusCode, definite: String) -> CloudError {
+    if status.is_server_error() || status == StatusCode::REQUEST_TIMEOUT {
+        CloudError::new(failure_message(status, None, true), true)
+    } else {
+        CloudError::new(definite, uncertain_write_status(status))
+    }
+}
+
 fn read_transport_message(error: &reqwest::Error) -> &'static str {
     if error.is_timeout() {
         "连接云端超时，请检查网络"
@@ -128,7 +151,7 @@ fn failure_message(status: StatusCode, code: Option<i64>, uncertain_write: bool)
     let http = status.as_u16();
     // A write that may have been applied must not read like a plain retry.
     let outcome = if uncertain_write {
-        "写入结果不确定，请先查看待处理操作再继续"
+        "写入结果不确定，请先到页面上方「查看待处理记录」里核对再继续"
     } else {
         "请稍后再试"
     };
@@ -452,7 +475,10 @@ impl Cloud {
             };
             let response = sent.map_err(|error| {
                 if write {
-                    CloudError::no_response("云端写入结果不确定，请检查操作记录", true)
+                    write_transport_error(
+                        &error,
+                        "云端写入结果不确定，请到页面上方「查看待处理记录」里核对",
+                    )
                 } else {
                     CloudError::no_response(read_transport_message(&error), false)
                 }
@@ -683,15 +709,20 @@ impl Cloud {
                 .header("content-type", "application/json")
                 .send()
                 .await
-                .map_err(|_| CloudError::new("云端写入结果不确定，请检查操作记录", true))?;
+                .map_err(|error| {
+                    write_transport_error(
+                        &error,
+                        "云端写入结果不确定，请到页面上方「查看待处理记录」里核对",
+                    )
+                })?;
             if response.status() == StatusCode::TOO_MANY_REQUESTS && attempt < 3 {
                 tokio::time::sleep(Duration::from_secs(1 << attempt)).await;
                 continue;
             }
             if !response.status().is_success() {
-                return Err(CloudError::new(
+                return Err(write_status_error(
+                    response.status(),
                     format!("写入云端记录失败（HTTP {}）", response.status().as_u16()),
-                    uncertain_write_status(response.status()),
                 ));
             }
             return Ok(());
@@ -757,15 +788,20 @@ impl Cloud {
                 .multipart(form)
                 .send()
                 .await
-                .map_err(|_| CloudError::new("Worker 上传结果不确定，请检查操作记录", true))?;
+                .map_err(|error| {
+                    write_transport_error(
+                        &error,
+                        "云端跳转服务上传结果不确定，请到页面上方「查看待处理记录」里核对",
+                    )
+                })?;
             if response.status() == StatusCode::TOO_MANY_REQUESTS && attempt < 3 {
                 tokio::time::sleep(Duration::from_secs(1 << attempt)).await;
                 continue;
             }
             if !response.status().is_success() {
-                return Err(CloudError::new(
+                return Err(write_status_error(
+                    response.status(),
                     format!("Worker 上传失败（HTTP {}）", response.status().as_u16()),
-                    uncertain_write_status(response.status()),
                 ));
             }
             let value: Value = response
@@ -834,11 +870,16 @@ impl Cloud {
             .multipart(form)
             .send()
             .await
-            .map_err(|_| CloudError::new("Worker 上传结果不确定，请从待处理操作核对", true))?;
+            .map_err(|error| {
+                write_transport_error(
+                    &error,
+                    "云端跳转服务上传结果不确定，请到页面上方「查看待处理记录」里核对",
+                )
+            })?;
         if !response.status().is_success() {
-            return Err(CloudError::new(
+            return Err(write_status_error(
+                response.status(),
                 format!("Worker 上传失败（HTTP {}）", response.status().as_u16()),
-                uncertain_write_status(response.status()),
             ));
         }
         let value: Value = response
@@ -1256,6 +1297,112 @@ mod tests {
                 .unwrap_err();
             assert!(error.uncertain, "{method}");
             assert_eq!(connections.load(Ordering::SeqCst), 1, "{method}");
+        }
+        // KV writes and Worker uploads treat a lost response the same way.
+        let (base, _) = flaky_server(usize::MAX, "").await;
+        let cloud = Cloud::for_test(&base);
+        let error = cloud
+            .write_value("synthetic-token", "acct", "ns", "key", "{}")
+            .await
+            .unwrap_err();
+        assert!(error.uncertain, "{}", error.message);
+        let error = cloud
+            .upload_script("synthetic-token", "acct", "edge", "ns", "00")
+            .await
+            .unwrap_err();
+        assert!(error.uncertain, "{}", error.message);
+    }
+
+    /// A base URL whose port refuses connections: the request never leaves.
+    async fn refused_base() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        format!("http://{address}/client/v4/")
+    }
+
+    #[tokio::test]
+    async fn writes_that_never_connected_are_definite_failures() {
+        let cloud = Cloud::for_test(&refused_base().await);
+        let mut errors = vec![
+            cloud
+                .post("synthetic-token", "zones", json!({}))
+                .await
+                .unwrap_err(),
+            cloud
+                .write_value("synthetic-token", "acct", "ns", "key", "{}")
+                .await
+                .unwrap_err(),
+            cloud
+                .upload_script("synthetic-token", "acct", "edge", "ns", "00")
+                .await
+                .unwrap_err(),
+        ];
+        let settings =
+            json!({"bindings":[{"type":"kv_namespace","name":"LINKS","namespace_id":"ns"}]});
+        errors.push(
+            cloud
+                .upload_worker_upgrade("synthetic-token", "acct", "edge", "ns", &settings, b"x")
+                .await
+                .unwrap_err(),
+        );
+        for error in errors {
+            assert!(!error.uncertain, "{}", error.message);
+            assert!(error.network, "{}", error.message);
+            assert!(
+                error.message.contains("这一步没有发出去"),
+                "{}",
+                error.message
+            );
+            // Callers append rollback results to this text, so it must not
+            // promise that the whole operation left the cloud untouched.
+            assert!(!error.message.contains("没有改动云端"), "{}", error.message);
+            assert!(!error.message.contains("不确定"), "{}", error.message);
+        }
+    }
+
+    #[tokio::test]
+    async fn kv_and_worker_write_server_errors_say_the_outcome_is_unknown() {
+        use wiremock::{
+            matchers::{method, path_regex},
+            Mock, MockServer, ResponseTemplate,
+        };
+        for (status, uncertain) in [(502, true), (408, true), (409, false), (403, false)] {
+            let server = MockServer::start().await;
+            Mock::given(method("PUT"))
+                .and(path_regex("^/client/v4/accounts/acct/"))
+                .respond_with(ResponseTemplate::new(status))
+                .mount(&server)
+                .await;
+            let cloud = Cloud::for_test(&format!("{}/client/v4/", server.uri()));
+            let settings =
+                json!({"bindings":[{"type":"kv_namespace","name":"LINKS","namespace_id":"ns"}]});
+            let errors = [
+                cloud
+                    .write_value("synthetic-token", "acct", "ns", "key", "{}")
+                    .await
+                    .unwrap_err(),
+                cloud
+                    .upload_script("synthetic-token", "acct", "edge", "ns", "00")
+                    .await
+                    .unwrap_err(),
+                cloud
+                    .upload_worker_upgrade("synthetic-token", "acct", "edge", "ns", &settings, b"x")
+                    .await
+                    .unwrap_err(),
+            ];
+            for error in errors {
+                assert_eq!(error.uncertain, uncertain, "{status}: {}", error.message);
+                assert_eq!(
+                    error
+                        .message
+                        .contains("写入结果不确定，请先到页面上方「查看待处理记录」里核对再继续"),
+                    uncertain,
+                    "{status}: {}",
+                    error.message
+                );
+                assert!(error.message.contains(&format!("HTTP {status}")));
+            }
         }
     }
 }

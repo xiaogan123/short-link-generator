@@ -3,7 +3,7 @@ import type { MonitorResultStatus, MonitorSummary, VisibleMonitorRecord } from '
 import './RedirectMonitor.css';
 
 export function monitorDisplay(record:VisibleMonitorRecord|null) {
-  if (!record) return {label:'尚未巡检',tone:'slate' as const};
+  if (!record) return {label:'本次打开后还没检查',tone:'slate' as const};
   if (record.stale) return {label:record.unresolvedAlert ? '异常待确认恢复 · 已过期' : '结果已过期',tone:'amber' as const};
   if (record.phase === 'healthy') return {label:'首跳符合预期',tone:'green' as const};
   if (record.phase === 'alert') return {label:'首跳异常',tone:'red' as const};
@@ -37,6 +37,9 @@ type Props = {
   totalLinks?:number;
   summary?:MonitorSummary;
   resultStatus?:MonitorResultStatus;
+  /** Set when the result comes from the last round before this app start. */
+  previousRunAt?:string|null;
+  backendBusy?:boolean;
 };
 function formatDate(value:string|null) {
   if (!value) return '尚未完成';
@@ -44,17 +47,18 @@ function formatDate(value:string|null) {
   return Number.isFinite(date.getTime()) ? new Intl.DateTimeFormat('zh-CN',{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'}).format(date) : '尚未完成';
 }
 
-export default function RedirectMonitor({enabled,active,online,progress,lastCompletion,onEnabled,onRun,disabled,ready=true,nextCheckAt,runKind='full',pendingChanges=0,totalLinks,summary,resultStatus='unverified'}:Props) {
+export default function RedirectMonitor({enabled,active,online,progress,lastCompletion,onEnabled,onRun,disabled,ready=true,nextCheckAt,runKind='full',pendingChanges=0,totalLinks,summary,resultStatus='unverified',previousRunAt=null,backendBusy=false}:Props) {
   const attention = summary ? summary.alert + summary.unresolved + summary.attention : 0;
-  const resultText = resultStatus === 'healthy' ? '上次巡检：全部首跳符合预期'
+  const resultText = resultStatus === 'healthy' ? (previousRunAt ? `上一轮（${formatDate(previousRunAt)}）全部符合预期，本次打开后还没重新检查` : '上次巡检：全部首跳符合预期')
     : resultStatus === 'attention' ? `上次巡检：${attention > 0 ? `${attention} 条链接需关注` : '有链接需关注'}`
-      : resultStatus === 'stale' ? '上次巡检结果已过期，等待重新检查'
+      : resultStatus === 'stale' ? (previousRunAt ? `上一轮（${formatDate(previousRunAt)}）的结果已过期，等待重新检查` : '上次巡检结果已过期，等待重新检查')
         : '巡检结果：尚未完成有效巡检';
   const waiting = !enabled ? '开启后自动开始'
     : !ready ? '等待读取本机配置'
       : totalLinks === 0 ? '等待添加短链接'
         : !online ? '等待网络连接'
           : disabled ? '当前操作结束后继续'
+            : backendBusy ? '后台正忙，过几分钟自动接着查'
             : pendingChanges > 0 ? `等待检查 ${pendingChanges} 条新增或修改的链接`
               : '等待下次巡检';
   const activity = runKind === 'confirm' ? '正在复查首跳结果'
@@ -68,7 +72,7 @@ export default function RedirectMonitor({enabled,active,online,progress,lastComp
       </div>
     </div>
     {enabled && ready && !active && (totalLinks ?? 0) > 0 && <p className={`redirect-monitor-result ${resultStatus}`} aria-live="polite">{resultStatus === 'healthy' ? <CheckCircle size={16} weight="fill" aria-hidden="true"/> : <WarningCircle size={16} aria-hidden="true"/>}{resultText}</p>}
-    <div className="redirect-monitor-meta"><span role={enabled ? "status" : undefined}>{active ? activity : waiting}</span><span>上次整轮完成：{formatDate(lastCompletion)}</span>{enabled && nextCheckAt && <span>下次预计：{formatDate(nextCheckAt)}{(!online || disabled || !ready) && ' · 条件恢复后执行'}</span>}</div>
+    <div className="redirect-monitor-meta"><span role={enabled ? "status" : undefined}>{active ? activity : waiting}</span><span>{lastCompletion ? `上次整轮完成：${formatDate(lastCompletion)}` : '本次打开后还没跑完一整轮'}</span>{enabled && nextCheckAt && <span>下次预计：{formatDate(nextCheckAt)}{(!online || disabled || !ready) && ' · 条件恢复后执行'}</span>}</div>
     {active && runKind !== 'confirm' && progress.total > 0 && <progress className="redirect-monitor-progress" aria-label="本次巡检进度" value={progress.done} max={progress.total}/>}
     <p className="redirect-monitor-note">仅检查本机网络看到的首跳及预期地址；不代表大陆网络或目标网站可达。巡检会产生正常的短链接请求，巡检请求不计入点击统计。</p>
   </section>;

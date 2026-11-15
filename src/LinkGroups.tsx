@@ -1,4 +1,4 @@
-import { Fragment, useId, useRef, useState } from "react";
+import { Fragment, useEffect, useId, useRef, useState } from "react";
 import { ChartBar, CaretDown, CaretLeft, CaretRight, Copy, Globe, PencilSimple, Plus, ShieldCheck, Trash } from "@phosphor-icons/react";
 import { shortUrl } from "./validators";
 import type { Domain, Link, Pool } from "./types";
@@ -20,8 +20,13 @@ type Props = {
   pools: Pool[];
   getDetection: (link: Link) => LinkDetection;
   getAutoDetection?: (link: Link) => VisibleMonitorRecord | null;
-  onCopy: (url: string) => void;
+  /** Resolves to false when copying failed, so the button does not claim success. */
+  onCopy: (url: string) => void | boolean | Promise<boolean | void>;
   onCheck: (link: Link, domain: Domain) => void;
+  /** True while a check for this link is still running, including one the user stopped waiting for. */
+  isChecking?: (link: Link) => boolean;
+  /** Changes when the search or filter changes; only then does the list return to page 1. */
+  resetKey?: string;
   onStats?: (link: Link, domain: Domain) => void;
   onEdit: (link: Link, usePlatform?: boolean) => void;
   onDelete: (link: Link, domain: Domain) => void;
@@ -29,6 +34,7 @@ type Props = {
 };
 
 const pageSizes = [25, 50, 100] as const;
+const COPIED_MS = 2000;
 
 function formatUpdated(value: string) {
   if (!value) return "暂无更新时间";
@@ -112,27 +118,51 @@ function Targets({ link, pool }: { link: Link; pool: Pool | undefined }) {
   );
 }
 
-function LinkGroupSection({ domain, links, pools, getDetection, getAutoDetection, onCopy, onCheck, onStats, onEdit, onDelete, onCreate, busy = false }: Props & LinkGroup) {
+function LinkGroupSection({ domain, links, pools, getDetection, getAutoDetection, onCopy, onCheck, isChecking, onStats, onEdit, onDelete, onCreate, busy = false, resetKey = "" }: Props & LinkGroup) {
   const detailPrefix = useId();
   const [pageSize, setPageSize] = useState<(typeof pageSizes)[number]>(25);
-  const [pageState, setPageState] = useState({ linkKey: "", page: 1 });
+  const [pageState, setPageState] = useState({ linkKey: "", resetKey, page: 1 });
   const [expanded, setExpanded] = useState<Set<string>>(() => new Set());
+  const [copied, setCopied] = useState("");
   const headerRef = useRef<HTMLElement>(null);
+  const mounted = useRef(true);
+  // Set on every mount: StrictMode runs the cleanup once before the real mount.
+  useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
+  useEffect(() => {
+    if (!copied) return;
+    const timer = window.setTimeout(() => setCopied(""), COPIED_MS);
+    return () => window.clearTimeout(timer);
+  }, [copied]);
   // Keyed by the set of slugs: editing a link may reorder it, which must not
-  // reset the page or collapse details; adding or removing one still does.
-  const linkKey = JSON.stringify(links.map((link) => link.slug).sort());
-  if (pageState.linkKey !== linkKey) {
-    setPageState({ linkKey, page: 1 });
-    setExpanded(new Set());
+  // reset the page or collapse details. Removing links (for example deleting one)
+  // keeps the current page and the details still open; a new search or filter,
+  // or a newly added link, starts again from page 1.
+  const slugs = links.map((link) => link.slug).sort();
+  const linkKey = JSON.stringify(slugs);
+  if (pageState.linkKey !== linkKey || pageState.resetKey !== resetKey) {
+    const previous = new Set<string>(pageState.linkKey ? JSON.parse(pageState.linkKey) as string[] : []);
+    const onlyRemoved = pageState.resetKey === resetKey && slugs.every((slug) => previous.has(slug));
+    if (onlyRemoved) {
+      const remaining = new Set(slugs);
+      setPageState({ linkKey, resetKey, page: Math.min(pageState.page, Math.max(1, Math.ceil(links.length / pageSize))) });
+      setExpanded((current) => new Set([...current].filter((slug) => remaining.has(slug))));
+    } else {
+      setPageState({ linkKey, resetKey, page: 1 });
+      setExpanded(new Set());
+    }
   }
   const pageCount = Math.max(1, Math.ceil(links.length / pageSize));
   const page = pageState.linkKey === linkKey ? Math.min(pageState.page, pageCount) : 1;
+  const copy = async (slug: string, url: string) => {
+    const result = await onCopy(url);
+    if (result !== false && mounted.current) setCopied(slug);
+  };
   const start = (page - 1) * pageSize;
   const visible = links.slice(start, start + pageSize);
   const poolById = new Map(pools.map((pool) => [pool.id, pool]));
   const showPageStart = () => headerRef.current?.scrollIntoView?.({ block: "start" });
   const choosePage = (next: number) => {
-    setPageState({ linkKey, page: Math.min(Math.max(next, 1), pageCount) });
+    setPageState({ linkKey, resetKey, page: Math.min(Math.max(next, 1), pageCount) });
     showPageStart();
   };
   const toggleDetails = (slug: string) => setExpanded((current) => {
@@ -172,6 +202,8 @@ function LinkGroupSection({ domain, links, pools, getDetection, getAutoDetection
                 const automatic = getAutoDetection?.(link) || null;
                 const automaticDisplay = getAutoDetection ? monitorDisplay(automatic) : null;
                 const open = expanded.has(link.slug);
+                const checking = Boolean(isChecking?.(link));
+                const justCopied = copied === link.slug;
                 const detailId = `${detailPrefix}-${encodeURIComponent(link.slug)}`;
                 return (
                   <Fragment key={`${domain.id}:${link.slug}`}>
@@ -195,8 +227,8 @@ function LinkGroupSection({ domain, links, pools, getDetection, getAutoDetection
                       </td>
                       <td className="slg-action-cell">
                         <div className="slg-actions">
-                          <button className="slg-copy" type="button" aria-label={`复制 ${link.slug}`} title="复制链接" onClick={() => onCopy(url)}><Copy size={15} aria-hidden="true" /><span>复制</span></button>
-                          <button type="button" aria-label={`检测 ${link.slug}`} title="检测链接" onClick={() => onCheck(link, domain)}><ShieldCheck size={15} aria-hidden="true" /><span>检测</span></button>
+                          <button className={`slg-copy${justCopied ? " slg-copied" : ""}`} type="button" aria-label={`复制 ${link.slug}`} title="复制链接" onClick={() => void copy(link.slug, url)}><Copy size={15} aria-hidden="true" /><span aria-live="polite">{justCopied ? "已复制 ✓" : "复制"}</span></button>
+                          <button className={checking ? "slg-checking" : undefined} type="button" aria-label={`检测 ${link.slug}`} aria-busy={checking || undefined} title={checking ? "检测进行中" : "检测链接"} onClick={() => onCheck(link, domain)}><ShieldCheck size={15} aria-hidden="true" /><span>{checking ? "检测中…" : "检测"}</span></button>
                           {onStats && <button type="button" aria-label={`点击统计 ${link.slug}`} title="查看点击统计" onClick={() => onStats(link, domain)}><ChartBar size={15} aria-hidden="true" /><span>统计</span></button>}
                           <button type="button" aria-label={`编辑 ${link.slug}`} title="编辑链接" onClick={() => onEdit(link)}><PencilSimple size={15} aria-hidden="true" /><span>编辑</span></button>
                           <button className="slg-details-toggle" type="button" aria-label={`详情 ${link.slug}`} aria-expanded={open} aria-controls={open ? detailId : undefined} onClick={() => toggleDetails(link.slug)}><CaretDown size={15} aria-hidden="true" /><span>详情</span></button>
@@ -224,7 +256,7 @@ function LinkGroupSection({ domain, links, pools, getDetection, getAutoDetection
           </table>
           {links.length > pageSizes[0] && <div className="slg-pagination" aria-label={`${domain.host} 的分页`}>
             <span>显示 {start + 1}–{start + visible.length} / 共 {links.length} 条</span>
-            <label>每页 <select aria-label={`${domain.host} 每页条数`} value={pageSize} onChange={(event) => { setPageSize(Number(event.target.value) as (typeof pageSizes)[number]); setPageState({ linkKey, page: 1 }); showPageStart(); }}>
+            <label>每页 <select aria-label={`${domain.host} 每页条数`} value={pageSize} onChange={(event) => { setPageSize(Number(event.target.value) as (typeof pageSizes)[number]); setPageState({ linkKey, resetKey, page: 1 }); showPageStart(); }}>
               {pageSizes.map((size) => <option value={size} key={size}>{size}</option>)}
             </select> 条</label>
             <div className="slg-page-controls">

@@ -1,7 +1,7 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, expect, it, vi } from "vitest";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import StatsCenter from "./StatsCenter";
+import StatsCenter, { resetStatsCenterCache } from "./StatsCenter";
 import App from "./App";
 import { dispatch } from "./bridge";
 import type { Account, ClickStatsTotals, Domain, Link, StatsCenterReport, StatsCenterRow } from "./types";
@@ -97,6 +97,7 @@ async function expectSummary(value: string) {
 afterEach(() => {
   cleanup();
   vi.clearAllMocks();
+  resetStatsCenterCache();
 });
 
 it("reads every account page serially, sums each account once, and drills into links", async () => {
@@ -143,11 +144,10 @@ it("reads every account page serially, sums each account once, and drills into l
   expect(screen.queryByLabelText("全部账户估算汇总")).toBeNull();
 });
 
-it("reuses a validated overview page for drilldown and fetches only the next page", async () => {
+it("reuses every overview page for drilldown and pages locally without new requests", async () => {
   mockedDispatch.mockResolvedValueOnce(response({ totalLinks: 30, rows: aPageRows(1) }))
     .mockResolvedValueOnce(response({ page: 2, totalLinks: 30, rows: aPageRows(2) }))
-    .mockResolvedValueOnce(response({ accountId: "account-b", status: "no_data", totals: undefined, rows: [row("domain-b1", "welcome", zeroTotals)] }))
-    .mockResolvedValueOnce(response({ page: 2, totalLinks: 30, rows: aPageRows(2) }));
+    .mockResolvedValueOnce(response({ accountId: "account-b", status: "no_data", totals: undefined, rows: [row("domain-b1", "welcome", zeroTotals)] }));
   render(view());
   fireEvent.click(screen.getByRole("button", { name: "读取统计" }));
   const table = await screen.findByRole("table", { name: "账户统计总览" });
@@ -157,8 +157,12 @@ it("reuses a validated overview page for drilldown and fetches only the next pag
   expect(mockedDispatch).toHaveBeenCalledTimes(3);
   fireEvent.click(screen.getByRole("button", { name: "下一页统计" }));
   expect(await screen.findByText(/第 2 \/ 2 页/)).toBeTruthy();
-  expect(mockedDispatch).toHaveBeenCalledTimes(4);
-  expect(mockedDispatch).toHaveBeenLastCalledWith("get_stats_center", { accountId: "account-a", days: 7, page: 2, pageSize: 25 });
+  expect(screen.getByText("/sample-30")).toBeTruthy();
+  expect(screen.queryByText("/sample-01")).toBeNull();
+  fireEvent.click(screen.getByRole("button", { name: "上一页统计" }));
+  expect(await screen.findByText(/第 1 \/ 2 页/)).toBeTruthy();
+  expect(screen.getByText("/sample-01")).toBeTruthy();
+  expect(mockedDispatch).toHaveBeenCalledTimes(3);
 });
 
 it.each(["request failure", "wrong page identities"])("keeps later links unread after %s and skips remaining pages", async (failure) => {
@@ -344,7 +348,7 @@ it("queries only after an explicit read and sends one selected account and scope
   expect(stop.closest(".scenter-footer")).toBeTruthy();
   expect(screen.getByText("停用前会显示变更计划")).toBeTruthy();
   fireEvent.click(screen.getByRole("button", { name: "查看 sample-01 的详细统计" }));
-  expect(onOpenLinkStats).toHaveBeenCalledWith(links[0], domains[0]);
+  expect(onOpenLinkStats).toHaveBeenCalledWith(links[0], domains[0], 30);
 });
 
 it("hides the previous scope immediately when account, domain, or days changes", async () => {
@@ -417,7 +421,8 @@ it("keeps page responses scoped and uses a fixed page size of 25", async () => {
   expect(await screen.findByText(/第 1 \/ 2 页/)).toBeTruthy();
   fireEvent.click(screen.getByRole("button", { name: "下一页统计" }));
   expect(screen.getByText(/第 2 \/ 2 页/)).toBeTruthy();
-  fireEvent.click(screen.getByRole("button", { name: "上一页统计" }));
+  fireEvent.click(screen.getByRole("button", { name: "停止等待" }));
+  fireEvent.click(screen.getByRole("button", { name: "读取统计" }));
   latestFirstPage.resolve(response({
     totalLinks: 30,
     totals: { total: 111, likelyHuman: 90, likelyBot: 12, unknown: 9, previews: 1, prefetches: 1 },
@@ -719,4 +724,240 @@ it('does not retry a continuation that failed for another reason',async()=>{
   fireEvent.click(screen.getByRole('button',{name:'下一页统计'}));
   expect(await screen.findByText('网络连接失败')).toBeTruthy();
   expect(mockedDispatch.mock.calls.filter((call)=>call[1]?.page===2)).toHaveLength(1);
+});
+
+const busyText = "上一个操作还没结束，已经等了几秒。请稍后再点一次；如果屏幕上有系统的钥匙串窗口，请先处理它。";
+const flush = async (ms = 0) => { await act(async () => { await vi.advanceTimersByTimeAsync(ms); }); };
+
+it("disables both page buttons while a page is loading so a double click sends one request", async () => {
+  const secondPage = deferred<StatsCenterReport>();
+  mockedDispatch.mockResolvedValueOnce(response({ totalLinks: 60, rows: aPageRows(1) }))
+    .mockImplementationOnce(() => secondPage.promise);
+  render(view());
+  chooseAccount();
+  fireEvent.click(screen.getByRole("button", { name: "读取统计" }));
+  expect(await screen.findByText(/第 1 \/ 3 页/)).toBeTruthy();
+  const next = screen.getByRole("button", { name: "下一页统计" }) as HTMLButtonElement;
+  fireEvent.click(next);
+  expect((screen.getByRole("button", { name: "下一页统计" }) as HTMLButtonElement).disabled).toBe(true);
+  expect((screen.getByRole("button", { name: "上一页统计" }) as HTMLButtonElement).disabled).toBe(true);
+  fireEvent.click(screen.getByRole("button", { name: "下一页统计" }));
+  expect(mockedDispatch).toHaveBeenCalledTimes(2);
+  await act(async () => secondPage.resolve(response({ page: 2, totalLinks: 60, rows: aPageRows(1) })));
+  expect(screen.getByText(/第 2 \/ 3 页/)).toBeTruthy();
+  expect((screen.getByRole("button", { name: "下一页统计" }) as HTMLButtonElement).disabled).toBe(false);
+});
+
+it("waits for a still-finishing read and retries every 2 seconds instead of failing", async () => {
+  vi.useFakeTimers();
+  try {
+    mockedDispatch.mockRejectedValueOnce(new Error(busyText))
+      .mockRejectedValueOnce(new Error(busyText))
+      .mockResolvedValueOnce(response());
+    render(view());
+    chooseAccount();
+    fireEvent.click(screen.getByRole("button", { name: "读取统计" }));
+    await flush();
+    expect(screen.getByText("上一次读取还在收尾，稍等…")).toBeTruthy();
+    expect(screen.queryByText("统计读取失败")).toBeNull();
+    expect(mockedDispatch).toHaveBeenCalledTimes(1);
+    await flush(2_000);
+    expect(mockedDispatch).toHaveBeenCalledTimes(2);
+    await flush(2_000);
+    expect(mockedDispatch).toHaveBeenCalledTimes(3);
+    expect(within(screen.getByLabelText("估算总访问")).getByText("120")).toBeTruthy();
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+it("gives up after 5 busy retries with a plain next step, a retry button and no disable button", async () => {
+  vi.useFakeTimers();
+  try {
+    mockedDispatch.mockRejectedValue(new Error(busyText));
+    render(view());
+    chooseAccount();
+    fireEvent.click(screen.getByRole("button", { name: "读取统计" }));
+    await flush();
+    for (let index = 0; index < 5; index += 1) await flush(2_000);
+    expect(mockedDispatch).toHaveBeenCalledTimes(6);
+    expect(screen.getByText("后台还在忙，请过一会儿再点『读取统计』。")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "检查并停用账户统计" })).toBeNull();
+    mockedDispatch.mockReset();
+    mockedDispatch.mockResolvedValue(response());
+    fireEvent.click(screen.getByRole("button", { name: "重试" }));
+    await flush();
+    expect(within(screen.getByLabelText("估算总访问")).getByText("120")).toBeTruthy();
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+it("waits for a busy backend inside the all-account overview instead of failing each account", async () => {
+  vi.useFakeTimers();
+  try {
+    let busy = 1;
+    mockedDispatch.mockImplementation((_action, payload) => {
+      if (busy-- > 0) return Promise.reject(new Error(busyText));
+      return Promise.resolve(payload?.accountId === "account-b"
+        ? response({ accountId: "account-b", rows: [row("domain-b1", "welcome")] })
+        : response());
+    });
+    render(view({ links: singleLinks }));
+    fireEvent.click(screen.getByRole("button", { name: "读取统计" }));
+    await flush();
+    expect(screen.getByText("上一次读取还在收尾，稍等…")).toBeTruthy();
+    await flush(2_000);
+    expect(screen.getByText(/已处理 2 \/ 2 个账户/)).toBeTruthy();
+    expect(screen.queryByText("读取失败")).toBeNull();
+    expect(mockedDispatch).toHaveBeenCalledTimes(3);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+it("keeps a finished overview when drilling into an account, coming back, or leaving the page", async () => {
+  mockedDispatch.mockImplementation((_action, payload) => Promise.resolve(payload?.accountId === "account-b"
+    ? response({ accountId: "account-b", rows: [row("domain-b1", "welcome")] })
+    : response()));
+  const first = render(view({ links: singleLinks }));
+  fireEvent.click(screen.getByRole("button", { name: "读取统计" }));
+  await screen.findByText(/已处理 2 \/ 2 个账户/);
+  expect(screen.getByText(/读取时间：/)).toBeTruthy();
+  expect(mockedDispatch).toHaveBeenCalledTimes(2);
+  chooseAccount();
+  expect(screen.getByLabelText("估算总访问")).toBeTruthy();
+  fireEvent.change(screen.getByLabelText("统计账户"), { target: { value: "" } });
+  expect(within(screen.getByLabelText("全部账户估算汇总")).getByText("240")).toBeTruthy();
+  expect(screen.getByRole("button", { name: "刷新统计" })).toBeTruthy();
+  first.unmount();
+  render(view({ links: singleLinks }));
+  expect(within(screen.getByLabelText("全部账户估算汇总")).getByText("240")).toBeTruthy();
+  expect(screen.getByText(/读取时间：/)).toBeTruthy();
+  fireEvent.change(screen.getByLabelText("统计时间范围"), { target: { value: "30" } });
+  expect(screen.getByText("选择范围，读取全部链接")).toBeTruthy();
+  fireEvent.change(screen.getByLabelText("统计时间范围"), { target: { value: "7" } });
+  expect(within(screen.getByLabelText("全部账户估算汇总")).getByText("240")).toBeTruthy();
+  expect(mockedDispatch).toHaveBeenCalledTimes(2);
+});
+
+it("does not reuse a kept overview after the local links change", async () => {
+  mockedDispatch.mockImplementation((_action, payload) => Promise.resolve(payload?.accountId === "account-b"
+    ? response({ accountId: "account-b", rows: [row("domain-b1", "welcome")] })
+    : response()));
+  const first = render(view({ links: singleLinks }));
+  fireEvent.click(screen.getByRole("button", { name: "读取统计" }));
+  await screen.findByText(/已处理 2 \/ 2 个账户/);
+  first.unmount();
+  render(view({ links: singleLinks, revision: 1 }));
+  expect(screen.getByText("选择范围，读取全部链接")).toBeTruthy();
+  expect(screen.queryByLabelText("全部账户估算汇总")).toBeNull();
+});
+
+it("rereads an expired overview page with a fresh session and keeps reading the remaining pages", async () => {
+  const manyLinks = Array.from({ length: 60 }, (_, index): Link => ({ ...links[0], slug: `many-${String(index + 1).padStart(2, "0")}` }));
+  const pageRows = (page: number) => manyLinks.slice((page - 1) * 25, page * 25).map((link) => row(link.domainId, link.slug));
+  mockedDispatch.mockImplementation((_action, payload) => {
+    if (payload?.accountId === "account-b") return Promise.resolve(response({ accountId: "account-b", rows: [row("domain-b1", "welcome")] }));
+    const page = Number(payload?.page);
+    if (page === 2 && payload?.readSessionId === "session-old") return Promise.reject(new Error(expiredSession));
+    return Promise.resolve(response({ page, totalLinks: 60, rows: pageRows(page), readSessionId: page === 1 ? "session-old" : "session-new" }));
+  });
+  render(view({ links: [...manyLinks, links[30]] }));
+  fireEvent.click(screen.getByRole("button", { name: "读取统计" }));
+  await screen.findByText(/已处理 2 \/ 2 个账户/);
+  const aCalls = mockedDispatch.mock.calls.filter((call) => call[1]?.accountId === "account-a").map((call) => [call[1]?.page, call[1]?.readSessionId]);
+  expect(aCalls).toEqual([[1, undefined], [2, "session-old"], [2, undefined], [3, "session-new"]]);
+  expect(screen.getByText(/已读 61 条/)).toBeTruthy();
+  expect(screen.queryByText("读取失败")).toBeNull();
+});
+
+it("offers a retry in the error box and hides the disable path for network or busy failures", async () => {
+  mockedDispatch.mockRejectedValueOnce(new Error("连接云端超时，请检查网络")).mockResolvedValueOnce(response());
+  render(view());
+  chooseAccount();
+  fireEvent.click(screen.getByRole("button", { name: "读取统计" }));
+  expect(await screen.findByText("连接云端超时，请检查网络")).toBeTruthy();
+  expect(screen.queryByRole("button", { name: "检查并停用账户统计" })).toBeNull();
+  fireEvent.click(screen.getByRole("button", { name: "重试" }));
+  await expectSummary("120");
+});
+
+it("sorts and searches the single-account rows that were read", async () => {
+  const small: ClickStatsTotals = { total: 3, likelyHuman: 1, likelyBot: 1, unknown: 1, previews: 0, prefetches: 0 };
+  const big: ClickStatsTotals = { total: 50, likelyHuman: 10, likelyBot: 30, unknown: 10, previews: 0, prefetches: 0 };
+  mockedDispatch.mockResolvedValue(response({ totalLinks: 3, rows: [row("domain-a1", "sample-01", small), row("domain-a1", "sample-03", big), row("domain-a2", "sample-02", totals)] }));
+  render(view({ links: links.slice(0, 3) }));
+  chooseAccount();
+  fireEvent.click(screen.getByRole("button", { name: "读取统计" }));
+  const table = await screen.findByRole("table", { name: "当前本机短链接统计" });
+  const order = () => within(table).getAllByRole("row").slice(1).map((item) => item.querySelector("code")?.textContent);
+  expect(order()).toEqual(["/sample-02", "/sample-03", "/sample-01"]);
+  fireEvent.change(screen.getByLabelText("本页排序"), { target: { value: "human" } });
+  expect(order()).toEqual(["/sample-02", "/sample-03", "/sample-01"]);
+  fireEvent.change(screen.getByLabelText("本页排序"), { target: { value: "name" } });
+  expect(order()).toEqual(["/sample-01", "/sample-03", "/sample-02"]);
+  fireEvent.change(screen.getByLabelText("在本页搜索"), { target: { value: "SAMPLE-03" } });
+  expect(order()).toEqual(["/sample-03"]);
+  fireEvent.change(screen.getByLabelText("在本页搜索"), { target: { value: "nothing" } });
+  expect(screen.getByText("本页没有匹配的短链接。")).toBeTruthy();
+});
+
+it("opens detailed statistics with the range chosen in the statistics center", async () => {
+  const state = { accounts, domains, links: [links[0]], pools: [], pendingOperations: [], pendingActions: [] };
+  mockedDispatch.mockImplementation((action, payload) => {
+    if (action === "get_state") return Promise.resolve(state);
+    if (action === "get_stats_center") return Promise.resolve(response({ days: Number(payload?.days) as 1 | 7 | 30 }));
+    if (action === "get_link_stats") return Promise.resolve({
+      status: "ready", message: "单链接示例", domainId: "domain-a1", slug: "sample-01", days: payload?.days,
+      queriedAt: "2026-10-15T03:20:00Z", estimated: true, totals,
+    });
+    return Promise.reject(new Error(`unexpected action: ${action}`));
+  });
+  render(<App />);
+  fireEvent.click(await screen.findByRole("button", { name: "统计中心" }));
+  chooseAccount();
+  fireEvent.change(screen.getByLabelText("统计时间范围"), { target: { value: "30" } });
+  fireEvent.click(screen.getByRole("button", { name: "读取统计" }));
+  await expectSummary("120");
+  fireEvent.click(screen.getByRole("button", { name: "查看 sample-01 的详细统计" }));
+  const dialog = await screen.findByRole("dialog", { name: "访问统计 · /sample-01" });
+  expect((within(dialog).getByRole("combobox", { name: "统计时间范围" }) as HTMLSelectElement).value).toBe("30");
+  await waitFor(() => expect(mockedDispatch).toHaveBeenCalledWith("get_link_stats", { domainId: "domain-a1", slug: "sample-01", days: 30 }));
+});
+
+it("stops waiting again for every later account once the overview has given up on a busy backend", async () => {
+  vi.useFakeTimers();
+  try {
+    mockedDispatch.mockRejectedValue(new Error(busyText));
+    render(view({ links: singleLinks }));
+    fireEvent.click(screen.getByRole("button", { name: "读取统计" }));
+    await flush();
+    for (let index = 0; index < 5; index += 1) await flush(2_000);
+    await flush();
+    // Account A: 1 try + 5 retries. Account B: one try only, no second 10-second wait.
+    expect(mockedDispatch).toHaveBeenCalledTimes(7);
+    expect(screen.getByText(/已处理 2 \/ 2 个账户/)).toBeTruthy();
+    // The button now reads "刷新统计", so the next step names that button.
+    expect(screen.getByRole("button", { name: "刷新统计" })).toBeTruthy();
+    expect(screen.getAllByText("后台还在忙，请过一会儿再点『刷新统计』。")).toHaveLength(2);
+    expect(screen.queryByText(/读取统计』/)).toBeNull();
+    // A later read that gets through waits and retries as usual again.
+    let busy = 1;
+    mockedDispatch.mockReset();
+    mockedDispatch.mockImplementation((_action, payload) => {
+      if (payload?.accountId === "account-b" && busy-- > 0) return Promise.reject(new Error(busyText));
+      return Promise.resolve(payload?.accountId === "account-b"
+        ? response({ accountId: "account-b", rows: [row("domain-b1", "welcome")] })
+        : response());
+    });
+    fireEvent.click(screen.getByRole("button", { name: "刷新统计" }));
+    await flush();
+    await flush(2_000);
+    expect(mockedDispatch).toHaveBeenCalledTimes(3);
+    expect(screen.queryByText("读取失败")).toBeNull();
+    expect(within(screen.getByLabelText("全部账户估算汇总")).getByText("240")).toBeTruthy();
+  } finally {
+    vi.useRealTimers();
+  }
 });

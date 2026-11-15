@@ -111,7 +111,7 @@ test('exact host, prefix and raw single-segment paths; absent list retains legac
   const env = fixture();
   assert.equal(await location(await worker.fetch(req(`https://GO.EXAMPLE.COM/r/Offer_1`), env)), DEFAULT);
   const invalid = [
-    '/r', '/r/', '/R/Offer_1', '/r/offer_1', '/r/Offer_1/', '/r/Offer_1/extra',
+    '/r', '/r/', '/R/Offer_1', '/r/offer_1', '/r/Offer_1//', '/r/Offer_1/extra',
     '/r/%4Fffer_1', '/r/Offer%2F1', '/r/Offer%5c1', '/r/../r/Offer_1',
     '/r/%2e%2e/r/Offer_1', '/r/.', '//r/Offer_1', '/r/a.b',
     `/r/${'a'.repeat(33)}`, `/${'a'.repeat(13)}/Offer_1`,

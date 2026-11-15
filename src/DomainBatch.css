@@ -1,0 +1,39 @@
+/* Batch domain dialog: settings stay in view, only the domain list scrolls. */
+.domain-batch{display:grid;gap:12px;}
+.domain-batch.form-grid{gap:12px;}
+.domain-batch-account{display:flex;gap:8px;align-items:center;}
+.domain-batch-account select{flex:1 1 auto;min-width:0;}
+.domain-batch-account .button{flex:0 0 auto;min-height:40px;padding:8px 12px;}
+.form-grid .domain-batch-option{align-items:flex-start;line-height:1.5;color:#334b39;}
+.domain-batch-option input{margin-top:2px;flex:0 0 auto;}
+.domain-batch-note{margin:0;padding:8px 11px;border-radius:6px;background:#f7faf5;border:1px solid #dce7d8;color:#536b59;font-size:11px;line-height:1.55;}
+.domain-batch-picker{display:grid;gap:8px;min-width:0;}
+.domain-batch-tools{display:flex;align-items:center;gap:6px;flex-wrap:wrap;}
+.domain-batch-tools .searchbox{flex:1 1 160px;width:auto;height:34px;}
+.domain-batch-tools .button{min-height:34px;padding:6px 10px;}
+.domain-batch-count{margin-left:auto;font-size:11px;color:#5f6f66;}
+/* Sized so a 1000 x 680 window shows the account, directory, option and start button without scrolling. */
+.domain-batch-list{max-height:max(120px,calc(min(86vh,740px) - 470px));overflow:auto;border:1px solid #e1e7dd;border-radius:7px;background:#fff;}
+.domain-batch-item{display:flex !important;align-items:center;gap:9px !important;padding:7px 11px;border-bottom:1px solid #f0f2ec;font-size:12px !important;font-weight:500 !important;color:#25382c !important;cursor:pointer;}
+.domain-batch-item:last-child{border-bottom:0;}
+.domain-batch-item input{flex:0 0 auto;margin:0;accent-color:#106c4c;}
+.domain-batch-item span{min-width:0;overflow-wrap:anywhere;}
+.domain-batch-empty{margin:0;padding:12px;font-size:11px;color:#5f6f66;line-height:1.6;}
+.domain-batch-hint{font-size:11px !important;color:#5f6f66 !important;}
+.domain-batch-steps{margin:0;padding-left:18px;font-size:12px;color:#536658;line-height:1.7;}
+.domain-batch-confirm{padding:8px 11px;font-size:12px;color:#25382c;line-height:1.7;overflow-wrap:anywhere;max-height:max(100px,calc(min(86vh,740px) - 500px));}
+.domain-batch-results{max-height:max(160px,calc(min(86vh,740px) - 300px));}
+.domain-batch-results{margin:0;padding:0;list-style:none;}
+.batch-row{display:grid;grid-template-columns:minmax(0,2fr) minmax(0,3fr);gap:12px;padding:8px 11px;border-bottom:1px solid #f0f2ec;font-size:12px;}
+.batch-row:last-child{border-bottom:0;}
+.batch-host{color:#25382c;overflow-wrap:anywhere;}
+.batch-state{min-width:0;}
+.batch-reason{display:block;margin-top:3px;font-size:11px;line-height:1.5;color:#6b5a2f;overflow-wrap:anywhere;}
+.batch-added strong{color:#226846;}
+.batch-skipped strong{color:#8c6325;}
+.batch-failed strong{color:#8b3428;}
+.batch-failed .batch-reason{color:#8b3428;}
+.batch-checking strong,.batch-dns strong,.batch-applying strong{color:#285c49;}
+.batch-waiting strong,.batch-stopped strong{color:#8a9990;font-weight:600;}
+.domain-batch .form-two > label{align-content:start;}
+.form-grid .domain-batch-tools .searchbox input{height:auto;border:0;padding:0;background:none;}

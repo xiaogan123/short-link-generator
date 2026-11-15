@@ -209,6 +209,10 @@ describe('desktop primary flows in explicit preview', () => {
     expect(document.querySelector('.slg-groups')?.textContent).not.toContain('/campaign');
     fireEvent.click(within(plan).getByRole('button', { name: '确认并执行' }));
     await waitFor(() => expect(screen.getByText('/campaign')).toBeTruthy());
+    // The check after saving only reports in a notice; the result window opens on request.
+    expect(await screen.findByText(/已自动检测 .*\/campaign：暂时没法确认能否正常打开/)).toBeTruthy();
+    expect(screen.queryByRole('dialog', { name: '链接检测' })).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: '查看结果' }));
     const test = await screen.findByRole('dialog', { name: '链接检测' });
     expect(within(test).getByText('等待生效')).toBeTruthy();
   });
@@ -243,6 +247,7 @@ describe('desktop primary flows in explicit preview', () => {
     expect(within(linkPlan).getByText('邀请码：member_01')).toBeTruthy();
     expect(within(linkPlan).queryByText(/中国大陆：https/)).toBeNull();
     fireEvent.click(within(linkPlan).getByRole('button', {name:'确认并执行'}));
+    fireEvent.click(await screen.findByRole('button', {name:'查看结果'}));
     const result = await screen.findByRole('dialog', {name:'链接检测'});
     expect(within(result).getAllByText(/本地预览未发起网络检测/)).toHaveLength(2);
     fireEvent.click(within(result).getByRole('button', {name:'完成'}));
@@ -281,7 +286,7 @@ describe('desktop primary flows in explicit preview', () => {
     await waitFor(()=>expect(screen.getByText(/检测服务：已启用/)).toBeTruthy());
   });
 
-  it('previews a pasted invitation link before filling an address and rejects ambiguous links', async () => {
+  it('fills the address as soon as a pasted invitation link is recognised and rejects ambiguous links', async () => {
     render(<App />);
     await screen.findByRole('heading', { name: '短链接' });
     fireEvent.click(screen.getByRole('button', { name: /^平台地址$/ }));
@@ -295,7 +300,8 @@ describe('desktop primary flows in explicit preview', () => {
     fireEvent.change(full, { target: { value: 'https://example.com/register?lang=zh&ref=CODE_1&utm=sample' } });
     fireEvent.click(within(editor).getAllByRole('button', { name: '识别' })[0]);
     expect(within(editor).getByText('CODE_1')).toBeTruthy();
-    fireEvent.click(within(editor).getByRole('button', { name: '填入链接地址' }));
+    expect(within(editor).getByText(/已去掉邀请码，并填好下面的链接地址/)).toBeTruthy();
+    expect(within(editor).queryByRole('button', { name: '填入链接地址' })).toBeNull();
     expect((within(editor).getByPlaceholderText('https://example.com/join/') as HTMLInputElement).value).toBe('https://example.com/register?lang=zh&ref=');
     expect((within(editor).getAllByPlaceholderText('例如 ?lang=zh')[0] as HTMLInputElement).value).toBe('&utm=sample');
     expect(within(editor).getByRole('button', { name: '下一步，核对内容' })).toBeTruthy();
@@ -310,13 +316,11 @@ describe('desktop primary flows in explicit preview', () => {
     fireEvent.change(within(editor).getByRole('textbox', {name:'官网链接 完整邀请链接'}), {target:{value:'https://example.com/join?lang=%2F&ref=DEMO_Code-1&utm=%2B'}});
     fireEvent.click(within(editor).getAllByRole('button', {name:'识别'})[0]);
     expect(within(editor).getByText('DEMO_Code-1')).toBeTruthy();
-    fireEvent.click(within(editor).getByRole('button', {name:'填入链接地址'}));
     expect((within(editor).getByPlaceholderText('https://example.com/join/') as HTMLInputElement).value).toBe('https://example.com/join?lang=%2F&ref=');
     expect((within(editor).getAllByPlaceholderText('例如 ?lang=zh')[0] as HTMLInputElement).value).toBe('&utm=%2B');
     fireEvent.change(within(editor).getByRole('textbox', {name:'大陆访问地址（首选） 完整邀请链接'}), {target:{value:'https://example.org/join?ref=DEMO_Mainland'}});
     fireEvent.click(within(editor).getAllByRole('button', {name:'识别'})[1]);
     expect(within(editor).getByText('DEMO_Mainland')).toBeTruthy();
-    fireEvent.click(within(editor).getAllByRole('button', {name:'填入链接地址'})[1]);
     expect((within(editor).getByPlaceholderText('https://example.org/join/') as HTMLInputElement).value).toBe('https://example.org/join?ref=');
     fireEvent.click(within(editor).getByRole('button', {name:'下一步，核对内容'}));
     const plan=await screen.findByRole('dialog', {name:'保存平台地址'});
@@ -349,7 +353,46 @@ describe('desktop primary flows in explicit preview', () => {
     const mainland = within(editor).getByRole('textbox', { name: '大陆访问地址（首选） 完整邀请链接' });
     fireEvent.change(mainland, { target: { value: 'https://example.com/join/CODE' } });
     fireEvent.click(within(editor).getAllByRole('button', { name: '识别' })[1]);
-    fireEvent.click(within(editor).getByRole('button', { name: '填入链接地址' }));
     expect((within(editor).getAllByPlaceholderText('https://example.org/join/')[0] as HTMLInputElement).value).toBe('https://example.com/join/');
+  });
+  it('treats Enter in the invitation paste box as 识别, not as submitting the address form', async () => {
+    const prepared: string[] = [];
+    const originalDispatch = bridge.dispatch;
+    vi.spyOn(bridge, 'dispatch').mockImplementation(((action: Action, payload: Record<string, unknown> = {}) => {
+      if (action === 'prepare_change') prepared.push(String(payload.kind));
+      return originalDispatch(action, payload);
+    }) as typeof bridge.dispatch);
+    render(<App />);
+    await screen.findByRole('heading', { name: '短链接' });
+    fireEvent.click(screen.getByRole('button', { name: /^平台地址$/ }));
+    fireEvent.click(screen.getByRole('button', { name: '添加平台地址' }));
+    const editor = screen.getByRole('dialog', { name: '添加平台地址' });
+    const full = within(editor).getByRole('textbox', { name: '官网链接 完整邀请链接' });
+    fireEvent.change(full, { target: { value: 'https://example.com/join/CODE_9' } });
+    const enter = new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true });
+    act(() => { full.dispatchEvent(enter); });
+    expect(enter.defaultPrevented).toBe(true);
+    expect((within(editor).getByPlaceholderText('https://example.com/join/') as HTMLInputElement).value).toBe('https://example.com/join/');
+    expect(within(editor).getByText('CODE_9')).toBeTruthy();
+    expect(within(editor).getByRole('status').textContent).toContain('请核对');
+    expect(within(editor).queryAllByRole('alert')).toHaveLength(0);
+    expect(prepared).toHaveLength(0);
+    expect(screen.queryByRole('dialog', { name: '保存平台地址' })).toBeNull();
+  });
+  it('does not run 识别 on the Enter that only confirms input-method text in the paste box', async () => {
+    render(<App />);
+    await screen.findByRole('heading', { name: '短链接' });
+    fireEvent.click(screen.getByRole('button', { name: /^平台地址$/ }));
+    fireEvent.click(screen.getByRole('button', { name: '添加平台地址' }));
+    const editor = screen.getByRole('dialog', { name: '添加平台地址' });
+    const full = within(editor).getByRole('textbox', { name: '官网链接 完整邀请链接' });
+    fireEvent.change(full, { target: { value: 'https://example.com/join/CODE_9' } });
+    // WebKit reports this key press after the composition has ended, with key code 229.
+    fireEvent.keyDown(full, { key: 'Enter', keyCode: 229 });
+    fireEvent.keyDown(full, { key: 'Enter', isComposing: true });
+    expect((within(editor).getByPlaceholderText('https://example.com/join/') as HTMLInputElement).value).toBe('');
+    expect(within(editor).queryByText('CODE_9')).toBeNull();
+    fireEvent.keyDown(full, { key: 'Enter' });
+    expect((within(editor).getByPlaceholderText('https://example.com/join/') as HTMLInputElement).value).toBe('https://example.com/join/');
   });
 });

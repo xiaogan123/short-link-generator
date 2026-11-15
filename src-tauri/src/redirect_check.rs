@@ -10,6 +10,15 @@ use std::{future::Future, sync::OnceLock};
 use tokio::sync::Semaphore;
 
 const PROBE_BUDGET: Duration = Duration::from_secs(20);
+/// Taking the local snapshot is quick; wait this long for another operation
+/// to finish before reporting `busy`.
+const SNAPSHOT_WAIT: Duration = if cfg!(test) {
+    Duration::from_millis(200)
+} else {
+    Duration::from_secs(10)
+};
+/// Set by the Worker on the 503 responses it produces itself.
+const WORKER_REASON: &str = "x-reason";
 
 #[derive(Debug)]
 struct RedirectSnapshot {
@@ -173,7 +182,40 @@ fn classify(status: StatusCode, location: Option<&str>, expected: &[String]) -> 
     )
 }
 
+/// A 503 the Worker produced itself: visitors cannot open the link now.
+/// Other 5xx (for example a passing Cloudflare hiccup) stay unknown.
+fn worker_unavailable(status: StatusCode, headers: &HeaderMap) -> Option<Outcome> {
+    if status != StatusCode::SERVICE_UNAVAILABLE {
+        return None;
+    }
+    let mut values = headers.get_all(WORKER_REASON).iter();
+    let (Some(value), None) = (values.next(), values.next()) else {
+        return None;
+    };
+    match value.to_str().ok()?.trim() {
+        "pool_missing" => Some((
+            ResultStatus::Failed,
+            "worker_pool_missing",
+            "这组平台地址在云端缺失，访客现在打不开。请到「平台地址」页点这组地址的「编辑地址」，不用改内容，直接保存一次，软件会把它重新写到云端",
+        )),
+        "no_candidate" => Some((
+            ResultStatus::Failed,
+            "worker_no_candidate",
+            "大陆备用地址全部不可用，大陆访客现在打不开。请到「平台地址」页检查备用地址",
+        )),
+        "internal" => Some((
+            ResultStatus::Failed,
+            "worker_internal",
+            "云端跳转服务出错，访客现在打不开。请稍后再检测一次；一直这样请联系维护的人",
+        )),
+        _ => None,
+    }
+}
+
 fn classify_response(status: StatusCode, headers: &HeaderMap, expected: &[String]) -> Outcome {
+    if let Some(outcome) = worker_unavailable(status, headers) {
+        return outcome;
+    }
     if status != StatusCode::FOUND {
         return classify(status, None, expected);
     }
@@ -293,6 +335,19 @@ async fn bounded_result(
     }
 }
 
+/// Waits at most `wait` for the backend; `None` when it stayed busy.
+async fn snapshot_within(
+    state: &AppState,
+    domain_id: &str,
+    slug: &str,
+    wait: Duration,
+) -> Result<Option<RedirectSnapshot>, String> {
+    match tokio::time::timeout(wait, state.0.lock()).await {
+        Ok(backend) => snapshot(&backend, domain_id, slug).map(Some),
+        Err(_) => Ok(None),
+    }
+}
+
 pub(super) async fn check_link_redirect(
     state: &AppState,
     domain_id: &str,
@@ -310,16 +365,13 @@ pub(super) async fn check_link_redirect(
             ))
         }
     };
-    let snapshot = match state.0.try_lock() {
-        Ok(backend) => snapshot(&backend, domain_id, slug)?,
-        Err(_) => {
-            return Ok(result(
-                ResultStatus::Unknown,
-                "busy",
-                "本地操作正在进行，请稍后重试",
-                local_check::DnsMode::System,
-            ))
-        }
+    let Some(snapshot) = snapshot_within(state, domain_id, slug, SNAPSHOT_WAIT).await? else {
+        return Ok(result(
+            ResultStatus::Unknown,
+            "busy",
+            "本地操作正在进行，请稍后重试",
+            local_check::DnsMode::System,
+        ));
     };
     // The backend mutex is dropped before DNS or transport work begins.
     let used_public = AtomicBool::new(false);
@@ -558,8 +610,97 @@ mod tests {
         );
     }
 
+    #[test]
+    fn worker_own_503_is_a_failure_with_its_reason() {
+        let expected = vec!["https://example.org/Aa".into()];
+        for (header, reason) in [
+            ("pool_missing", "worker_pool_missing"),
+            ("no_candidate", "worker_no_candidate"),
+            ("internal", "worker_internal"),
+            (" Internal", ""),
+            ("unknown_value", ""),
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert("X-Reason", header.parse().unwrap());
+            let outcome = classify_response(StatusCode::SERVICE_UNAVAILABLE, &headers, &expected);
+            if reason.is_empty() {
+                assert_eq!(outcome.0, ResultStatus::Unknown, "{header}");
+                assert_eq!(outcome.1, "server_unavailable");
+            } else {
+                assert_eq!(outcome.0, ResultStatus::Failed, "{header}");
+                assert_eq!(outcome.1, reason);
+                assert!(outcome.2.contains("访客现在打不开"), "{}", outcome.2);
+                // The Worker is called 云端跳转服务 in the app.
+                assert!(!outcome.2.contains("转发程序"), "{}", outcome.2);
+            }
+        }
+        let mut headers = HeaderMap::new();
+        headers.insert("x-reason", "internal".parse().unwrap());
+        let message = classify_response(StatusCode::SERVICE_UNAVAILABLE, &headers, &expected).2;
+        assert!(message.starts_with("云端跳转服务出错"), "{message}");
+        for reason in ["worker_pool_missing", "worker_no_candidate"] {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "x-reason",
+                reason.trim_start_matches("worker_").parse().unwrap(),
+            );
+            let message = classify_response(StatusCode::SERVICE_UNAVAILABLE, &headers, &expected).2;
+            assert!(message.contains("「平台地址」页"), "{message}");
+        }
+        // The platform page has no 继续同步 button; saving the pool again
+        // through 「编辑地址」 re-creates the missing cloud copy.
+        let mut headers = HeaderMap::new();
+        headers.insert("x-reason", "pool_missing".parse().unwrap());
+        let message = classify_response(StatusCode::SERVICE_UNAVAILABLE, &headers, &expected).2;
+        assert!(message.contains("点这组地址的「编辑地址」"), "{message}");
+        assert!(message.contains("直接保存一次"), "{message}");
+        assert!(!message.contains("继续同步"), "{message}");
+        // The header only counts on a 503, and a 5xx without it stays unknown.
+        let mut headers = HeaderMap::new();
+        headers.insert("x-reason", "pool_missing".parse().unwrap());
+        for status in [StatusCode::INTERNAL_SERVER_ERROR, StatusCode::BAD_GATEWAY] {
+            assert_eq!(
+                classify_response(status, &headers, &expected).0,
+                ResultStatus::Unknown
+            );
+        }
+        let plain = classify_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &HeaderMap::new(),
+            &expected,
+        );
+        assert_eq!(plain.0, ResultStatus::Unknown);
+        assert_eq!(plain.1, "server_unavailable");
+        // Two different reasons are ambiguous: treated like no header.
+        let mut twice = HeaderMap::new();
+        twice.append("x-reason", "pool_missing".parse().unwrap());
+        twice.append("x-reason", "internal".parse().unwrap());
+        assert_eq!(
+            classify_response(StatusCode::SERVICE_UNAVAILABLE, &twice, &expected).0,
+            ResultStatus::Unknown
+        );
+    }
+
     #[tokio::test]
-    async fn busy_probe_and_backend_lock_fail_without_waiting_or_reading_credentials() {
+    async fn snapshot_waits_for_a_short_local_operation() {
+        let (_server, mut backend, _guard) = fixture().await;
+        backend.db.domains.push(domain());
+        backend.db.links.push(manual_link());
+        let state = AppState(Mutex::new(backend));
+        let held = state.0.lock().await;
+        let (found, _) = tokio::join!(
+            snapshot_within(&state, "domain1", "Ab_1", SNAPSHOT_WAIT),
+            async move {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                drop(held);
+            }
+        );
+        assert!(found.unwrap().is_some());
+        assert!(mock_key_reads().lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn busy_probe_and_backend_lock_report_busy_without_reading_credentials() {
         let (_server, mut backend, _guard) = fixture().await;
         backend.db.domains.push(domain());
         backend.db.links.push(manual_link());

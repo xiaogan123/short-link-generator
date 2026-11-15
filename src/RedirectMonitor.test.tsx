@@ -76,3 +76,18 @@ it('hides previous result claims while checking, disabled, loading or empty',()=
     expect(screen.queryByText('上次巡检：全部首跳符合预期')).toBeNull();
   }
 });
+
+it('says per link and per round what this app start has not checked yet',()=>{
+  expect(monitorDisplay(null).label).toBe('本次打开后还没检查');
+  const props={enabled:true,active:false,online:true,progress:{done:0,total:2},onEnabled:vi.fn(),onRun:vi.fn(),disabled:false,totalLinks:2};
+  const {rerender}=render(<RedirectMonitor {...props} lastCompletion="2026-10-16T12:00:00Z" previousRunAt="2026-10-16T12:00:00Z" resultStatus="healthy"/>);
+  expect(screen.getByText(/^上一轮（.+）全部符合预期，本次打开后还没重新检查$/)).toBeTruthy();
+  expect(screen.queryByText('上次巡检：全部首跳符合预期')).toBeNull();
+  rerender(<RedirectMonitor {...props} lastCompletion="2026-10-16T12:00:00Z" previousRunAt="2026-10-16T12:00:00Z" resultStatus="stale"/>);
+  expect(screen.getByText(/^上一轮（.+）的结果已过期，等待重新检查$/)).toBeTruthy();
+  rerender(<RedirectMonitor {...props} lastCompletion={null}/>);
+  expect(screen.getByText('本次打开后还没跑完一整轮')).toBeTruthy();
+  expect(screen.queryByText(/尚未完成$/)).toBeNull();
+  rerender(<RedirectMonitor {...props} lastCompletion={null} backendBusy/>);
+  expect(screen.getByRole('status').textContent).toBe('后台正忙，过几分钟自动接着查');
+});

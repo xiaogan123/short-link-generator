@@ -322,6 +322,121 @@ impl Database {
     }
 }
 
+impl Database {
+    /// When a pending record still has its own recovery entry (the buttons
+    /// built from `pending_actions`, or the account's cleanup), says where to
+    /// handle it. Such records must not be dismissed as plain notes.
+    pub(crate) fn dedicated_recovery_hint(&self, entry: &str) -> Option<String> {
+        self.dedicated_recovery_entry(entry)
+            .map(|place| format!("这条记录有专门的处理入口，不能直接清除。{place}"))
+    }
+
+    /// The sentence naming a pending record's own recovery entry, if it has
+    /// one (see `dedicated_recovery_hint`).
+    pub(crate) fn dedicated_recovery_entry(&self, entry: &str) -> Option<String> {
+        let matches_journal = |journal: &str| {
+            !journal.is_empty()
+                && (entry == journal
+                    || entry
+                        .strip_prefix(journal)
+                        .is_some_and(|rest| rest.starts_with('：')))
+        };
+        // The resume bar sits above the page content on every page and is
+        // titled 「有 N 项变更可继续处理」.
+        let button = |label: &str| {
+            Some(format!(
+                "请用页面上方“……项变更可继续处理”那一栏里的「{label}」按钮处理"
+            ))
+        };
+        if let Some(p) = self
+            .pending_pool_changes
+            .iter()
+            .find(|p| matches_journal(&p.journal))
+        {
+            return button(if p.deleting {
+                "继续删除"
+            } else {
+                "继续同步"
+            });
+        }
+        if self
+            .pending_monitor_changes
+            .iter()
+            .any(|p| matches_journal(&p.journal))
+        {
+            return button("继续处理监测");
+        }
+        if self
+            .pending_worker_upgrades
+            .iter()
+            .any(|p| matches_journal(&p.journal))
+        {
+            return button("继续核对升级");
+        }
+        for account in &self.accounts {
+            let rotation = self
+                .pending_selftest_rotations
+                .iter()
+                .find(|p| p.account_id == account.id);
+            if rotation.is_some_and(|p| matches_journal(&p.journal))
+                || entry.starts_with(&format!("重置自检密钥 {} (", account.id))
+            {
+                return button(match rotation {
+                    Some(p) if p.status == SelftestRotationStatus::StagingMissing => "查看修复计划",
+                    Some(_) => "继续修复",
+                    None if self.can_recover_selftest_resources(&account.id) => "找回本机检测配置",
+                    None => "查看修复计划",
+                });
+            }
+            // A cleanup refuses to run while the account has a local domain
+            // or no recorded resources (an account removed from this computer
+            // and imported again), so its record would have no way out: it
+            // may be dismissed then.
+            if entry.starts_with(&format!("清理账号 {} (", account.id))
+                && account.resources.is_some()
+                && !self.domains.iter().any(|d| d.account_id == account.id)
+            {
+                // The record itself shows only the account ID.
+                return Some(format!(
+                    "请到「Cloudflare 账户」页打开账户「{}」的「管理账户」，再点一次「删除云端短链接服务」继续处理",
+                    account.label
+                ));
+            }
+        }
+        None
+    }
+
+    /// For a record that may be cleared by hand but that one more click
+    /// usually finishes: where that click is. Advice only; it never blocks
+    /// clearing the record.
+    pub(crate) fn resume_hint(&self, entry: &str) -> Option<String> {
+        let (kind, rest) = entry.split_once(' ')?;
+        let host = &rest[..rest.find([' ', '（']).unwrap_or(rest.len())];
+        let domain = self.domains.iter().find(|d| d.host == host)?;
+        match kind {
+            "移除域名" => Some(format!(
+                "到「域名管理」对域名 {host} 再点一次「移除域名」把它做完"
+            )),
+            // The note `revived_links_note` leaves on an add-domain record.
+            "添加域名" if entry.contains(REVIVED_LINKS_MARK) => {
+                let label = self
+                    .accounts
+                    .iter()
+                    .find(|a| a.id == domain.account_id)
+                    .map_or("这个域名所属账户", |a| a.label.as_str());
+                Some(format!(
+                    "到「Cloudflare 账户」页打开账户「{label}」的「管理账户」，点「从 Cloudflare 找回配置」把那些短链接找回来"
+                ))
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Part of the note kept on an add-domain record whose reused setup brought
+/// back links this computer does not list (see `resume_hint`).
+pub(crate) const REVIVED_LINKS_MARK: &str = "条短链接，现在重新生效了";
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct State {
@@ -584,6 +699,10 @@ pub enum PlanKind {
     RecoverSelftestResources {
         account_id: String,
     },
+    /// Removes one exact pending record from local state; no cloud access.
+    DismissPendingOperation {
+        entry: String,
+    },
 }
 
 pub struct Plan {
@@ -593,7 +712,7 @@ pub struct Plan {
     pub snapshot: String,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Candidate {
     pub account_id: String,

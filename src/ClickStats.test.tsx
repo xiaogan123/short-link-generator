@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, expect, it, vi } from "vitest";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import ClickStatsDialog from "./ClickStats";
@@ -241,4 +241,71 @@ it("points an account with incomplete token import to recovery without reading o
   rerender(view({ account: { ...account, needsTokenRecovery: false } }));
   await waitFor(() => expect(mockedDispatch).toHaveBeenCalledTimes(1));
   expect(screen.queryByText("令牌导入未完成")).toBeNull();
+});
+
+const busyText = "上一个操作还没结束，已经等了几秒。请稍后再点一次；如果屏幕上有系统的钥匙串窗口，请先处理它。";
+const flush = async (ms = 0) => { await act(async () => { await vi.advanceTimersByTimeAsync(ms); }); };
+const readyTotals = { total: 12, likelyHuman: 7, likelyBot: 3, unknown: 2, previews: 0, prefetches: 0 };
+
+it("opens with the range passed in and still defaults to 7 days", async () => {
+  mockedDispatch.mockImplementation(async (_action, payload = {}) => response("no_data", payload.days as ClickStatsDays));
+  const first = render(view({ initialDays: 30 }));
+  await screen.findByText("所选时间范围暂无统计");
+  expect((screen.getByRole("combobox", { name: "统计时间范围" }) as HTMLSelectElement).value).toBe("30");
+  expect(mockedDispatch).toHaveBeenCalledWith("get_link_stats", { domainId: domain.id, slug: link.slug, days: 30 });
+  first.unmount();
+  render(view());
+  await screen.findByText("所选时间范围暂无统计");
+  expect((screen.getByRole("combobox", { name: "统计时间范围" }) as HTMLSelectElement).value).toBe("7");
+});
+
+it("waits for a still-finishing read after switching the range instead of showing an error", async () => {
+  vi.useFakeTimers();
+  try {
+    mockedDispatch.mockResolvedValueOnce(response("no_data"))
+      .mockRejectedValueOnce(new Error(busyText))
+      .mockResolvedValueOnce(response("ready", 30, { totals: readyTotals }));
+    render(view());
+    await flush();
+    expect(screen.getByText("所选时间范围暂无统计")).toBeTruthy();
+    fireEvent.change(screen.getByRole("combobox", { name: "统计时间范围" }), { target: { value: "30" } });
+    await flush();
+    expect(screen.getByText("上一次读取还在收尾，稍等…")).toBeTruthy();
+    expect(screen.queryByText("访问统计读取失败")).toBeNull();
+    await flush(2_000);
+    expect(mockedDispatch).toHaveBeenCalledTimes(3);
+    expect(mockedDispatch).toHaveBeenLastCalledWith("get_link_stats", { domainId: domain.id, slug: link.slug, days: 30 });
+    expect(screen.getByText("12")).toBeTruthy();
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+it("gives up after 5 busy retries with a retry button and without the disable path", async () => {
+  vi.useFakeTimers();
+  try {
+    mockedDispatch.mockRejectedValue(new Error(busyText));
+    render(view());
+    await flush();
+    for (let index = 0; index < 5; index += 1) await flush(2_000);
+    expect(mockedDispatch).toHaveBeenCalledTimes(6);
+    expect(screen.getByText("后台还在忙，请过一会儿再点『重试』。")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "检查并停用账户统计" })).toBeNull();
+    mockedDispatch.mockReset();
+    mockedDispatch.mockResolvedValue(response("ready", 7, { totals: readyTotals }));
+    fireEvent.click(screen.getByRole("button", { name: "重试" }));
+    await flush();
+    expect(screen.getByText("12")).toBeTruthy();
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+it("keeps the disable path away from a network failure but offers a retry", async () => {
+  mockedDispatch.mockRejectedValueOnce(new Error("连不上云端，请检查网络")).mockResolvedValueOnce(response("no_data"));
+  render(view());
+  expect(await screen.findByText("连不上云端，请检查网络")).toBeTruthy();
+  expect(screen.queryByRole("button", { name: /停用账户统计/ })).toBeNull();
+  fireEvent.click(screen.getByRole("button", { name: "重试" }));
+  expect(await screen.findByText("所选时间范围暂无统计")).toBeTruthy();
 });

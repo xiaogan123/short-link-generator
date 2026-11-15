@@ -107,8 +107,20 @@ it.each(['取消','关闭','Escape','遮罩'])('dismisses an unsubmitted token u
   fireEvent.click(within(screen.getByRole('dialog',{name:'账户管理'})).getByRole('button',{name:'更换本机令牌'}));
   const editor=screen.getByRole('dialog',{name:'更换本机令牌'});
   fireEvent.change(within(editor).getByPlaceholderText('在此粘贴令牌'),{target:{value:'discard-this-test-token'}});
-  if(method==='Escape')fireEvent.keyDown(document,{key:'Escape'});
-  else if(method==='遮罩')fireEvent.mouseDown(editor.parentElement!);
+  if(method==='Escape'){
+    // A typed token is not thrown away by a single stray Escape.
+    fireEvent.keyDown(document,{key:'Escape'});
+    expect(screen.getByRole('dialog',{name:'更换本机令牌'})).toBe(editor);
+    expect(within(editor).getByText('再按一次 Esc 放弃已填的内容。')).toBeTruthy();
+    fireEvent.keyDown(document,{key:'Escape'});
+  }
+  else if(method==='遮罩'){
+    // Clicking the dimmed background never closes the dialog; 取消 still does.
+    fireEvent.mouseDown(editor.parentElement!);
+    fireEvent.click(editor.parentElement!);
+    expect(screen.getByRole('dialog',{name:'更换本机令牌'})).toBe(editor);
+    fireEvent.click(within(editor).getByRole('button',{name:'取消'}));
+  }
   else fireEvent.click(within(editor).getByRole('button',{name:method}));
   await waitFor(()=>expect(screen.queryByRole('dialog',{name:'更换本机令牌'})).toBeNull());
   expect(calls.filter(call=>call.action==='import_token')).toHaveLength(0);

@@ -38,6 +38,7 @@ import {
 } from "./validators";
 import type {
   Account,
+  ClickStatsDays,
   Domain,
   DomainDnsPreparation,
   DomainPreparation,
@@ -59,6 +60,7 @@ import LinkEditor, { type LinkDraft } from "./LinkEditor";
 import { FieldError, fieldProps, focusFirstError, type FieldErrors } from "./FormFeedback";
 import Pools from "./Pools";
 import LinkGroups from "./LinkGroups";
+import DomainBatch, { authorizationCheck, isAuthorizationError } from "./DomainBatch";
 import ClickStatsDialog from "./ClickStats";
 import StatsCenter from "./StatsCenter";
 import { useUpdateCheck } from "./useUpdateCheck";
@@ -190,8 +192,30 @@ function hasDomainOwnershipProblem(preparation: DomainPreparation) {
     preparation.checks.some((check) => domainCheckLevel(check) === "error" && /归属/.test(check.label) &&
       !networkReasons.includes(check.reason || ""));
 }
+// The backend is still finishing another request: wait and retry, nothing is wrong with the token.
+// The older wording is matched too, so a mixed-version build never sends the user to the token page.
+function isBusyMessage(message: string) {
+  return /上一个操作(还没结束|仍在进行)/.test(message);
+}
+// For the text of a rejected call only. Check results are judged by their reason instead
+// (authorizationCheck): a website answering 403 on the probed path is not a token problem.
 function isDomainCredentialError(message: string) {
-  return /HTTP 401|HTTP 403|令牌|凭据|授权|权限/.test(message);
+  return !isBusyMessage(message) && isAuthorizationError(message);
+}
+// What one more click usually finishes for a pending record, by the rule the backend applies: a
+// removal continues while the domain is still local; a cleanup while the account is here with its
+// cloud resources recorded, no local domain, and a usable token.
+function pendingRecordHint(entry: string, state: Pick<State, "accounts" | "domains">) {
+  const ifRefused = "又报错的话，先按报错的提示处理。";
+  const removal = /^移除域名 (\S+) \(/.exec(entry);
+  if (removal && state.domains.some((domain) => domain.host === removal[1]))
+    return `到「域名管理」对这个域名再点一次「移除域名」会接着做完，做完后这条记录会自己消失。${ifRefused}`;
+  const cleanup = /^清理账号 (\S+) \(/.exec(entry);
+  const account = cleanup && state.accounts.find((item) => item.id === cleanup[1]);
+  if (account && account.hasResources && !account.needsTokenRecovery &&
+    !state.domains.some((domain) => domain.accountId === account.id))
+    return `到账户「${account.label}」的「管理账户」再点一次「删除云端短链接服务」会接着做完，做完后这条记录会自己消失。${ifRefused}`;
+  return "";
 }
 function hasOnlyDnsBlocker(preparation: DomainPreparation) {
   const errors = preparation.checks.filter(
@@ -203,7 +227,8 @@ function hasOnlyDnsBlocker(preparation: DomainPreparation) {
   );
 }
 function domainErrorMessage(message: string) {
-  return /HTTP 403|DNS\s*编辑权限|修改\s*DNS|修改.*解析/i.test(message)
+  // Only a refused DNS edit. Other 403s (a zone read, a route write, the website itself) are not about DNS.
+  return /DNS\s*编辑权限|修改\s*DNS|修改.*解析/i.test(message)
     ? `当前授权无法修改此域名的解析。${message}`
     : message;
 }
@@ -297,6 +322,7 @@ export default function App() {
     dnsMode: "system" as "system" | "public",
   });
   const [domainOpen, setDomainOpen] = useState(false);
+  const [domainBatchOpen, setDomainBatchOpen] = useState(false);
   const [domainBusy, setDomainBusy] = useState(false);
   const [domainAutomaticDns, setDomainAutomaticDns] = useState(false);
   // True only when the user picked the account; automatic picks follow the typed host.
@@ -309,6 +335,8 @@ export default function App() {
   const [domainFeedback, setDomainFeedback] = useState<{
     tone: "error" | "success" | "progress" | "warning";
     message: string;
+    /** Set when the message only points at the check results below; those decide on token help. */
+    fromChecks?: boolean;
   } | null>(null);
   const [duplicateDomainId, setDuplicateDomainId] = useState("");
   const [preflight, setPreflight] = useState<DomainPreparation | null>(null);
@@ -365,6 +393,15 @@ export default function App() {
   const [monitorSecret, setMonitorSecret] = useState("");
   const [testingLink, setTestingLink] = useState("");
   const [testingAutomaticDns, setTestingAutomaticDns] = useState(false);
+  // Links whose check request has not returned yet, even after "取消等待".
+  const [checkingKeys, setCheckingKeys] = useState<ReadonlySet<string>>(() => new Set());
+  // Result of the quiet check that runs after saving a link; shown in a notice, not a window.
+  const [autoCheck, setAutoCheck] = useState<{
+    url: string;
+    outcome: "passed" | "failed" | "unknown";
+    view: NonNullable<typeof testResult>;
+    targets: TargetReport;
+  } | null>(null);
   const [updateStatus, setUpdateStatus] = useState<UpdateStatus | null>(null);
   const [updateOpen, setUpdateOpen] = useState(false);
   const [updatePhase, setUpdatePhase] = useState<"checking" | "downloading" | "verifying" | "installing" | null>(null);
@@ -381,7 +418,7 @@ export default function App() {
   const [manageAccount, setManageAccount] = useState<Account | null>(null);
   const [protectionRead, setProtectionRead] = useState<{accountId:string;loading?:boolean;status?:import('./types').ClickProtection;error?:string} | null>(null);
   const protectionReadSequence = useRef(0);
-  const [statsTarget, setStatsTarget] = useState<{link: Link; domain: Domain} | null>(null);
+  const [statsTarget, setStatsTarget] = useState<{link: Link; domain: Domain; days?: ClickStatsDays} | null>(null);
   const [statsRevision, setStatsRevision] = useState(0);
   const [statsConfigurationError, setStatsConfigurationError] = useState<{accountId: string; message: string} | null>(null);
   const [statsPlanAccountId, setStatsPlanAccountId] = useState("");
@@ -407,10 +444,27 @@ export default function App() {
   const proxyDetected = useRef(false);
   const detectionSequence = useRef(0);
   const detectionInflight = useRef(new Set<string>());
+  // The link whose check the user is currently waiting for ("" after 取消等待 or when done).
+  const activeDetectionKey = useRef("");
+  // The link draft as it was opened, to tell whether closing would discard typing.
+  const linkDraftBaseline = useRef("");
+  // Which domain request a "再试一次" after a busy reply should repeat.
+  const lastDomainRequest = useRef<"check" | "refresh">("check");
   const domainCheckSequence = useRef(0);
   const domainOperation = useRef({ sequence: 0, inflight: false });
   const resumeDomainAfterToken = useRef(false);
+  // Per link: the newest request, so an older one finishing late does not overwrite its row.
   const latestDetectionForLink = useRef<Record<string, number>>({});
+  const detectionRuns = useRef(0);
+  // Links whose running request is a quiet after-save check.
+  const automaticDetectionInflight = useRef(new Set<string>());
+  // A quiet check the user picked up with 检测: the slot sequence it then reports to.
+  const adoptedDetection = useRef<Record<string, number>>({});
+  // Quiet checks asked for while an older request for the same link was still running.
+  const queuedAutomaticDetection = useRef(new Set<string>());
+  // False once the app is unmounted. A quiet check holds no slot that unmounting could
+  // take away, so this is what keeps it from sending a retry or reporting afterwards.
+  const detectionAlive = useRef(true);
   stateRef.current = state;
   linkDraftRef.current = linkDraft;
   domainDraftRef.current = domainDraft;
@@ -456,10 +510,13 @@ export default function App() {
     }
   }
   useEffect(() => {
+    detectionAlive.current = true;
     void load();
     return () => {
       loadSequence.current += 1;
       detectionSequence.current++;
+      detectionAlive.current = false;
+      queuedAutomaticDetection.current.clear();
       targetRetrySequence.current++;
       domainCheckSequence.current++;
       domainOperation.current.sequence++;
@@ -506,6 +563,12 @@ export default function App() {
     const id = window.setTimeout(() => setNotice(""), 5000);
     return () => clearTimeout(id);
   }, [notice]);
+  useEffect(() => {
+    // A passing automatic check fades like other notices; a problem stays until read.
+    if (autoCheck?.outcome !== "passed") return;
+    const id = window.setTimeout(() => setAutoCheck(null), 5000);
+    return () => clearTimeout(id);
+  }, [autoCheck]);
 
   async function withMutation(kind: string, work: () => Promise<void>) {
     if (mutationRef.current) return;
@@ -710,7 +773,12 @@ export default function App() {
           `删除：${domain ? shortUrl(domain.host, domain.prefix, String(fields.slug)) : String(fields.slug)}`,
           "确认后，此地址将不再按当前配置跳转。请先保存目标地址；删除不会移除平台地址或其他短链接。",
         ]);
-      } else if (kind === "remove_domain")
+      } else if (kind === "dismiss_pending_operation")
+        // The record itself is listed in the plan steps below.
+        setPlanDetails([
+          "只清除本机这条记录，不会改动 Cloudflare 上的任何内容。请确认你已经到对应账户核对过云端状态。",
+        ]);
+      else if (kind === "remove_domain")
         setPlanDetails([
           `域名：${domainById.get(String(fields.domainId))?.host || String(fields.domainId)}`,
           `此域名关联 ${linksByDomain.get(String(fields.domainId))?.length || 0} 条短链接。确认后会删除云端转发规则和这些短链接，访客将无法跳转。导出的备份只能用来对照手动重建，导入备份无法恢复已删除的链接。`,
@@ -791,6 +859,8 @@ export default function App() {
             ? "本机检测配置已找回。请查看新的修复计划，另行确认恢复检测密钥。"
           : appliedKind === "dismiss_worker_upgrade"
             ? "本机升级记录已解除，云端和密钥未修改。请继续核对云端当前状态。"
+          : appliedKind === "dismiss_pending_operation"
+            ? "已清除这条本机记录，云端没有改动。"
           : appliedKind === "resume_worker_upgrade"
             ? "云端升级已核对，待处理记录已完成。请留意账户中的检测密钥恢复提示。"
           : appliedKind === "upgrade_worker"
@@ -815,7 +885,7 @@ export default function App() {
               setError("");
             }
           : appliedKind === "save_pool" || (appliedKind === "migrate_credentials" && page === "pools") ? setPoolError
-          : appliedKind === "add_domain" ? (message) => { applyFailure = message; } : undefined,
+          : appliedKind === "add_domain" || appliedKind === "fix_domain_dns" ? (message) => { applyFailure = message; } : undefined,
       );
       if (next) {
         if (["enable_click_protection", "disable_click_protection", "upgrade_worker", "resume_worker_upgrade"].includes(appliedKind)) {
@@ -864,12 +934,17 @@ export default function App() {
           const link = next.links.find(
             (l) => l.domainId === savedLink.domainId && l.slug === savedLink.slug,
           );
-          if (domain && link) void selftest(link, domain);
+          // Quiet check: the user may already be filling in the next link.
+          if (domain && link) void selftest(link, domain, undefined, { automatic: true });
         }
       } else {
-        // Only a network-only review failure keeps the same plan usable; the error stays in this window.
-        const planStillValid = appliedKind === "add_domain" &&
-          applyFailure.includes("接入计划仍然有效") && isCurrentPlan(plan);
+        // A network-only review failure keeps the same add_domain plan usable, and a busy reply
+        // keeps any domain plan: the backend answers busy before it takes the plan (lib.rs
+        // dispatch → lock_backend). The error stays in this window.
+        const busyReply = /^上一个操作(还没结束|仍在进行)/.test(applyFailure.trim());
+        const planStillValid = isCurrentPlan(plan) && (
+          (appliedKind === "add_domain" && (applyFailure.includes("接入计划仍然有效") || busyReply)) ||
+          (appliedKind === "fix_domain_dns" && busyReply));
         if (!planStillValid) {
           setPlan(null);
           if (appliedKind === "add_domain") {
@@ -897,13 +972,21 @@ export default function App() {
     });
   }
   async function copy(value: string) {
+    let copied = false;
     await run(async () => {
-      if (preview) await navigator.clipboard.writeText(value);
-      else
-        await (
-          await import("@tauri-apps/plugin-clipboard-manager")
-        ).writeText(value);
+      try {
+        if (preview) await navigator.clipboard.writeText(value);
+        else
+          await (
+            await import("@tauri-apps/plugin-clipboard-manager")
+          ).writeText(value);
+      } catch {
+        // The system's own wording is English and says nothing about what to do next.
+        throw new Error("没能复制到剪贴板，请手动选中这条地址再复制。");
+      }
+      copied = true;
     }, "已复制短链接。");
+    return copied;
   }
   function openLink(link?: Link, usePlatform = false, preferredDomainId?: string) {
     setFormErrors({});
@@ -911,7 +994,7 @@ export default function App() {
     setError("");
     setCopySource(null);
     setOriginalSlug(link?.slug || null);
-    setLinkDraft(
+    const draft: LinkDraft =
       link
         ? {
             domainId: link.domainId,
@@ -932,8 +1015,9 @@ export default function App() {
             defaultUrl: "",
             poolId: "",
             code: "",
-          },
-    );
+          };
+    linkDraftBaseline.current = JSON.stringify(draft);
+    setLinkDraft(draft);
   }
   function updateLinkDraft(fields: Partial<LinkDraft>) {
     setFormErrors({});
@@ -1034,6 +1118,23 @@ export default function App() {
     domainOperation.current.inflight = false;
     setDomainBusy(false);
   }
+  // The batch dialog runs one domain command at a time and holds the app-wide lock meanwhile.
+  function beginDomainBatch() {
+    if (mutationRef.current || domainOperation.current.inflight) return false;
+    mutationRef.current = "domain_batch";
+    setMutation("domain_batch");
+    return true;
+  }
+  function endDomainBatch() {
+    if (mutationRef.current !== "domain_batch") return;
+    mutationRef.current = null;
+    setMutation(null);
+  }
+  function closeDomainBatch() {
+    setDomainBatchOpen(false);
+    // Leave the domain list current even if the last step did not return a state.
+    void dispatch<State>("get_state").then(publishState).catch(() => {});
+  }
   function revealDomainResult() {
     setDomainResultReveal((count) => count + 1);
   }
@@ -1114,6 +1215,7 @@ export default function App() {
       repairAlreadyApplied?: boolean;
     } = {},
   ) {
+    lastDomainRequest.current = "check";
     const hostError = validateHost(draft.input);
     const prefixError = validatePrefix(draft.prefix);
     const validation = hostError || prefixError;
@@ -1317,6 +1419,7 @@ export default function App() {
                     tone: "error",
                     message:
                       "DNS 已显示就绪，但域名接入复核仍未通过。请查看下方最新检查结果，不要重复提交修改。",
+                    fromChecks: true,
                   }
                 : null,
             );
@@ -1332,6 +1435,7 @@ export default function App() {
                   tone: "error",
                   message:
                     "解析修改已提交，但云端复核仍显示需要处理。请先核对下方状态，不要重复提交同一修改。",
+                  fromChecks: true,
                 }
               : null,
           );
@@ -1360,6 +1464,7 @@ export default function App() {
     await refreshDomainPreparation();
   }
   async function refreshDomainAccountList() {
+    lastDomainRequest.current = "refresh";
     const selectedAccountId =
       domainDraftRef.current.accountId ||
       (stateRef.current.accounts.length === 1
@@ -1486,6 +1591,23 @@ export default function App() {
           disabled={domainBusy}
         >
           更换本机令牌
+        </button>
+      </div>
+    );
+  }
+  function domainBusyRetryAction() {
+    return (
+      <div className="domain-feedback-actions">
+        <button
+          type="button"
+          className="button secondary"
+          disabled={busy || domainBusy}
+          onClick={() => {
+            if (lastDomainRequest.current === "refresh") void refreshDomainAccountList();
+            else void refreshDomainPreparation(domainDraftRef.current);
+          }}
+        >
+          再试一次
         </button>
       </div>
     );
@@ -1878,8 +2000,9 @@ export default function App() {
       setWorking(false);
     }
     if (!shouldAccept()) return;
-    setMonitorSecret("");
+    // A failed preparation keeps the key so the user can simply try again.
     if (next) {
+      setMonitorSecret("");
       setPlanKind("enable_monitor");
       setPlanDetails([
         `账户：${monitorAccount.label}`,
@@ -1977,25 +2100,84 @@ export default function App() {
       pool?.candidates,
     ]);
   }
-  async function selftest(link: Link, domain: Domain, requestedMode?: "system" | "public") {
+  function autoCheckKey(notice: { view: { domainId: string; slug: string } }) {
+    return `${notice.view.domainId}:${notice.view.slug}`;
+  }
+  function setChecking(key: string, checking: boolean) {
+    setCheckingKeys((current) => {
+      if (current.has(key) === checking) return current;
+      const next = new Set(current);
+      if (checking) next.add(key);
+      else next.delete(key);
+      return next;
+    });
+  }
+  async function selftest(
+    link: Link,
+    domain: Domain,
+    requestedMode?: "system" | "public",
+    options: { automatic?: boolean } = {},
+  ) {
     const key = detectionKey(link);
-    if (detectionInflight.current.has(key)) return;
+    const url = shortUrl(domain.host, domain.prefix, link.slug);
+    if (detectionInflight.current.has(key)) {
+      if (options.automatic) {
+        // The older request checks an older configuration: check again once it is done.
+        queuedAutomaticDetection.current.add(key);
+        return;
+      }
+      if (automaticDetectionInflight.current.has(key) && activeDetectionKey.current !== key) {
+        // 检测 on a link whose quiet check is still running: wait for that request in the window.
+        closeDetection();
+        activeDetectionKey.current = key;
+        adoptedDetection.current[key] = ++detectionSequence.current;
+        setAutoCheck((current) => current && autoCheckKey(current) === key ? null : current);
+        setTestingLink(url);
+        setError("");
+        return;
+      }
+      // One request per link at a time. If the user stopped waiting, say why nothing happens.
+      if (activeDetectionKey.current !== key) {
+        setError("");
+        setNotice("上一次检测还在收尾，几秒后再试。");
+      }
+      return;
+    }
     if (!requireCurrentCredentials([domain.accountId])) return;
     const dnsKey = JSON.stringify([domain.accountId, domain.host, domain.prefix]);
     let dnsMode = requestedMode || (publicDnsDomains.current.has(dnsKey) ? "public" : "system");
     let automaticDns = false;
-    closeDetection();
+    // A quiet check never takes the single "waiting for a result" slot: it reports in its row
+    // and in a notice, so a check started meanwhile does not throw its result away.
+    let sequence: number | undefined;
+    if (options.automatic) {
+      automaticDetectionInflight.current.add(key);
+      delete adoptedDetection.current[key];
+    } else {
+      closeDetection();
+      setAutoCheck((current) => current && autoCheckKey(current) === key ? null : current);
+    }
     detectionInflight.current.add(key);
-    const url = shortUrl(domain.host, domain.prefix, link.slug);
-    const sequence = ++detectionSequence.current;
-    latestDetectionForLink.current[detectionKey(link)] = sequence;
-    setTestingLink(url);
-    setError("");
-    const observedFingerprint = fingerprint(link);
-    const isCurrent = () => {
-      const current = stateRef.current.links.find((item) => detectionKey(item) === key);
-      return sequence === detectionSequence.current && current && fingerprint(current) === observedFingerprint;
+    setChecking(key, true);
+    const run = ++detectionRuns.current;
+    latestDetectionForLink.current[key] = run;
+    if (!options.automatic) {
+      activeDetectionKey.current = key;
+      sequence = ++detectionSequence.current;
+      setTestingLink(url);
+      setError("");
+    }
+    // True while the user waits for this request: a manual check, or a quiet one picked up by 检测.
+    const holdsSlot = () => {
+      const slot = options.automatic ? adoptedDetection.current[key] : sequence;
+      return slot !== undefined && slot === detectionSequence.current;
     };
+    const observedFingerprint = fingerprint(link);
+    const configurationCurrent = () => {
+      const current = stateRef.current.links.find((item) => detectionKey(item) === key);
+      return Boolean(current && fingerprint(current) === observedFingerprint);
+    };
+    const isCurrent = () => (options.automatic ? detectionAlive.current : holdsSlot()) && configurationCurrent();
     const routeRequest = () => dispatch<Selftest>("selftest_link", {
       domainId: link.domainId, slug: link.slug, ...(dnsMode === "public" ? {dnsMode} : {}),
     });
@@ -2019,7 +2201,7 @@ export default function App() {
         if (retry) {
           automaticDns = true;
           proxyDetected.current = true;
-          setTestingAutomaticDns(true);
+          if (holdsSlot()) setTestingAutomaticDns(true);
           if (route.value.status === "key_missing") {
             // Targets are anonymous; do not repeat a known missing-key read.
             targets = (await Promise.allSettled([dispatch<TargetReport>("check_link_targets", {
@@ -2058,36 +2240,77 @@ export default function App() {
                 },
               ],
             };
-      if (isCurrent() && latestDetectionForLink.current[detectionKey(link)] === sequence)
+      if (isCurrent() && latestDetectionForLink.current[key] === run)
         setDetections((prev) => ({
           ...prev,
-          [detectionKey(link)]: {
+          [key]: {
             fingerprint: observedFingerprint,
             selftest: result,
             targets: targetReport,
             checkedAt,
           },
         }));
-      const current = stateRef.current.links.find(
-        (item) => item.domainId === link.domainId && item.slug === link.slug,
-      );
-      if (sequence === detectionSequence.current) {
-        if (current && fingerprint(current) === observedFingerprint) {
+      const view = { url, result, domainId: link.domainId, slug: link.slug, fingerprint: observedFingerprint, dnsMode, automaticDns };
+      if (holdsSlot()) {
+        if (configurationCurrent()) {
           if (dnsMode === "public" && result.status === "passed") publicDnsDomains.current.add(dnsKey);
-          setTestResult({ url, result, domainId: link.domainId, slug: link.slug, fingerprint: observedFingerprint, dnsMode, automaticDns });
+          setTestResult(view);
           setTargetResult(targetReport);
         } else setNotice("链接或平台地址已变化，请重新检测。");
+      } else if (options.automatic && detectionAlive.current) {
+        if (configurationCurrent()) {
+          if (dnsMode === "public" && result.status === "passed") publicDnsDomains.current.add(dnsKey);
+          // Same verdict as the list status; the window opens only when the user asks.
+          const outcome = result.status === "failed" || targetReport.checks.some((check) => check.status === "failed")
+            ? "failed"
+            : result.status === "passed" && targetReport.checks.length >= 2 && targetReport.checks.every((check) => check.status === "passed")
+              ? "passed"
+              : "unknown";
+          const next = { url, outcome, view, targets: targetReport } as const;
+          // A pass never hides an unread problem of another link; a pass of the same link clears it.
+          setAutoCheck((current) => outcome === "passed" && current && current.outcome !== "passed" &&
+            autoCheckKey(current) !== key ? current : next);
+        } else if (!queuedAutomaticDetection.current.has(key)) setNotice("链接或平台地址已变化，请重新检测。");
       }
     } catch (e) {
-      if (sequence === detectionSequence.current) setError(`检测未完成：${errorMessage(e)}`);
+      if (holdsSlot() || (options.automatic && !activeDetectionKey.current)) setError(`检测未完成：${errorMessage(e)}`);
     } finally {
+      const waited = holdsSlot();
       detectionInflight.current.delete(key);
-      if (sequence === detectionSequence.current) setTestingLink("");
+      if (options.automatic) {
+        automaticDetectionInflight.current.delete(key);
+        delete adoptedDetection.current[key];
+      }
+      setChecking(key, false);
+      if (waited) {
+        if (activeDetectionKey.current === key) activeDetectionKey.current = "";
+        setTestingLink("");
+      }
+      if (queuedAutomaticDetection.current.delete(key)) {
+        const nextLink = stateRef.current.links.find((item) => detectionKey(item) === key);
+        const nextDomain = nextLink && stateRef.current.domains.find((item) => item.id === nextLink.domainId);
+        if (nextLink && nextDomain) void selftest(nextLink, nextDomain, undefined, { automatic: true });
+      }
     }
+  }
+  function openAutoCheck() {
+    if (!autoCheck) return;
+    const { view, targets } = autoCheck;
+    setAutoCheck(null);
+    const link = stateRef.current.links.find((item) => item.domainId === view.domainId && item.slug === view.slug);
+    if (!link || fingerprint(link) !== view.fingerprint) {
+      setNotice("链接或平台地址已变化，请重新检测。");
+      return;
+    }
+    closeDetection();
+    setTestResult(view);
+    setTargetResult(targets);
   }
 
   function closeDetection() {
     detectionSequence.current++;
+    // A request still running for this link is now only finishing in the background.
+    activeDetectionKey.current = "";
     setTestingLink("");
     setTestingAutomaticDns(false);
     targetRetrySequence.current++;
@@ -2218,6 +2441,22 @@ export default function App() {
       if (attentionOnly && (!record || !(record.stale || record.phase !== "healthy"))) return false;
       return `${link.slug} ${link.cnUrl} ${link.defaultUrl} ${link.code || ""} ${poolById.get(link.poolId || "")?.name || ""} ${domain.host}`.toLowerCase().includes(searchTerm);
     })})).filter((group) => (!searchTerm && !attentionOnly) || group.links.length);
+  const listFiltered = Boolean(searchTerm) || activeFilter !== "all";
+  const shownLinkCount = groups.reduce((count, group) => count + group.links.length, 0);
+  // A missing key is not a network problem: checking the redirect again would only read the key
+  // again, so in that case the retry in the result window covers the websites alone.
+  const retryRouteToo = testResult?.result.status === "failed" || testResult?.result.status === "pending";
+  // Only the link page reads monitor records, so skip the scan elsewhere.
+  const monitorRecords = page === "links" && redirectMonitor.enabled ? state.links.map((link) => redirectMonitor.getRecord(link)) : [];
+  const attentionDisabledReason = !redirectMonitor.enabled
+    ? "先打开上方的自动巡检，才能筛出需关注的链接。"
+    : attentionOnly
+      ? ""
+      : monitorRecords.length > 0 && !monitorRecords.some(Boolean)
+        ? "还没检测过，等第一轮巡检完成后再用。"
+        : !monitorRecords.some((record) => record && (record.stale || record.phase !== "healthy"))
+          ? "目前没有需要关注的链接。"
+          : "";
   const matchingDomains = state.domains.filter((domain) => `${domain.host} ${domain.prefix} ${accountById.get(domain.accountId)?.label || ""}`.toLowerCase().includes(domainSearch.trim().toLowerCase()));
   const matchingAccounts = state.accounts.filter((account) => `${account.label} ${account.cloudflareName || ""} ${account.id}`.toLowerCase().includes(accountSearch.trim().toLowerCase()));
   const title =
@@ -2256,6 +2495,10 @@ export default function App() {
     ? "go"
     : domainDraft.prefix;
   const domainSummary = preflight ? domainCheckSummary(preflight) : null;
+  // Token help for check results comes only from the backend's reason, never from their wording.
+  const domainChecksNeedAuthorization = [preflight, dnsPreflight].some(
+    (result) => Boolean(result && authorizationCheck(result.checks)),
+  );
 
   return (
     <div className="app-shell">
@@ -2404,6 +2647,19 @@ export default function App() {
                   添加域名
                 </button>
               )}
+              {page === "domains" && (
+                <button
+                  className="button secondary"
+                  onClick={() => {
+                    setError("");
+                    setDomainBatchOpen(true);
+                  }}
+                  disabled={!state.accounts.length || busy}
+                >
+                  <Plus size={18} weight="bold" />
+                  批量添加
+                </button>
+              )}
               {page === "accounts" && (
                 <button
                   className="button primary"
@@ -2412,7 +2668,9 @@ export default function App() {
                     setToken("");
                     setClipboardOffer("");
                     setTokenOpen(true);
-                    void openTemplate();
+                    // Only a first-time user is sent to the template page automatically;
+                    // the dialog keeps its own button for everyone else.
+                    if (!stateRef.current.accounts.length) void openTemplate();
                   }}
                 >
                   <Plus size={18} weight="bold" />
@@ -2421,6 +2679,7 @@ export default function App() {
               )}
             </div>
           </section>
+          <div className="alert-stack">
           {error && (
             <div role="alert" className="alert error">
               <WarningCircle size={19} />
@@ -2464,6 +2723,26 @@ export default function App() {
               <button onClick={closeDetection}>取消等待</button>
             </div>
           )}
+          {autoCheck && (
+            <div role="status" className={`alert ${autoCheck.outcome === "passed" ? "success" : "testing"}`}>
+              {autoCheck.outcome === "passed" ? <CheckCircle size={19} /> : <WarningCircle size={19} />}
+              <span>
+                {autoCheck.outcome === "passed"
+                  ? `已自动检测 ${autoCheck.url}：通过。`
+                  : autoCheck.outcome === "failed"
+                    ? `已自动检测 ${autoCheck.url}：有问题，请查看结果。`
+                    : `已自动检测 ${autoCheck.url}：暂时没法确认能否正常打开，请查看结果。`}
+              </span>
+              {autoCheck.outcome !== "passed" && (
+                <button type="button" className="button secondary" onClick={openAutoCheck}>
+                  查看结果
+                </button>
+              )}
+              <button aria-label="关闭检测结果提示" onClick={() => setAutoCheck(null)}>
+                <X size={16} />
+              </button>
+            </div>
+          )}
           {clipboardToClear && (
             <div className="alert success">
               <span>令牌已导入。你可以清空剪贴板里的令牌。</span>
@@ -2473,6 +2752,7 @@ export default function App() {
               <button onClick={() => setClipboardToClear("")}>保留</button>
             </div>
           )}
+          </div>
           {!loading &&
             !loadFailed &&
             (state.pendingActions?.length || 0) > 0 && (
@@ -2542,10 +2822,28 @@ export default function App() {
               <summary>
                 查看待处理记录（{state.pendingOperations.length} 条）
               </summary>
-              <p>{state.pendingActions?.length ? "以下为历史操作详情，请按上方对应账户的入口核对后续步骤。" : "以下记录尚未确认完成，请先核对对应账户和云端状态，避免重复提交。"}</p>
+              <p>
+                这些操作的云端结果还没确认。请先到对应的 Cloudflare 账户核对云端状态，核对完可以在这里清除这条记录。
+                {state.pendingActions?.length ? " 上方有专门按钮的，请先用那个按钮处理。" : ""}
+              </p>
               <ul>
                 {state.pendingOperations.map((entry, i) => (
-                  <li key={i}>{entry}</li>
+                  <li key={i} className="operation-log-entry">
+                    <span>
+                      {entry}
+                      {pendingRecordHint(entry, state) && (
+                        <small className="operation-log-hint">{pendingRecordHint(entry, state)}</small>
+                      )}
+                    </span>
+                    <button
+                      type="button"
+                      className="button ghost bordered"
+                      disabled={busy}
+                      onClick={() => void prepare("dismiss_pending_operation", { entry })}
+                    >
+                      我已核对，清除这条
+                    </button>
+                  </li>
                 ))}
               </ul>
             </details>
@@ -2580,14 +2878,14 @@ export default function App() {
               onScopeInvalidate={() => {
                 statsPrepareSequence.current++;
               }}
-              onOpenLinkStats={(link, domain) => {
+              onOpenLinkStats={(link, domain, days) => {
                 statsPrepareSequence.current++;
-                setStatsTarget({link, domain});
+                setStatsTarget({link, domain, days});
               }}
             />
           ) : page === "links" ? (
             <>
-              <RedirectMonitor ready={redirectMonitor.ready} nextCheckAt={redirectMonitor.nextCheckAt} runKind={redirectMonitor.runKind} pendingChanges={redirectMonitor.pendingChanges} totalLinks={redirectMonitor.totalLinks} summary={redirectMonitor.summary} resultStatus={redirectMonitor.resultStatus} enabled={redirectMonitor.enabled} active={redirectMonitor.active} online={redirectMonitor.online} progress={redirectMonitor.progress} lastCompletion={redirectMonitor.lastCompletion} onEnabled={(value) => {if (!value) setAttentionOnly(false);redirectMonitor.setEnabled(value);}} onRun={redirectMonitor.runNow} disabled={busy || loading || updates.checking || !!updateStatus}/>
+              <RedirectMonitor ready={redirectMonitor.ready} nextCheckAt={redirectMonitor.nextCheckAt} runKind={redirectMonitor.runKind} pendingChanges={redirectMonitor.pendingChanges} totalLinks={redirectMonitor.totalLinks} summary={redirectMonitor.summary} resultStatus={redirectMonitor.resultStatus} previousRunAt={redirectMonitor.previousRunAt} backendBusy={redirectMonitor.waitingForBackend} enabled={redirectMonitor.enabled} active={redirectMonitor.active} online={redirectMonitor.online} progress={redirectMonitor.progress} lastCompletion={redirectMonitor.lastCompletion} onEnabled={(value) => {if (!value) setAttentionOnly(false);redirectMonitor.setEnabled(value);}} onRun={redirectMonitor.runNow} disabled={busy || loading || updates.checking || !!updateStatus}/>
               <div className="metric-row">
                 <div className="metric">
                   <span>全部链接</span>
@@ -2612,12 +2910,13 @@ export default function App() {
                     <h2 ref={linkListHeadingRef} tabIndex={-1} className="link-list-heading">
                       {attentionOnly ? "需关注链接" : "全部链接"}{" "}
                       <span className="heading-count">
-                        {attentionOnly ? groups.reduce((count, group) => count + group.links.length, 0) : state.links.length}
+                        {attentionOnly ? shownLinkCount : listFiltered ? `${shownLinkCount} / ${state.links.length}` : state.links.length}
                       </span>
                     </h2>
                   </div>
                   <div className="panel-tools">
-                    <button type="button" className={`button secondary ${attentionOnly ? 'redirect-monitor-filter-active' : ''}`} aria-pressed={attentionOnly} disabled={!redirectMonitor.enabled} onClick={() => {setAttentionOnly(!attentionOnly);setSearch('');setFilter('all');}}>只看需关注</button>
+                    <button type="button" className={`button secondary ${attentionOnly ? 'redirect-monitor-filter-active' : ''}`} aria-pressed={attentionOnly} disabled={Boolean(attentionDisabledReason)} aria-describedby={attentionDisabledReason ? "attention-disabled-reason" : undefined} title={attentionDisabledReason || undefined} onClick={() => {setAttentionOnly(!attentionOnly);setSearch('');setFilter('all');}}>只看需关注</button>
+                    {attentionDisabledReason && <small id="attention-disabled-reason" className="attention-disabled-reason">{attentionDisabledReason}</small>}
                     <label className="searchbox">
                       <MagnifyingGlass size={17} />
                       <input
@@ -2698,8 +2997,10 @@ export default function App() {
                       };
                     }}
                     getAutoDetection={redirectMonitor.enabled ? redirectMonitor.getRecord : undefined}
-                    onCopy={(url) => void copy(url)}
+                    onCopy={(url) => copy(url)}
                     onCheck={(link, domain) => void selftest(link, domain)}
+                    isChecking={(link) => checkingKeys.has(detectionKey(link))}
+                    resetKey={JSON.stringify([searchTerm, activeFilter, attentionOnly])}
                     onStats={(link, domain) => {
                       statsPrepareSequence.current++;
                       setStatsConfigurationError(null);
@@ -3013,6 +3314,7 @@ export default function App() {
           errorAction={migrationAction()}
           status={notice === "本机授权已更新，请重试刚才的操作" ? <div role="status">{notice}</div> : undefined}
           dismissDisabled={mutation === "prepare_credentials"}
+          hasUserInput={JSON.stringify(linkDraft) !== linkDraftBaseline.current}
           onClose={closeLink}
           footer={
             <>
@@ -3039,21 +3341,47 @@ export default function App() {
             slugInput={slugInput} saveLink={saveLink} updateLinkDraft={updateLinkDraft} useNewLinkName={useNewLinkName} />
         </Dialog>
       )}
+      {domainBatchOpen && (
+        <DomainBatch
+          accounts={state.accounts}
+          domains={state.domains}
+          initialDnsMode={() => (proxyDetected.current ? "public" : "system")}
+          begin={beginDomainBatch}
+          end={endDomainBatch}
+          onState={publishState}
+          onPublicDns={() => { proxyDetected.current = true; }}
+          onSystemDns={() => { proxyDetected.current = false; }}
+          onAdded={(info) => {
+            if (info.dnsMode === "public")
+              publicDnsDomains.current.add(JSON.stringify([info.accountId, info.host, info.prefix]));
+          }}
+          onClose={closeDomainBatch}
+        />
+      )}
       {domainOpen && !plan && (
         <Dialog
           title="添加域名"
           eyebrow="DOMAIN SETUP"
           error={domainErrorMessage(error)}
-          errorAction={domainMigrationAccount ? undefined : migrationAction() || (isDomainCredentialError(error) ? domainRecoveryActions() : undefined)}
+          errorAction={domainMigrationAccount ? undefined : migrationAction() || (isDomainCredentialError(error) ? domainRecoveryActions() : isBusyMessage(error) ? domainBusyRetryAction() : undefined)}
           dismissDisabled={mutation === "prepare_credentials"}
+          hasUserInput={Boolean(domainDraft.input.trim())}
           status={
-            domainFeedback ? (
+            domainFeedback && domainFeedback.tone === "error" && isBusyMessage(domainFeedback.message) ? (
+              // Busy is temporary: show it as a retryable notice, not as a token problem.
+              <div role="status" className="domain-feedback warning">
+                <span>{domainFeedback.message}</span>
+                {domainBusyRetryAction()}
+              </div>
+            ) : domainFeedback ? (
               <div
                 role={domainFeedback.tone === "error" ? "alert" : "status"}
                 className={`domain-feedback ${domainFeedback.tone}`}
               >
                 <span>{domainFeedback.message}</span>
-                {domainFeedback.tone === "error" && isDomainCredentialError(domainFeedback.message) && domainRecoveryActions()}
+                {domainFeedback.tone === "error" &&
+                  (domainFeedback.fromChecks ? domainChecksNeedAuthorization : isDomainCredentialError(domainFeedback.message)) &&
+                  domainRecoveryActions()}
               </div>
             ) : domainPreparationExpired ? (
               <div role="status" className="domain-feedback error">
@@ -3083,6 +3411,7 @@ export default function App() {
                     </button>
                   </div>
                 )}
+                {!domainSummary.network && domainChecksNeedAuthorization && domainRecoveryActions()}
               </div>
             ) : undefined
           }
@@ -3473,6 +3802,7 @@ export default function App() {
           onClose={closeStats}
           onConfigure={(enabled) => void configureClickStats(statsTarget.domain.accountId, enabled, statsTarget)}
           revision={statsRevision}
+          initialDays={statsTarget.days}
           busy={busy}
           configurationError={statsConfigurationError?.accountId === statsTarget.domain.accountId ? statsConfigurationError.message : undefined}
         />
@@ -3538,7 +3868,9 @@ export default function App() {
             )}
             <p>{planKind === "migrate_credentials"
               ? "本次仅更新此账户在本机的凭据保存方式："
-              : "应用将再次检查账户归属和当前状态，然后执行以下步骤："}</p>
+              : planKind === "dismiss_pending_operation"
+                ? "这次只改本机的记录，不连接 Cloudflare："
+                : "应用将再次检查账户归属和当前状态，然后执行以下步骤："}</p>
             <ol>
               {plan.steps.map((step, i) => (
                 <li key={i}>{step}</li>
@@ -3570,6 +3902,7 @@ export default function App() {
         <Dialog
           title={updateTokenAccount?.needsTokenRecovery ? "恢复账户令牌" : updateTokenAccount ? "更换本机令牌" : "导入访问令牌"}
           dismissDisabled={mutation === "token"}
+          hasUserInput={Boolean(token.trim())}
           eyebrow="ACCOUNT ACCESS"
           error={error}
           onClose={closeToken}
@@ -3721,6 +4054,7 @@ export default function App() {
         <Dialog
           title="重命名账户"
           dismissDisabled={mutation === "rename"}
+          hasUserInput={renameValue.trim() !== renameAccount.label.trim()}
           error={error}
           onClose={() => setRenameAccount(null)}
           footer={
@@ -3965,7 +4299,7 @@ export default function App() {
               <section className="manager-section">
                 <div className="manager-section-heading">
                   <strong>云端跳转功能</strong>
-                  <p>升级此账户的云端跳转服务以启用新版功能，包括名称大小写兼容与默认访问保护。旧链接保持原样；已有重名时先匹配原名称，再匹配小写名称。现有密钥和检测设置会保留；此前明确停用的保护设置也会保留。</p>
+                  <p>升级此账户的云端跳转服务以启用新版功能，包括名称大小写兼容、默认访问保护，以及链接末尾多了标点或斜杠也能打开。旧链接保持原样；已有重名时先匹配原名称，再匹配小写名称。现有密钥和检测设置会保留；此前明确停用的保护设置也会保留。</p>
                 </div>
                 <div className="manager-actions">
                   <button disabled={busy || Boolean(manageAccount.needsTokenRecovery)} className="button secondary" onClick={() => {
@@ -4020,6 +4354,7 @@ export default function App() {
           title="配置检测服务"
           errorAction={migrationAction()}
           dismissDisabled={mutation === "prepare_credentials"}
+          hasUserInput={Boolean(monitorSecret.trim()) || monitorEndpoint.trim() !== (monitorAccount.monitorEndpoint || "").trim()}
           eyebrow="OPTIONAL MONITOR"
           error={error}
           onClose={closeMonitor}
@@ -4159,18 +4494,17 @@ export default function App() {
                 </span>
               </div>
             ))}
-            {!preview && (targetResult?.dnsMode === "public" || targetResult?.checks.some((check) => check.status === "unknown") || testResult.result.status !== "passed") && (
+            {!preview && (retryRouteToo || targetResult?.checks.some((check) => check.status === "unknown")) && (
+              // One retry: a failed redirect re-checks both parts, otherwise only the websites.
               <div className="form-note">
-                <p>明确检测到 VPN 虚拟地址时会自动兼容重查一次；其他网络问题不会自动切换，也可在这里手动重试。Cloudflare 公共 DNS 只向查询服务发送域名，不发送完整链接或邀请码；重试过程中如遇跳转，也会查询跳转后的域名。</p>
-                <button className="button secondary" disabled={retryingTargets} onClick={() => void retryTargetsWithPublicDns()}>
-                  {retryingTargets ? "正在重新检测…" : "兼容 VPN 重试"}
+                <p>开着 VPN 时结果可能不准，可以用公共 DNS 再测一次：只向查询服务发送域名，不改你的 VPN 设置。</p>
+                <button
+                  className="button secondary"
+                  disabled={retryingTargets || Boolean(testingLink)}
+                  onClick={() => retryRouteToo ? retryRouteWithPublicDns() : void retryTargetsWithPublicDns()}
+                >
+                  {retryingTargets ? "正在重新检测…" : "兼容 VPN 再测一次"}
                 </button>
-                {testResult.result.status !== "passed" && (
-                  <button className="button secondary" disabled={retryingTargets || Boolean(testingLink)} onClick={retryRouteWithPublicDns}>
-                    兼容 VPN 重新检测跳转和网站
-                  </button>
-                )}
-                <p>不会更改你的 VPN 设置。结果仍代表本机当前网络，不能据此判断大陆是否能访问。</p>
               </div>
             )}
             <small>

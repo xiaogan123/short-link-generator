@@ -24,7 +24,9 @@ describe('explicit VPN retry',()=>{
  it('uses public DNS only after consent and retries targets without credentials or route checks',async()=>{
    const dialog=await open();expect(mock.calls.filter(c=>c.action==='check_link_targets')[0].payload.dnsMode).toBeUndefined();
    expect(within(dialog).getByText(/只向查询服务发送域名/)).toBeTruthy();
-   fireEvent.click(within(dialog).getByRole('button',{name:'兼容 VPN 重试'}));
+   // One button only: the redirect passed, so it re-checks just the websites.
+   expect(within(dialog).getAllByRole('button',{name:/兼容 VPN/})).toHaveLength(1);
+   fireEvent.click(within(dialog).getByRole('button',{name:'兼容 VPN 再测一次'}));
    await within(dialog).findByText(/当前网络请求成功/);
    expect(within(dialog).getByText('跳转检测通过')).toBeTruthy();
    expect(within(dialog).getByText(/来源：本机网络 · 公共 DNS/)).toBeTruthy();
@@ -33,7 +35,8 @@ describe('explicit VPN retry',()=>{
  });
  it('explicitly retries both checks with public DNS when route checking also failed',async()=>{
    mock.routeFails=true;const dialog=await open();
-   fireEvent.click(within(dialog).getByRole('button',{name:'兼容 VPN 重新检测跳转和网站'}));
+   expect(within(dialog).getAllByRole('button',{name:/兼容 VPN/})).toHaveLength(1);
+   fireEvent.click(within(dialog).getByRole('button',{name:'兼容 VPN 再测一次'}));
    const next=await screen.findByRole('dialog',{name:'链接检测'});
    expect(within(next).getByText('跳转检测通过')).toBeTruthy();
    expect(within(next).getByText(/本次跳转检查使用公共 DNS/)).toBeTruthy();
@@ -42,7 +45,7 @@ describe('explicit VPN retry',()=>{
  });
  it('ignores a late response after closing and reopening, and prevents duplicate retries',async()=>{
    const dialog=await open();mock.deferred=true;
-   const retry=within(dialog).getByRole('button',{name:'兼容 VPN 重试'});fireEvent.click(retry);fireEvent.click(retry);
+   const retry=within(dialog).getByRole('button',{name:'兼容 VPN 再测一次'});fireEvent.click(retry);fireEvent.click(retry);
    expect(mock.calls.filter(c=>c.payload?.dnsMode==='public')).toHaveLength(1);
    const finish=mock.finish!;fireEvent.click(within(dialog).getByRole('button',{name:'完成'}));
    fireEvent.click(screen.getByRole('button',{name:'检测 sample'}));
@@ -52,7 +55,7 @@ describe('explicit VPN retry',()=>{
    expect(within(next).getByText(/VPN 返回虚拟地址/)).toBeTruthy();
  });
  it('discards a public result when link settings changed while checking',async()=>{
-   const dialog=await open();mock.deferred=true;fireEvent.click(within(dialog).getByRole('button',{name:'兼容 VPN 重试'}));
+   const dialog=await open();mock.deferred=true;fireEvent.click(within(dialog).getByRole('button',{name:'兼容 VPN 再测一次'}));
    mock.changed=true;fireEvent.click(screen.getByRole('button',{name:'刷新数据'}));
    await waitFor(()=>expect(mock.calls.filter(c=>c.action==='get_state')).toHaveLength(2));
    await act(async()=>mock.finish!(report('public')));
@@ -111,11 +114,17 @@ describe('automatic typed virtual DNS retry',()=>{
    const before=mock.calls.filter(c=>c.action==='check_link_targets').length;
    expect(before).toBe(mode==='public'?2:1);
    fireEvent.click(screen.getByRole('button',{name:'取消等待'}));
+   expect(button.getAttribute('aria-busy')).toBe('true');
+   expect(button.textContent).toContain('检测中…');
    fireEvent.click(button);
    expect(mock.calls.filter(c=>c.action==='check_link_targets')).toHaveLength(before);
+   expect(screen.getByText('上一次检测还在收尾，几秒后再试。')).toBeTruthy();
    await act(async()=>mock.finish!(report(mode)));
    expect(screen.queryByRole('dialog',{name:'链接检测'})).toBeNull();
    expect(mock.calls.filter(c=>c.action==='check_link_targets')).toHaveLength(before);
+   await waitFor(()=>expect(button.getAttribute('aria-busy')).toBeNull());
+   expect(button.textContent).toContain('检测');
+   expect(button.textContent).not.toContain('检测中');
  });
  it('ignores an automatic retry if the saved link changes before completion',async()=>{
    mock.systemReason='virtual_dns_address';mock.deferred=true;
@@ -196,4 +205,24 @@ it('does not retry missing-key reads or successful targets based on route-only v
   expect(within(dialog).queryByText(/本次已自动使用公共 DNS/)).toBeNull();
   expect(mock.calls.filter(c=>c.action==='selftest_link')).toHaveLength(1);
   expect(mock.calls.filter(c=>c.action==='check_link_targets')).toHaveLength(1);
+});
+
+it('re-checks only the websites when the detection key is missing, without reading the key again',async()=>{
+  mock.keyMissing=true;
+  const dialog=await open();
+  expect(within(dialog).getByText('检测密钥缺失')).toBeTruthy();
+  fireEvent.click(within(dialog).getByRole('button',{name:'兼容 VPN 再测一次'}));
+  await within(dialog).findByText(/当前网络请求成功/);
+  // Same window, same key result: a missing key is not something another DNS can fix.
+  expect(screen.getByRole('dialog',{name:'链接检测'})).toBe(dialog);
+  expect(within(dialog).getByText('检测密钥缺失')).toBeTruthy();
+  expect(mock.calls.filter(c=>c.action==='selftest_link')).toHaveLength(1);
+  expect(mock.calls.filter(c=>c.action==='check_link_targets').map(c=>c.payload.dnsMode)).toEqual([undefined,'public']);
+});
+
+it('offers no VPN retry when the key is missing and every website already has a clear result',async()=>{
+  mock.keyMissing=true;mock.systemPasses=true;
+  const dialog=await open();
+  expect(within(dialog).getByText('检测密钥缺失')).toBeTruthy();
+  expect(within(dialog).queryByRole('button',{name:/兼容 VPN/})).toBeNull();
 });

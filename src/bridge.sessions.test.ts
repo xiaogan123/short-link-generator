@@ -22,7 +22,7 @@ it('rejects a preview session after a local configuration change',async()=>{
   const {dispatch}=await import('./bridge');
   const first=await dispatch<StatsCenterReport>('get_stats_center',{accountId:'demo-a',days:7,page:1,pageSize:25});
   await dispatch('rename_account',{accountId:'demo-a',label:'新示例备注'});
-  await expect(dispatch('get_stats_center',{accountId:'demo-a',days:7,page:2,pageSize:25,readSessionId:first.readSessionId})).rejects.toThrow(/范围已变化/);
+  await expect(dispatch('get_stats_center',{accountId:'demo-a',days:7,page:2,pageSize:25,readSessionId:first.readSessionId})).rejects.toThrow('统计读取会话已过期或范围发生变化，请刷新后重新读取');
 });
 
 it('exposes token recovery only as an explicit fixture and scopes its confirmed update',async()=>{

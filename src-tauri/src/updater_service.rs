@@ -1,6 +1,6 @@
 //! Bounded download before an exclusive, verified installation. No account
 //! credential is read here. Updater 2.14 verifies again inside `Update::install`.
-use super::{json, lock_backend, AppState, Duration, Value};
+use super::{json, lock_backend_within, AppState, Duration, Value};
 use futures_util::StreamExt;
 use reqwest::{header, redirect, Client, Url};
 use std::sync::Mutex as StdMutex;
@@ -23,6 +23,13 @@ const MANIFEST_POLICY: DownloadPolicy = DownloadPolicy {
     total: Duration::from_secs(30),
     idle: Duration::from_secs(10),
     max_bytes: 1024 * 1024,
+};
+/// A verified package waits this long for the current operation to finish
+/// before installing, so a short overlap does not throw the download away.
+const INSTALL_WAIT: Duration = if cfg!(test) {
+    Duration::from_millis(200)
+} else {
+    Duration::from_secs(30)
 };
 const CANCELLED: &str = "更新下载已取消，可以稍后重试";
 const DOWNLOAD_ERROR: &str = "更新请求失败，请检查网络后重试";
@@ -267,7 +274,7 @@ async fn install_exclusively<T>(
     state: &AppState,
     install: impl FnOnce() -> Result<T, String>,
 ) -> Result<T, String> {
-    let _backend_guard = lock_backend(state, "install_update").await?;
+    let _backend_guard = lock_backend_within(state, INSTALL_WAIT).await?;
     install()
 }
 fn require_https(url: &Url) -> Result<(), String> {
