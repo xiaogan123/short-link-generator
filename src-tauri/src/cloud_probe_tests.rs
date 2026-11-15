@@ -195,7 +195,34 @@ async fn probe_transport_timeout_is_distinct_and_does_not_expose_url() {
     .unwrap_err();
     assert!(error.message.contains("超时"));
     assert!(!error.message.contains("synthetic-private-path"));
-    assert!(!error.uncertain);
+    // A timeout is a network problem the UI may offer to retry.
+    assert_eq!(error.reason, Some("probe_timeout"));
+}
+
+#[tokio::test]
+async fn probe_timeouts_carry_a_network_reason_through_domain_checks() {
+    let server = MockServer::start().await;
+    Mock::given(method("HEAD"))
+        .and(path("/client/v4/probe/example.com/out/"))
+        .respond_with(ResponseTemplate::new(404).set_delay(Duration::from_millis(2500)))
+        .mount(&server)
+        .await;
+    let cloud = Cloud::for_test(&format!("{}/client/v4/", server.uri()));
+    let error = cloud
+        .probe_with_mode("https://example.com/out/", None, DnsMode::Public)
+        .await
+        .unwrap_err();
+    assert_eq!(error.reason, Some("probe_timeout"));
+    let (check, risk) = crate::domain_check::classify_probe_detailed(
+        "短链接目录",
+        "https://example.com/out/",
+        None,
+        Err(error),
+    );
+    assert_eq!(check.reason.as_deref(), Some("probe_timeout"));
+    assert_eq!(check.level, crate::model::DomainCheckLevel::Error);
+    assert_eq!(risk, crate::domain_check::ProbeRisk::Unreachable);
+    assert_eq!(probe_timeout().reason, Some("probe_timeout"));
 }
 
 #[tokio::test]
@@ -224,11 +251,11 @@ async fn probe_transport_connection_failure_is_distinct_and_sanitized() {
     .unwrap_err();
     server.await.unwrap();
     assert!(
-        error.message.contains("连接或 TLS"),
+        error.message.contains("没连上这个域名"),
         "sanitized transport classification: {}",
         error.message
     );
     assert!(!error.message.contains("synthetic-private-path"));
     assert!(!error.message.contains(&address.to_string()));
-    assert!(!error.uncertain);
+    assert_eq!(error.reason, Some("probe_transport_error"));
 }

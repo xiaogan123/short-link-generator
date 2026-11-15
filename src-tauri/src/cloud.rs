@@ -6,24 +6,64 @@ use std::time::Duration;
 const BASE: &str = "https://api.cloudflare.com/client/v4/";
 const MAX_PAGES: u32 = 100;
 const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Pauses before repeating a read that received no HTTP response.
+const READ_RETRY_DELAYS: [Duration; 2] = [Duration::from_millis(300), Duration::from_secs(1)];
 
-fn probe_timeout() -> CloudError {
-    CloudError::new(
-        "路径检查超时，尚未确认此目录的响应，请检查网络后重试",
-        false,
-    )
+pub(crate) fn probe_timeout() -> ProbeError {
+    ProbeError {
+        message: "路径检查超时，尚未确认此目录的响应，请检查网络后重试".into(),
+        reason: Some("probe_timeout"),
+    }
 }
 
-fn probe_transport_error(error: reqwest::Error) -> CloudError {
+fn probe_transport_error(error: reqwest::Error) -> ProbeError {
     if error.is_timeout() {
-        probe_timeout()
-    } else if error.is_connect() {
-        CloudError::new(
-            "连接或 TLS 验证失败；请检查代理/VPN，以及此主机名的边缘证书是否已生效",
-            false,
-        )
+        return probe_timeout();
+    }
+    let message = if error.is_connect() {
+        "没连上这个域名。如果刚给它补过解析，证书要等几分钟才生效，过一会儿再查；否则请检查代理或 VPN"
     } else {
-        CloudError::new("路径网络请求失败，尚未确认此目录的响应", false)
+        "路径网络请求失败，尚未确认此目录的响应"
+    };
+    ProbeError {
+        message: message.into(),
+        reason: Some("probe_transport_error"),
+    }
+}
+
+/// A read that has already waited this long is not repeated: the network is
+/// down rather than hiccuping, and stacking full timeouts would only make the
+/// user wait a minute for the same answer.
+const READ_RETRY_WINDOW: Duration = Duration::from_secs(12);
+
+/// Sends an idempotent read. Only a request that received no HTTP response
+/// (connect failure, timeout, aborted connection) is repeated, and only while
+/// the failures are quick.
+async fn send_read(
+    build: impl Fn() -> reqwest::RequestBuilder,
+) -> Result<reqwest::Response, reqwest::Error> {
+    let started = std::time::Instant::now();
+    let mut delays = READ_RETRY_DELAYS.iter();
+    loop {
+        match build().send().await {
+            Ok(response) => return Ok(response),
+            Err(error) => match delays.next() {
+                Some(delay) if started.elapsed() < READ_RETRY_WINDOW => {
+                    tokio::time::sleep(*delay).await
+                }
+                _ => return Err(error),
+            },
+        }
+    }
+}
+
+fn read_transport_message(error: &reqwest::Error) -> &'static str {
+    if error.is_timeout() {
+        "连接云端超时，请检查网络"
+    } else if error.is_connect() {
+        "连不上云端，请检查网络"
+    } else {
+        "连接云端失败，请检查网络"
     }
 }
 
@@ -31,7 +71,7 @@ async fn probe_response(
     client: &Client,
     url: reqwest::Url,
     header: Option<&str>,
-) -> CloudResult<(u16, Option<String>)> {
+) -> Result<(u16, Option<String>), ProbeError> {
     let mut req = client.head(url.clone());
     if let Some(h) = header {
         req = req.header("X-Selftest", h);
@@ -112,6 +152,10 @@ fn failure_message(status: StatusCode, code: Option<i64>, uncertain_write: bool)
 pub struct CloudError {
     pub message: String,
     pub uncertain: bool,
+    /// True only when no HTTP response was received (connect failure, timeout
+    /// or aborted request). Cloudflare error responses keep this false. It
+    /// says nothing about whether a write was applied; see `uncertain`.
+    pub network: bool,
 }
 
 impl CloudError {
@@ -119,6 +163,14 @@ impl CloudError {
         Self {
             message: message.into(),
             uncertain,
+            network: false,
+        }
+    }
+
+    fn no_response(message: impl Into<String>, uncertain: bool) -> Self {
+        Self {
+            network: true,
+            ..Self::new(message, uncertain)
         }
     }
 }
@@ -334,6 +386,8 @@ impl Cloud {
         let client = Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .https_only(true)
+            .connect_timeout(Duration::from_secs(8))
+            .pool_idle_timeout(Duration::from_secs(30))
             .timeout(Duration::from_secs(20))
             .build()
             .map_err(|_| "网络客户端初始化失败".to_string())?;
@@ -379,7 +433,7 @@ impl Cloud {
     ) -> CloudResult<Value> {
         let url = self.url(path)?;
         let write = method != Method::GET && method != Method::HEAD;
-        for attempt in 0..=3 {
+        let build = || {
             let mut req = self
                 .client
                 .request(method.clone(), url.clone())
@@ -387,15 +441,21 @@ impl Cloud {
             if let Some(value) = &body {
                 req = req.json(value);
             }
-            let response = req.send().await.map_err(|_| {
-                CloudError::new(
-                    if write {
-                        "云端写入结果不确定，请检查操作记录"
-                    } else {
-                        "连接云端失败，请检查网络"
-                    },
-                    write,
-                )
+            req
+        };
+        for attempt in 0..=3 {
+            // Writes stay single-shot: a lost response may hide an applied change.
+            let sent = if write {
+                build().send().await
+            } else {
+                send_read(&build).await
+            };
+            let response = sent.map_err(|error| {
+                if write {
+                    CloudError::no_response("云端写入结果不确定，请检查操作记录", true)
+                } else {
+                    CloudError::no_response(read_transport_message(&error), false)
+                }
             })?;
             if response.status() == StatusCode::TOO_MANY_REQUESTS && attempt < 3 {
                 let delay = response
@@ -571,13 +631,14 @@ impl Cloud {
         );
         let url = self.url(&path)?;
         for attempt in 0..=3 {
-            let response = self
-                .client
-                .get(url.clone())
-                .bearer_auth(token)
-                .send()
+            let response = send_read(|| self.client.get(url.clone()).bearer_auth(token))
                 .await
-                .map_err(|_| CloudError::new("读取云端配置失败", false))?;
+                .map_err(|error| {
+                    CloudError::no_response(
+                        format!("读取云端配置失败：{}", read_transport_message(&error)),
+                        false,
+                    )
+                })?;
             if response.status() == StatusCode::TOO_MANY_REQUESTS && attempt < 3 {
                 tokio::time::sleep(Duration::from_secs(1 << attempt)).await;
                 continue;
@@ -813,13 +874,14 @@ impl Cloud {
             "accounts/{account}/workers/scripts/{script}/content/v2"
         ))?;
         for attempt in 0..=3 {
-            let response = self
-                .client
-                .get(url.clone())
-                .bearer_auth(token)
-                .send()
+            let response = send_read(|| self.client.get(url.clone()).bearer_auth(token))
                 .await
-                .map_err(|_| CloudError::new("无法读取 Worker 内容", false))?;
+                .map_err(|error| {
+                    CloudError::no_response(
+                        format!("无法读取 Worker 内容：{}", read_transport_message(&error)),
+                        false,
+                    )
+                })?;
             if response.status() == StatusCode::TOO_MANY_REQUESTS && attempt < 3 {
                 tokio::time::sleep(Duration::from_secs(1 << attempt)).await;
                 continue;
@@ -929,12 +991,10 @@ impl Cloud {
                     .map_err(|_| CloudError::new("测试探测地址无效", false))?;
                 (self.client.clone(), url)
             };
-            probe_response(&client, url, header.as_deref())
-                .await
-                .map_err(ProbeError::from)
+            probe_response(&client, url, header.as_deref()).await
         })
         .await
-        .map_err(|_| ProbeError::from(probe_timeout()))?
+        .map_err(|_| probe_timeout())?
     }
 
     pub async fn rotate_secret(
@@ -1093,5 +1153,109 @@ mod tests {
         let large = json!({"errors": [{"code": 1}], "pad": "x".repeat(MAX_ERROR_BODY)});
         let error = failed_get(422, Some(large)).await;
         assert!(!error.message.contains("Cloudflare 代码"));
+    }
+
+    /// A local HTTP server that closes the first `drop_first` connections
+    /// without answering, then answers every request with `body`.
+    async fn flaky_server(
+        drop_first: usize,
+        body: &'static str,
+    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let connections = std::sync::Arc::new(AtomicUsize::new(0));
+        let counter = connections.clone();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let seen = counter.fetch_add(1, Ordering::SeqCst);
+                if seen < drop_first {
+                    drop(stream);
+                    continue;
+                }
+                tokio::spawn(async move {
+                    let mut buffer = vec![0_u8; 8192];
+                    let mut request = Vec::new();
+                    while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match stream.read(&mut buffer).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => request.extend_from_slice(&buffer[..n]),
+                        }
+                    }
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+        (format!("http://{address}/client/v4/"), connections)
+    }
+
+    #[tokio::test]
+    async fn reads_retry_when_no_response_arrived() {
+        use std::sync::atomic::Ordering;
+        let (base, connections) = flaky_server(1, r#"{"success":true,"result":[]}"#).await;
+        let cloud = Cloud::for_test(&base);
+        let value = cloud.get("synthetic-token", "zones").await.unwrap();
+        assert_eq!(value["success"], true);
+        assert_eq!(connections.load(Ordering::SeqCst), 2);
+
+        // Raw KV reads share the same bounded retry.
+        let (base, connections) = flaky_server(2, "plain value").await;
+        let value = Cloud::for_test(&base)
+            .read_value("synthetic-token", "acct", "ns", "key")
+            .await
+            .unwrap();
+        assert_eq!(value.as_deref(), Some("plain value"));
+        assert_eq!(connections.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn reads_give_up_after_two_retries_and_report_a_network_failure() {
+        use std::sync::atomic::Ordering;
+        let (base, connections) = flaky_server(usize::MAX, "").await;
+        let error = Cloud::for_test(&base)
+            .get("synthetic-token", "zones")
+            .await
+            .unwrap_err();
+        assert!(error.network, "{}", error.message);
+        assert!(!error.uncertain);
+        assert!(!crate::is_access_refusal(&error.message));
+        assert_eq!(connections.load(Ordering::SeqCst), 3);
+        // A Cloudflare error response is not a network failure.
+        assert!(!failed_get(403, None).await.network);
+        assert!(!failed_get(503, None).await.network);
+    }
+
+    #[tokio::test]
+    async fn writes_never_retry_a_lost_response_and_stay_uncertain() {
+        use std::sync::atomic::Ordering;
+        let (base, connections) = flaky_server(usize::MAX, "").await;
+        let cloud = Cloud::for_test(&base);
+        let error = cloud
+            .post("synthetic-token", "zones", json!({}))
+            .await
+            .unwrap_err();
+        assert!(error.uncertain);
+        assert!(error.message.contains("写入结果不确定"));
+        assert_eq!(connections.load(Ordering::SeqCst), 1);
+        for method in [Method::PUT, Method::PATCH, Method::DELETE] {
+            let (base, connections) = flaky_server(usize::MAX, "").await;
+            let error = Cloud::for_test(&base)
+                .send(
+                    "synthetic-token",
+                    method.clone(),
+                    "zones/z",
+                    Some(json!({})),
+                )
+                .await
+                .unwrap_err();
+            assert!(error.uncertain, "{method}");
+            assert_eq!(connections.load(Ordering::SeqCst), 1, "{method}");
+        }
     }
 }

@@ -34,7 +34,8 @@ function focusable(element: HTMLElement) {
 
 function focusInitial(modal: Modal) {
   const items = focusable(modal.element);
-  const first = items.find(item => item.hasAttribute('autofocus'))
+  // React's autoFocus does not leave an attribute, so a field can opt in with data-autofocus.
+  const first = items.find(item => item.hasAttribute('autofocus') || item.hasAttribute('data-autofocus'))
     || items.find(item => item.matches('input, select, textarea')) || items[0];
   (first || modal.element).focus();
 }

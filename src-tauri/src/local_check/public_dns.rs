@@ -1,16 +1,29 @@
 use super::{validate_addresses, CheckIssue};
+use futures_util::future::{BoxFuture, FutureExt, Shared};
 use reqwest::Client;
 use serde_json::Value;
 use std::{
     collections::{HashMap, HashSet},
     net::{IpAddr, Ipv4Addr, SocketAddr},
-    time::Duration,
+    sync::{Arc, Mutex, MutexGuard, OnceLock},
+    time::{Duration, Instant},
 };
 
 const ENDPOINT: &str = "https://cloudflare-dns.com/dns-query";
 const MAX_BODY_BYTES: usize = 65_536;
 const MAX_RECORDS: usize = 64;
 const MAX_ALIASES: usize = 16;
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(6);
+const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(7);
+const TOTAL_BUDGET: Duration = Duration::from_secs(12);
+const MAX_ATTEMPTS: usize = 3;
+const RETRY_PAUSE: Duration = Duration::from_millis(250);
+const CACHE_TTL: Duration = Duration::from_secs(60);
+const MAX_CACHE_ENTRIES: usize = 256;
+
+type Lookup = Result<Vec<IpAddr>, CheckIssue>;
+type PendingLookup = Shared<BoxFuture<'static, Lookup>>;
 
 struct Resolver {
     client: Client,
@@ -30,8 +43,8 @@ impl Resolver {
             .redirect(reqwest::redirect::Policy::none())
             .no_proxy()
             .https_only(true)
-            .connect_timeout(Duration::from_secs(2))
-            .timeout(Duration::from_secs(3))
+            .connect_timeout(CONNECT_TIMEOUT)
+            .timeout(REQUEST_TIMEOUT)
             .resolve_to_addrs("cloudflare-dns.com", &bootstrap)
             .build()
             .map_err(|_| CheckIssue::ClientInitialization)?;
@@ -90,20 +103,29 @@ impl Resolver {
         parse_answer(&body, host, record_type)
     }
 
-    async fn resolve(&self, host: &str, port: u16) -> Result<Vec<SocketAddr>, CheckIssue> {
+    /// One attempt: both families, strict parsing and address validation.
+    async fn resolve_ips(&self, host: &str) -> Lookup {
         let host = public_host(host)?;
         // Require both query results. A successful family must not conceal an
         // error, malformed record, private address or virtual address in the other.
         let (v4, v6) = tokio::try_join!(self.query(&host, 1), self.query(&host, 28))?;
-        let mut addresses: Vec<_> = v4
+        let mut ips: Vec<_> = v4.into_iter().chain(v6).collect();
+        ips.sort_unstable();
+        ips.dedup();
+        let probe: Vec<_> = ips.iter().map(|ip| SocketAddr::new(*ip, 0)).collect();
+        validate_addresses(&probe)?;
+        Ok(ips)
+    }
+
+    /// Single-attempt resolution (no retry, cache or sharing).
+    #[cfg(test)]
+    async fn resolve(&self, host: &str, port: u16) -> Result<Vec<SocketAddr>, CheckIssue> {
+        Ok(self
+            .resolve_ips(host)
+            .await?
             .into_iter()
-            .chain(v6)
             .map(|ip| SocketAddr::new(ip, port))
-            .collect();
-        addresses.sort_unstable();
-        addresses.dedup();
-        validate_addresses(&addresses)?;
-        Ok(addresses)
+            .collect())
     }
 
     #[cfg(test)]
@@ -120,13 +142,177 @@ impl Resolver {
     }
 }
 
+/// Retry, short success cache and in-flight sharing around single attempts.
+/// One process-wide instance lets HTTPS connections to the resolver be reused.
+struct CachedResolver {
+    resolver: Resolver,
+    ttl: Duration,
+    cache: Mutex<HashMap<String, (Instant, Vec<IpAddr>)>>,
+    in_flight: Mutex<HashMap<String, PendingLookup>>,
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn retryable(issue: &CheckIssue) -> bool {
+    matches!(
+        issue,
+        CheckIssue::PublicDnsTimeout | CheckIssue::PublicDnsFailed
+    )
+}
+
+impl CachedResolver {
+    fn new(resolver: Resolver, ttl: Duration) -> Self {
+        Self {
+            resolver,
+            ttl,
+            cache: Mutex::new(HashMap::new()),
+            in_flight: Mutex::new(HashMap::new()),
+        }
+    }
+
+    async fn resolve(
+        self: &Arc<Self>,
+        host: &str,
+        port: u16,
+    ) -> Result<Vec<SocketAddr>, CheckIssue> {
+        let host = public_host(host)?;
+        let pending = {
+            // Check the cache under the in-flight lock: a finishing lookup stores
+            // its result before it leaves the in-flight table.
+            let mut in_flight = lock(&self.in_flight);
+            if let Some(ips) = self.cached(&host) {
+                return with_port(ips, port);
+            }
+            match in_flight.get(&host) {
+                Some(pending) => pending.clone(),
+                None => {
+                    let pending = self.start(host.clone());
+                    in_flight.insert(host, pending.clone());
+                    pending
+                }
+            }
+        };
+        // Polled at once, with the table released: this is what spawns the
+        // lookup task when this call created the entry.
+        with_port(pending.await?, port)
+    }
+
+    fn cached(&self, host: &str) -> Option<Vec<IpAddr>> {
+        let mut cache = lock(&self.cache);
+        match cache.get(host) {
+            Some((expires, ips)) if *expires > Instant::now() => Some(ips.clone()),
+            Some(_) => {
+                cache.remove(host);
+                None
+            }
+            None => None,
+        }
+    }
+
+    fn store(&self, host: &str, ips: Vec<IpAddr>) {
+        let now = Instant::now();
+        let mut cache = lock(&self.cache);
+        cache.retain(|_, (expires, _)| *expires > now);
+        if cache.len() >= MAX_CACHE_ENTRIES {
+            if let Some(oldest) = cache
+                .iter()
+                .min_by_key(|(_, (expires, _))| *expires)
+                .map(|(name, _)| name.clone())
+            {
+                cache.remove(&oldest);
+            }
+        }
+        cache.insert(host.to_owned(), (now + self.ttl, ips));
+    }
+
+    /// The lookup runs as its own task, so a caller that gives up early does
+    /// not cancel it for other callers or lose a result that arrives later.
+    fn start(self: &Arc<Self>, host: String) -> PendingLookup {
+        // Dropped when the task ends for any reason, including a panic or a
+        // runtime that stops midway; a dead lookup must not stay in the table
+        // and keep answering for its host.
+        struct Leave(Arc<CachedResolver>, String);
+        impl Drop for Leave {
+            fn drop(&mut self) {
+                // Release the table before the removed entry itself is dropped.
+                let removed = lock(&self.0.in_flight).remove(&self.1);
+                drop(removed);
+            }
+        }
+        let leave = Leave(Arc::clone(self), host);
+        // The task is spawned on the first poll, which `resolve` does right
+        // after releasing the table. Spawning here, under that lock, could
+        // drop the task (and `leave`) on the spot if the runtime is stopping.
+        async move {
+            let task = tokio::spawn(async move {
+                let Leave(this, host) = &leave;
+                let result = this.lookup_with_retry(host).await;
+                if let Ok(ips) = &result {
+                    // Stored before `leave` drops: see the lock order in `resolve`.
+                    this.store(host, ips.clone());
+                }
+                result
+            });
+            task.await.unwrap_or(Err(CheckIssue::PublicDnsFailed))
+        }
+        .boxed()
+        .shared()
+    }
+
+    async fn lookup_with_retry(&self, host: &str) -> Lookup {
+        let attempts = async {
+            let mut attempt = 1;
+            loop {
+                let result = tokio::time::timeout(ATTEMPT_TIMEOUT, self.resolver.resolve_ips(host))
+                    .await
+                    .unwrap_or(Err(CheckIssue::PublicDnsTimeout));
+                match result {
+                    Err(issue) if retryable(&issue) && attempt < MAX_ATTEMPTS => {
+                        attempt += 1;
+                        tokio::time::sleep(RETRY_PAUSE).await;
+                    }
+                    other => return other,
+                }
+            }
+        };
+        tokio::time::timeout(TOTAL_BUDGET, attempts)
+            .await
+            .unwrap_or(Err(CheckIssue::PublicDnsTimeout))
+    }
+
+    #[cfg(test)]
+    fn for_test(resolver: Resolver, ttl: Duration) -> Arc<Self> {
+        Arc::new(Self::new(resolver, ttl))
+    }
+}
+
+fn with_port(ips: Vec<IpAddr>, port: u16) -> Result<Vec<SocketAddr>, CheckIssue> {
+    let addresses: Vec<_> = ips
+        .into_iter()
+        .map(|ip| SocketAddr::new(ip, port))
+        .collect();
+    // Cached answers pass the same address guard as fresh ones.
+    validate_addresses(&addresses)?;
+    Ok(addresses)
+}
+
+fn shared_resolver() -> Result<Arc<CachedResolver>, CheckIssue> {
+    static SHARED: OnceLock<Arc<CachedResolver>> = OnceLock::new();
+    if let Some(shared) = SHARED.get() {
+        return Ok(Arc::clone(shared));
+    }
+    let built = Arc::new(CachedResolver::new(Resolver::new()?, CACHE_TTL));
+    Ok(Arc::clone(SHARED.get_or_init(|| built)))
+}
+
 pub(super) async fn resolve(host: &str, port: u16) -> Result<Vec<SocketAddr>, CheckIssue> {
     // Reject local/reserved names before constructing a network request.
     public_host(host)?;
-    let resolver = Resolver::new()?;
-    tokio::time::timeout(Duration::from_secs(4), resolver.resolve(host, port))
-        .await
-        .map_err(|_| CheckIssue::PublicDnsTimeout)?
+    shared_resolver()?.resolve(host, port).await
 }
 
 fn transport_issue(error: reqwest::Error) -> CheckIssue {
@@ -613,5 +799,298 @@ mod tests {
             assert!(resolver.resolve(host, 443).await.is_err(), "{host}");
         }
         assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    async fn requests_of(server: &MockServer, kind: &str) -> usize {
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|request| {
+                request
+                    .url
+                    .query_pairs()
+                    .any(|(key, value)| key == "type" && value == kind)
+            })
+            .count()
+    }
+
+    fn cached_layer(server: &MockServer, timeout: Duration, ttl: Duration) -> Arc<CachedResolver> {
+        CachedResolver::for_test(
+            Resolver::for_test(format!("{}/dns-query", server.uri()), timeout),
+            ttl,
+        )
+    }
+
+    #[tokio::test]
+    async fn retry_layer_recovers_when_the_first_attempt_times_out() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/dns-query"))
+            .and(query_param("name", "example.org"))
+            .and(query_param("type", "A"))
+            .respond_with(
+                dns_response(answer(1, &["1.1.1.1"])).set_delay(Duration::from_millis(500)),
+            )
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        mount_answer(&server, "A", dns_response(answer(1, &["1.1.1.1"]))).await;
+        mount_answer(&server, "AAAA", dns_response(answer(28, &[]))).await;
+        let layer = cached_layer(&server, Duration::from_millis(150), CACHE_TTL);
+        assert_eq!(
+            layer.resolve("example.org", 443).await,
+            Ok(vec!["1.1.1.1:443".parse().unwrap()])
+        );
+        assert_eq!(requests_of(&server, "A").await, 2);
+    }
+
+    #[tokio::test]
+    async fn retry_layer_repeats_only_transient_failures() {
+        // A provider failure (HTTP 503) is transient: all three attempts run.
+        let server = MockServer::start().await;
+        mount_answer(&server, "A", ResponseTemplate::new(503)).await;
+        mount_answer(&server, "AAAA", dns_response(answer(28, &[]))).await;
+        let layer = cached_layer(&server, Duration::from_secs(1), CACHE_TTL);
+        assert_eq!(
+            layer.resolve("example.org", 443).await,
+            Err(CheckIssue::PublicDnsFailed)
+        );
+        assert_eq!(requests_of(&server, "A").await, MAX_ATTEMPTS);
+
+        // Deterministic results are returned after a single attempt.
+        for (v4, v6, expected) in [
+            (
+                dns_response(answer(1, &["198.18.0.1"])),
+                dns_response(answer(28, &[])),
+                CheckIssue::VirtualAddress,
+            ),
+            (
+                dns_response(answer(1, &["10.0.0.1"])),
+                dns_response(answer(28, &[])),
+                CheckIssue::NonPublicAddress,
+            ),
+            (
+                dns_response(answer(1, &[])),
+                dns_response(answer(28, &[])),
+                CheckIssue::DnsEmpty,
+            ),
+            (
+                ResponseTemplate::new(200).set_body_raw("not-json", "application/dns-json"),
+                dns_response(answer(28, &[])),
+                CheckIssue::PublicDnsInvalidResponse,
+            ),
+            (
+                ResponseTemplate::new(200)
+                    .set_body_raw(" ".repeat(MAX_BODY_BYTES + 1), "application/dns-json"),
+                dns_response(answer(28, &[])),
+                CheckIssue::PublicDnsResponseTooLarge,
+            ),
+        ] {
+            let server = MockServer::start().await;
+            mount_answer(&server, "A", v4).await;
+            mount_answer(&server, "AAAA", v6).await;
+            let layer = cached_layer(&server, Duration::from_secs(1), CACHE_TTL);
+            assert_eq!(
+                layer.resolve("example.org", 443).await,
+                Err(expected.clone())
+            );
+            assert_eq!(requests_of(&server, "A").await, 1, "{expected:?}");
+            // Failures are never cached: the next call asks again.
+            assert_eq!(
+                layer.resolve("example.org", 443).await,
+                Err(expected.clone())
+            );
+            assert_eq!(requests_of(&server, "A").await, 2, "{expected:?}");
+        }
+
+        // Invalid or local names never reach the network.
+        let server = MockServer::start().await;
+        let layer = cached_layer(&server, Duration::from_secs(1), CACHE_TTL);
+        assert_eq!(
+            layer.resolve("router.local", 443).await,
+            Err(CheckIssue::NonPublicAddress)
+        );
+        assert_eq!(
+            layer.resolve("bad..example.org", 443).await,
+            Err(CheckIssue::InvalidUrl)
+        );
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn retry_layer_caches_successes_per_host_and_applies_the_callers_port() {
+        let server = MockServer::start().await;
+        mount_answer(&server, "A", dns_response(answer(1, &["1.1.1.1"]))).await;
+        mount_answer(
+            &server,
+            "AAAA",
+            dns_response(answer(28, &["2606:4700:4700::1111"])),
+        )
+        .await;
+        let layer = cached_layer(&server, Duration::from_secs(1), CACHE_TTL);
+        let first = layer.resolve("example.org", 443).await.unwrap();
+        assert!(first.iter().all(|address| address.port() == 443));
+        let second = layer.resolve("EXAMPLE.ORG.", 8443).await.unwrap();
+        assert_eq!(second.len(), 2);
+        assert!(second.iter().all(|address| address.port() == 8443));
+        assert_eq!(
+            first.iter().map(SocketAddr::ip).collect::<Vec<_>>(),
+            second.iter().map(SocketAddr::ip).collect::<Vec<_>>()
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn concurrent_lookups_for_one_host_share_a_single_query_pair() {
+        let server = MockServer::start().await;
+        mount_answer(
+            &server,
+            "A",
+            dns_response(answer(1, &["1.1.1.1"])).set_delay(Duration::from_millis(200)),
+        )
+        .await;
+        mount_answer(&server, "AAAA", dns_response(answer(28, &[]))).await;
+        let layer = cached_layer(&server, Duration::from_secs(2), CACHE_TTL);
+        let results = futures_util::future::join_all(
+            (0..5).map(|index| layer.resolve("example.org", 443 + index)),
+        )
+        .await;
+        for (index, result) in results.into_iter().enumerate() {
+            let addresses = result.unwrap();
+            assert_eq!(addresses.len(), 1);
+            assert_eq!(addresses[0].port(), 443 + index as u16);
+        }
+        assert_eq!(requests_of(&server, "A").await, 1);
+        assert_eq!(requests_of(&server, "AAAA").await, 1);
+    }
+
+    #[tokio::test]
+    async fn cached_answers_expire_and_are_queried_again() {
+        let server = MockServer::start().await;
+        mount_answer(&server, "A", dns_response(answer(1, &["1.1.1.1"]))).await;
+        mount_answer(&server, "AAAA", dns_response(answer(28, &[]))).await;
+        let layer = cached_layer(&server, Duration::from_secs(1), Duration::from_millis(50));
+        layer.resolve("example.org", 443).await.unwrap();
+        layer.resolve("example.org", 443).await.unwrap();
+        assert_eq!(requests_of(&server, "A").await, 1);
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        layer.resolve("example.org", 443).await.unwrap();
+        assert_eq!(requests_of(&server, "A").await, 2);
+        assert!(lock(&layer.in_flight).is_empty());
+    }
+
+    /// The lookup task can die without finishing (its runtime stops, or it
+    /// panics). The in-flight entry must go with it; otherwise every later
+    /// lookup of that host would be handed the dead lookup's failure.
+    #[test]
+    fn a_lookup_that_dies_midway_does_not_block_later_lookups_of_that_host() {
+        let server_runtime = tokio::runtime::Runtime::new().unwrap();
+        let server = server_runtime.block_on(async {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/dns-query"))
+                .and(query_param("name", "example.org"))
+                .and(query_param("type", "A"))
+                .respond_with(
+                    dns_response(answer(1, &["1.1.1.1"])).set_delay(Duration::from_secs(2)),
+                )
+                .up_to_n_times(1)
+                .with_priority(1)
+                .mount(&server)
+                .await;
+            mount_answer(&server, "A", dns_response(answer(1, &["1.1.1.1"]))).await;
+            mount_answer(&server, "AAAA", dns_response(answer(28, &[]))).await;
+            server
+        });
+        let layer = cached_layer(&server, Duration::from_secs(5), CACHE_TTL);
+        let first = tokio::runtime::Runtime::new().unwrap();
+        let cut_off = first.block_on(async {
+            tokio::time::timeout(
+                Duration::from_millis(300),
+                layer.resolve("example.org", 443),
+            )
+            .await
+        });
+        assert!(cut_off.is_err(), "the first answer is still on its way");
+        assert_eq!(lock(&layer.in_flight).len(), 1);
+        // Stopping the runtime drops the lookup task before it can finish.
+        drop(first);
+        assert!(lock(&layer.in_flight).is_empty());
+        let second = tokio::runtime::Runtime::new().unwrap();
+        assert_eq!(
+            second.block_on(layer.resolve("example.org", 443)),
+            Ok(vec!["1.1.1.1:443".parse().unwrap()])
+        );
+    }
+
+    #[test]
+    fn cache_is_bounded_and_drops_expired_entries() {
+        let layer = CachedResolver::new(
+            Resolver::for_test(
+                "http://127.0.0.1:9/dns-query".into(),
+                Duration::from_secs(1),
+            ),
+            CACHE_TTL,
+        );
+        let ip = vec!["1.1.1.1".parse::<IpAddr>().unwrap()];
+        lock(&layer.cache).insert(
+            "stale.example.org".into(),
+            (Instant::now() - Duration::from_secs(1), ip.clone()),
+        );
+        for index in 0..MAX_CACHE_ENTRIES + 10 {
+            layer.store(&format!("h{index}.example.org"), ip.clone());
+        }
+        let cache = lock(&layer.cache);
+        assert_eq!(cache.len(), MAX_CACHE_ENTRIES);
+        assert!(!cache.contains_key("stale.example.org"));
+        assert!(cache.contains_key(&format!("h{}.example.org", MAX_CACHE_ENTRIES + 9)));
+    }
+
+    /// Manual measurement against the real resolver; never run in CI.
+    /// `cargo test live_public_dns_failure_rate -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore = "live network measurement"]
+    async fn live_public_dns_failure_rate() {
+        fn median(mut values: Vec<Duration>) -> Duration {
+            values.sort_unstable();
+            values.get(values.len() / 2).copied().unwrap_or_default()
+        }
+        const ROUNDS: usize = 20;
+        let mut cold = (0, Vec::new());
+        for _ in 0..ROUNDS {
+            let layer = Arc::new(CachedResolver::new(Resolver::new().unwrap(), CACHE_TTL));
+            let started = Instant::now();
+            if layer.resolve("example.com", 443).await.is_ok() {
+                cold.0 += 1;
+            }
+            cold.1.push(started.elapsed());
+        }
+        // A zero TTL disables the cache so each round really queries, while the
+        // resolver (and its HTTPS connection) is shared across rounds.
+        let shared = Arc::new(CachedResolver::new(
+            Resolver::new().unwrap(),
+            Duration::ZERO,
+        ));
+        let mut warm = (0, Vec::new());
+        for _ in 0..ROUNDS {
+            let started = Instant::now();
+            if shared.resolve("example.com", 443).await.is_ok() {
+                warm.0 += 1;
+            }
+            warm.1.push(started.elapsed());
+        }
+        println!(
+            "cold resolver: {}/{ROUNDS} ok, median {:?}",
+            cold.0,
+            median(cold.1)
+        );
+        println!(
+            "shared resolver: {}/{ROUNDS} ok, median {:?}",
+            warm.0,
+            median(warm.1)
+        );
     }
 }

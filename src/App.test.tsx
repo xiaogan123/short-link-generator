@@ -31,9 +31,8 @@ describe('desktop primary flows in explicit preview', () => {
     await user.type(prefix, 'r');
     await user.click(within(editor).getByRole('button', { name: '检查并继续' }));
     expect(await within(editor).findByText('www.example.com/r/')).toBeTruthy();
+    // Choosing the account re-checks right away; no second click is needed.
     await user.selectOptions(within(editor).getByRole('combobox', { name: /选择账户与区域/ }), 'demo-a');
-    expect(within(editor).queryByText('www.example.com/r/')).toBeNull();
-    await user.click(within(editor).getByRole('button', { name: '检查并继续' }));
     const plan = await screen.findByRole('dialog', { name: '添加 www.example.com' });
     expect(applyPayloads).toHaveLength(0);
     expect(within(plan).getByText(/www\.example\.com\/r\/ 及其所有下级内容/)).toBeTruthy();
@@ -154,7 +153,6 @@ describe('desktop primary flows in explicit preview', () => {
     await user.type(within(editor).getByPlaceholderText('go.example.com'), 'unused.example.org');
     await user.click(within(editor).getByRole('button', { name: '检查并继续' }));
     await user.selectOptions(await within(editor).findByRole('combobox', { name: /选择账户与区域/ }), 'demo-a');
-    await user.click(within(editor).getByRole('button', { name: '检查并继续' }));
     const plan = await screen.findByRole('dialog', { name: '添加 unused.example.org' });
     expect(within(plan).getByRole('button', { name: '确认并执行' })).toBeTruthy();
     expect(within(plan).queryByText('请确认接管范围')).toBeNull();

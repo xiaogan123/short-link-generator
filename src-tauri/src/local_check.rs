@@ -70,7 +70,7 @@ fn public_ip(ip: IpAddr) -> bool {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum CheckIssue {
     InvalidUrl,
     DnsTimeout,

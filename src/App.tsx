@@ -159,8 +159,36 @@ function hasOnlyNetworkBlocker(preparation: DomainPreparation) {
     (check) => domainCheckLevel(check) === "error",
   );
   return !preparation.canApply && errors.length > 0 && errors.every((check) =>
-    ["virtual_dns_address", "dns_timeout", "dns_failed", "public_dns_timeout", "public_dns_failed"].includes(check.reason || ""),
+    networkReasons.includes(check.reason || ""),
   );
+}
+// Reasons that mean "the network lookup did not finish", not "the domain is wrong".
+const networkReasons = ["virtual_dns_address", "dns_timeout", "dns_failed", "public_dns_timeout", "public_dns_failed", "cloud_unreachable", "probe_timeout", "probe_transport_error"];
+function hasOnlyPublicDnsFailure(preparation: DomainPreparation) {
+  const errors = preparation.checks.filter((check) => domainCheckLevel(check) === "error");
+  return !preparation.canApply && errors.length > 0 &&
+    errors.every((check) => check.reason === "public_dns_timeout" || check.reason === "public_dns_failed");
+}
+function domainCheckSummary(preparation: DomainPreparation) {
+  const errors = preparation.checks.filter((check) => domainCheckLevel(check) === "error");
+  if (!errors.length) return null;
+  // A VPN address that reaches this point was not fixed by the automatic switch (it came with other
+  // lookup failures), so it is still a network problem and public DNS is the next step.
+  if (errors.every((check) => networkReasons.includes(check.reason || "")))
+    return {
+      network: true,
+      message: `网络查询没完成（${errors[0].message}）。通常再查一次就好。`,
+      usePublicDns: preparation.dnsMode !== "public" &&
+        errors.some((check) => ["dns_timeout", "dns_failed", "virtual_dns_address"].includes(check.reason || "")),
+    };
+  const first = errors.find((check) => !networkReasons.includes(check.reason || "")) || errors[0];
+  return { network: false, message: `检查没通过：${first.label}——${first.message}`, usePublicDns: false };
+}
+function hasDomainOwnershipProblem(preparation: DomainPreparation) {
+  // An ownership read that only failed for a network reason says nothing about the domain list.
+  return preparation.candidates.length === 0 ||
+    preparation.checks.some((check) => domainCheckLevel(check) === "error" && /归属/.test(check.label) &&
+      !networkReasons.includes(check.reason || ""));
 }
 function isDomainCredentialError(message: string) {
   return /HTTP 401|HTTP 403|令牌|凭据|授权|权限/.test(message);
@@ -271,6 +299,13 @@ export default function App() {
   const [domainOpen, setDomainOpen] = useState(false);
   const [domainBusy, setDomainBusy] = useState(false);
   const [domainAutomaticDns, setDomainAutomaticDns] = useState(false);
+  // True only when the user picked the account; automatic picks follow the typed host.
+  const [domainAccountManual, setDomainAccountManual] = useState(false);
+  // Set after a failed confirmation consumed the plan; the main button must re-check.
+  const [domainRecheckNeeded, setDomainRecheckNeeded] = useState(false);
+  const [domainResultReveal, setDomainResultReveal] = useState(0);
+  const domainResultRef = useRef<HTMLDivElement>(null);
+  const domainDnsResultRef = useRef<HTMLDivElement>(null);
   const [domainFeedback, setDomainFeedback] = useState<{
     tone: "error" | "success" | "progress" | "warning";
     message: string;
@@ -368,6 +403,8 @@ export default function App() {
   const domainDraftRef = useRef(domainDraft);
   // Session-only, scoped to an account/host/directory that passed public-DNS checks.
   const publicDnsDomains = useRef(new Set<string>());
+  // Session-only: a check here already saw a VPN virtual address and switched to public DNS.
+  const proxyDetected = useRef(false);
   const detectionSequence = useRef(0);
   const detectionInflight = useRef(new Set<string>());
   const domainCheckSequence = useRef(0);
@@ -441,6 +478,16 @@ export default function App() {
     heading?.focus({preventScroll: true});
     heading?.scrollIntoView({block: "start"});
   }, [attentionViewRequest]);
+  useEffect(() => {
+    // Scroll only the dialog content, so the finished result is visible without moving the page.
+    if (domainResultReveal === 0) return;
+    const target = domainResultRef.current || domainDnsResultRef.current;
+    const body = target?.closest<HTMLElement>(".dialog-body");
+    if (!target || !body) return;
+    const offset = target.getBoundingClientRect().top - body.getBoundingClientRect().top;
+    if (offset < 0 || offset + target.offsetHeight > body.clientHeight)
+      body.scrollTop = Math.max(0, body.scrollTop + offset - 12);
+  }, [domainResultReveal]);
   useEffect(() => {
     const now = Date.now();
     const expiry = Math.min(...[
@@ -728,6 +775,7 @@ export default function App() {
         ? normalizeHost(domainDraftRef.current.input)
         : "";
       const takeover = Boolean(plan.domainTakeoverConfirmation);
+      let applyFailure = "";
       const next = await run(
         () =>
           dispatch<State>("apply_plan", {
@@ -766,7 +814,8 @@ export default function App() {
               if (statsPlanAccountId) setStatsConfigurationError({accountId: statsPlanAccountId, message});
               setError("");
             }
-          : appliedKind === "save_pool" || (appliedKind === "migrate_credentials" && page === "pools") ? setPoolError : undefined,
+          : appliedKind === "save_pool" || (appliedKind === "migrate_credentials" && page === "pools") ? setPoolError
+          : appliedKind === "add_domain" ? (message) => { applyFailure = message; } : undefined,
       );
       if (next) {
         if (["enable_click_protection", "disable_click_protection", "upgrade_worker", "resume_worker_upgrade"].includes(appliedKind)) {
@@ -818,11 +867,25 @@ export default function App() {
           if (domain && link) void selftest(link, domain);
         }
       } else {
-        setPlan(null);
-        if (appliedKind !== "migrate_credentials")
-          setDomainOpen(
-            appliedKind === "add_domain" || appliedKind === "fix_domain_dns",
-          );
+        // Only a network-only review failure keeps the same plan usable; the error stays in this window.
+        const planStillValid = appliedKind === "add_domain" &&
+          applyFailure.includes("接入计划仍然有效") && isCurrentPlan(plan);
+        if (!planStillValid) {
+          setPlan(null);
+          if (appliedKind === "add_domain") {
+            // The backend consumed this plan: drop its results so it cannot be offered again.
+            domainCheckSequence.current += 1;
+            setPreflight(null);
+            setDnsPreflight(null);
+            setDomainAutomaticDns(false);
+            setDomainFeedback(null);
+            setDomainRecheckNeeded(true);
+          }
+          if (appliedKind !== "migrate_credentials")
+            setDomainOpen(
+              appliedKind === "add_domain" || appliedKind === "fix_domain_dns",
+            );
+        }
         try {
           const latest = await dispatch<State>("get_state");
           stateRef.current = latest;
@@ -962,6 +1025,7 @@ export default function App() {
     setPreflight(null);
     setDnsPreflight(null);
     setDomainAutomaticDns(false);
+    setDomainRecheckNeeded(false);
     setDomainFeedback(null);
     setDuplicateDomainId("");
     setError("");
@@ -969,6 +1033,9 @@ export default function App() {
   function finishDomainOperation() {
     domainOperation.current.inflight = false;
     setDomainBusy(false);
+  }
+  function revealDomainResult() {
+    setDomainResultReveal((count) => count + 1);
   }
   function isCurrentDomainOperation(sequence: number) {
     return sequence === domainOperation.current.sequence;
@@ -1083,6 +1150,12 @@ export default function App() {
           : stateRef.current.accounts.length === 1
             ? stateRef.current.accounts
             : []).map((account) => account.id);
+    if (!accountIds.length && stateRef.current.accounts.length > 1) {
+      // A new host with several accounts would only get "please choose an account" back.
+      setDomainFeedback(null);
+      rejectFields({"domain-account": "本机还没有这个域名的记录。请先选它所在的 Cloudflare 账户，再点检查。"});
+      return;
+    }
     if (!requireCurrentCredentials(accountIds)) return;
     const operation = beginDomainOperation();
     if (operation === null) return;
@@ -1100,9 +1173,18 @@ export default function App() {
     setPreflight(null);
     setDnsPreflight(null);
     setDomainAutomaticDns(false);
+    setDomainRecheckNeeded(false);
     const isCurrent = () => sequence === domainCheckSequence.current &&
       isCurrentDomainOperation(operation);
     let automaticRetryUsed = false;
+    // This run already saw the VPN address: skip the local round that would fail anyway.
+    let rememberedPublic = false;
+    if (snapshot.dnsMode === "system" && proxyDetected.current) {
+      snapshot.dnsMode = "public";
+      automaticRetryUsed = true;
+      rememberedPublic = true;
+      setDomainAutomaticDns(true);
+    }
     async function prepareWithAutomaticDns(): Promise<DomainPreparation | null> {
       const prepare = () => dispatch<DomainPreparation>("prepare_domain", {
         input: snapshot.input,
@@ -1112,8 +1194,29 @@ export default function App() {
       });
       let result = await prepare();
       if (!isCurrent()) return null;
+      if (rememberedPublic && hasOnlyPublicDnsFailure(result)) {
+        // The proxy may be off or public DNS unreachable: go back to the local network once.
+        const publicResult = result;
+        rememberedPublic = false;
+        snapshot.dnsMode = "system";
+        setDomainAutomaticDns(false);
+        setDomainFeedback({
+          tone: "progress",
+          message: "公共 DNS 没连上，正在改用本机网络再查一次。",
+        });
+        result = await prepare();
+        if (!isCurrent()) return null;
+        if (hasOnlyVirtualDnsBlocker(result)) {
+          // The proxy is still on, so the local network cannot answer either: keep the memory and
+          // show the public-DNS failure, which the user can simply retry.
+          snapshot.dnsMode = "public";
+          setDomainAutomaticDns(true);
+          result = publicResult;
+        } else proxyDetected.current = false;
+      }
       if (snapshot.dnsMode === "system" && !automaticRetryUsed && hasOnlyVirtualDnsBlocker(result)) {
         automaticRetryUsed = true;
+        proxyDetected.current = true;
         snapshot.dnsMode = "public";
         setDomainAutomaticDns(true);
         setDomainFeedback({
@@ -1146,6 +1249,7 @@ export default function App() {
         };
         domainDraftRef.current = matchedDraft;
         setDomainDraft(matchedDraft);
+        setDomainAccountManual(false);
       }
       if (
         !(await syncDomainState(
@@ -1165,6 +1269,7 @@ export default function App() {
                 ? "多个账户都可能管理此域名。请选择账户后重新检查；尚未读取或修改 DNS。"
                 : "尚未确认此域名所属账户。请选择账户或刷新域名列表后重新检查。",
           });
+          revealDomainResult();
           return;
         }
         setDomainFeedback({
@@ -1215,6 +1320,7 @@ export default function App() {
                   }
                 : null,
             );
+            revealDomainResult();
           }
         } else if (dns.canApply && dns.plan && !options.repairAlreadyApplied) {
           setDomainFeedback(null);
@@ -1229,6 +1335,7 @@ export default function App() {
                 }
               : null,
           );
+          revealDomainResult();
         }
       } else {
         setPreflight(result);
@@ -1236,6 +1343,7 @@ export default function App() {
         setDomainFeedback(null);
         if (result.canApply && result.plan)
           openDomainPlan(result);
+        else revealDomainResult();
       }
     } catch (e) {
       if (
@@ -1910,6 +2018,7 @@ export default function App() {
           : routeSafe && (routeVirtual || targetsVirtual));
         if (retry) {
           automaticDns = true;
+          proxyDetected.current = true;
           setTestingAutomaticDns(true);
           if (route.value.status === "key_missing") {
             // Targets are anonymous; do not repeat a known missing-key read.
@@ -2146,6 +2255,7 @@ export default function App() {
   const domainExamplePrefix = validatePrefix(domainDraft.prefix)
     ? "go"
     : domainDraft.prefix;
+  const domainSummary = preflight ? domainCheckSummary(preflight) : null;
 
   return (
     <div className="app-shell">
@@ -2276,6 +2386,7 @@ export default function App() {
                   className="button primary"
                   onClick={() => {
                     invalidateDomainPreparation();
+                    setDomainAccountManual(false);
                     setDomainDraft({
                       dnsMode: "system",
                       input: "",
@@ -2673,6 +2784,7 @@ export default function App() {
                         className="button secondary"
                         onClick={() => {
                           invalidateDomainPreparation();
+                          setDomainAccountManual(false);
                           setDomainDraft({
                             dnsMode: "system",
                             input: "",
@@ -2953,6 +3065,25 @@ export default function App() {
                   上一项检查仍在进行，请稍候。
                 </span>
               </div>
+            ) : domainSummary ? (
+              <div role="status" className={`domain-feedback ${domainSummary.network ? "warning" : "error"} domain-summary`}>
+                <span>{domainSummary.message}</span>
+                {domainSummary.network && (
+                  <div className="domain-feedback-actions">
+                    <button type="button" className="button secondary" disabled={busy || domainBusy}
+                      onClick={() => {
+                        const next = domainSummary.usePublicDns
+                          ? { ...domainDraftRef.current, dnsMode: "public" as const }
+                          : domainDraftRef.current;
+                        domainDraftRef.current = next;
+                        setDomainDraft(next);
+                        void refreshDomainPreparation(next);
+                      }}>
+                      {domainSummary.usePublicDns ? "改用公共 DNS 再查一次" : "再查一次"}
+                    </button>
+                  </div>
+                )}
+              </div>
             ) : undefined
           }
           onClose={closeDomain}
@@ -2979,7 +3110,7 @@ export default function App() {
                 >
                   {domainBusy
                     ? "检查中…"
-                    : preflight || dnsPreflight || domainFeedback?.message === expiredDomainPlanMessage
+                    : preflight || dnsPreflight || domainRecheckNeeded || domainFeedback?.message === expiredDomainPlanMessage
                       ? "重新检查当前状态"
                       : "检查并继续"}
                 </button>
@@ -3000,10 +3131,12 @@ export default function App() {
             <label>
               Cloudflare 账户
               <select
+                {...fieldProps("domain-account", formErrors)}
                 aria-label="Cloudflare 账户"
                 value={domainDraft.accountId}
                 onChange={(e) => {
                   setDomainDraft({ ...domainDraft, accountId: e.target.value });
+                  setDomainAccountManual(Boolean(e.target.value));
                   invalidateDomainPreparation();
                 }}
               >
@@ -3019,6 +3152,7 @@ export default function App() {
                   </option>
                 ))}
               </select>
+              <FieldError name="domain-account" errors={formErrors} />
               <small>
                 {state.accounts.length > 1 && !domainDraft.accountId
                   ? "可输入域名自动匹配账户；刷新域名列表时需先明确选择账户。"
@@ -3030,6 +3164,7 @@ export default function App() {
                 域名
                 <input
                   {...fieldProps("domain-host", formErrors)}
+                  data-autofocus
                 list="cloudflare-zones"
                   value={domainDraft.input}
                   onChange={(e) => {
@@ -3042,11 +3177,13 @@ export default function App() {
                         )
                         .map(() => account),
                     );
+                    // An automatic pick follows the new host; a hand-picked account stays.
+                    const automatic = !domainAccountManual && state.accounts.length > 1;
                     setDomainDraft({
                       ...domainDraft,
                       input,
                       accountId:
-                        domainDraft.accountId ||
+                        (automatic ? "" : domainDraft.accountId) ||
                         (matches.length === 1 ? matches[0].id : ""),
                     });
                     invalidateDomainPreparation();
@@ -3059,7 +3196,7 @@ export default function App() {
                   {state.accounts
                     .filter(
                       (account) =>
-                        !domainDraft.accountId ||
+                        !domainAccountManual ||
                         account.id === domainDraft.accountId,
                     )
                     .flatMap((account) =>
@@ -3130,6 +3267,8 @@ export default function App() {
                 {migrationAction(domainMigrationAccount.id)}
               </div>
             )}
+            <details className="domain-more-options">
+              <summary>更多选项与说明</summary>
             <div className="domain-list-refresh">
               <button
                 type="button"
@@ -3160,9 +3299,10 @@ export default function App() {
               </label>
               <small>公共查询只向 Cloudflare 发送域名，不发送账户令牌，也不会更改本机 DNS 或 VPN 设置。</small>
             </details>
+            </details>
             {domainAutomaticDns && <p role="status" className="inline-warning">本次已自动切换为公共 DNS；接入计划会用同一方式复核，仍需确认后才会接入。</p>}
             {preflight && (
-              <div className="preflight">
+              <div className="preflight" ref={domainResultRef}>
                 {(() => {
                   const outcome = domainOutcome(preflight);
                   return (
@@ -3202,8 +3342,8 @@ export default function App() {
                 {hasOnlyNetworkBlocker(preflight) && (
                   <p className="inline-warning">
                     {preflight.dnsMode === "public"
-                      ? "公共 DNS 仍未完成网络验证。请检查 VPN 或网络连接后重新检查；域名尚未接入。"
-                      : "本机网络未完成验证。请检查网络或 VPN 后重新检查；域名尚未接入。"}
+                      ? "网络查询没完成，通常再查一次就好；还不行再检查 VPN 或网络。域名尚未接入。"
+                      : "本机网络查询没完成，通常再查一次就好；还不行再检查网络或 VPN。域名尚未接入。"}
                   </p>
                 )}
                 {preflight.candidates.length > 1 && (
@@ -3212,11 +3352,18 @@ export default function App() {
                     <select
                       value={domainDraft.accountId}
                       onChange={(e) => {
-                        setDomainDraft({
+                        const next = {
                           ...domainDraft,
                           accountId: e.target.value,
-                        });
+                        };
+                        setDomainDraft(next);
+                        setDomainAccountManual(Boolean(e.target.value));
                         invalidateDomainPreparation();
+                        // Choosing the account is enough: check it right away.
+                        if (e.target.value) {
+                          domainDraftRef.current = next;
+                          void refreshDomainPreparation(next);
+                        }
                       }}
                     >
                       <option value="">请选择</option>
@@ -3229,7 +3376,7 @@ export default function App() {
                         </option>
                       ))}
                     </select>
-                    <small>选择后需重新检查该账户下的域名。</small>
+                    <small>选好后会自动重新检查。</small>
                   </label>
                 )}
                 {!preflight.canApply &&
@@ -3237,17 +3384,30 @@ export default function App() {
                     (check) => domainCheckLevel(check) === "error",
                   ) &&
                   (preflight.candidates.length > 1 && !domainDraft.accountId ? (
-                    <p className="inline-warning">请选择账户，然后重新检查。</p>
+                    <p className="inline-warning">多个账户都有这个域名，请在上面选一个。</p>
                   ) : preflight.candidates.length === 0 ? (
                     <p className="inline-warning">
                       未在已读取的账户中找到此域名。请确认该域名权限或是否已在
                       Cloudflare 启用，然后刷新所选账户。
                     </p>
                   ) : null)}
+                {hasDomainOwnershipProblem(preflight) && (
+                  <div className="domain-result-actions">
+                    <button
+                      type="button"
+                      className="button secondary"
+                      onClick={() => void refreshDomainAccountList()}
+                      disabled={busy || domainBusy}
+                    >
+                      刷新域名列表
+                    </button>
+                    <small>新买的域名要先刷新一次，本机才有记录。</small>
+                  </div>
+                )}
               </div>
             )}
             {dnsPreflight && (
-              <div className="preflight dns-preflight">
+              <div className="preflight dns-preflight" ref={domainDnsResultRef}>
                 <div
                   className={`preflight-outcome outcome-${dnsPreflight.dnsStatus === "ready" ? "pass" : dnsPreflight.canApply ? "warning" : "error"}`}
                 >

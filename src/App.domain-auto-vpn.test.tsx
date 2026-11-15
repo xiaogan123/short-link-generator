@@ -161,15 +161,19 @@ it.each(['ready', 'missing'])('covers the followup check after DNS is %s with th
   expect(applies().map(call => call.payload.planId)).toEqual(dns === 'missing' ? ['dns'] : []);
 });
 
-it('does not silently remember public mode for a different host', async () => {
+it('remembers the VPN for this run: a later host starts with public DNS and says so', async () => {
   const form = await open(); submit(form); await done(form);
   fireEvent.click(screen.getByRole('button', {name:'返回'}));
   const restored = screen.getByRole('dialog', {name:'添加域名'});
   fireEvent.change(within(restored).getByPlaceholderText('go.example.com'), {target: {value: 'next.example.com'}});
-  control.reasons = []; submit(restored); await done(restored);
-  expect(calls().map(call => call.payload.dnsMode)).toEqual(['system', 'public', 'system']);
+  control.defer = 'public'; submit(restored);
+  await waitFor(() => expect(control.finish).toBeTypeOf('function'));
+  expect(within(restored).getByText(/本次已自动切换为公共 DNS/)).toBeTruthy();
+  await act(async () => control.finish!()); await done(restored);
+  expect(calls().map(call => call.payload.dnsMode)).toEqual(['system', 'public', 'public']);
   expect(screen.getByRole('button',{name:'确认使用此目录'})).toBeTruthy();
-  expect(screen.queryByText('网络检查：公共 DNS（兼容 VPN）')).toBeNull();
+  expect(screen.getByText('网络检查：公共 DNS（兼容 VPN）')).toBeTruthy();
+  expect(control.calls.filter(call => call.action === 'prepare_domain')[2].payload.input).toBe('next.example.com');
 });
 
 it('reuses a domain public-DNS preparation for link detection, without changing another domain', async () => {

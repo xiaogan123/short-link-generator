@@ -84,3 +84,11 @@ it('uses rendered geometry and includes fixed-position controls in the focus loo
   await user.tab({shift:true});
   expect(document.activeElement).toBe(input);
 });
+
+it('starts on a field marked data-autofocus, otherwise on the first field', () => {
+  const { unmount } = render(<Dialog title="选择" onClose={() => {}}><select aria-label="账户"><option>甲</option></select><input aria-label="域名" data-autofocus /></Dialog>);
+  expect(document.activeElement).toBe(screen.getByRole('textbox', {name:'域名'}));
+  unmount();
+  render(<Dialog title="选择" onClose={() => {}}><select aria-label="账户"><option>甲</option></select><input aria-label="域名" /></Dialog>);
+  expect(document.activeElement).toBe(screen.getByRole('combobox', {name:'账户'}));
+});

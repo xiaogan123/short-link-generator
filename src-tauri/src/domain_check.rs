@@ -325,6 +325,11 @@ impl ProbeRisk {
             (Self::Missing, Self::Missing) => true,
             // A warning disappearing into a 404 reduces risk and does not invalidate consent.
             (Self::Missing, previous) if previous.is_warning() => true,
+            // Origin errors fluctuate (522 one moment, 521 the next); any 5xx
+            // carries the same takeover risk that was already confirmed.
+            (Self::OriginFailure { status }, Self::OriginFailure { status: before }) => {
+                (500..600).contains(status) && (500..600).contains(before)
+            }
             _ => self == previous,
         }
     }
@@ -815,6 +820,46 @@ mod tests {
         };
         assert!(!changed.can_replace(&warning));
         assert!(!warning.can_replace(&safer));
+    }
+
+    #[test]
+    fn origin_failures_match_any_other_5xx_but_nothing_else() {
+        let origin = |status| ProbeRisk::OriginFailure { status };
+        for (now, before) in [(521, 522), (522, 521), (500, 599), (503, 503)] {
+            assert!(
+                origin(now).can_replace(&origin(before)),
+                "{now} after {before}"
+            );
+        }
+        // A 404 still replaces a confirmed origin failure (lower risk).
+        assert!(ProbeRisk::Missing.can_replace(&origin(522)));
+        // Other kinds never become equivalent to an origin failure.
+        for other in [
+            ProbeRisk::Content { status: 200 },
+            ProbeRisk::Blocked { status: 403 },
+            ProbeRisk::Unreachable,
+            ProbeRisk::Redirect {
+                status: 302,
+                target: RedirectTarget::Missing,
+            },
+        ] {
+            assert!(!other.can_replace(&origin(522)), "{other:?}");
+            assert!(!origin(522).can_replace(&other), "{other:?}");
+        }
+        assert!(!origin(522).can_replace(&ProbeRisk::Missing));
+        // Out-of-range values (never produced by classify_probe) are not equal.
+        assert!(!origin(600).can_replace(&origin(522)));
+        let before = PathRiskSnapshot {
+            root: origin(522),
+            child: origin(522),
+            probe_segment: "probe-fixed".into(),
+        };
+        let after = PathRiskSnapshot {
+            root: origin(521),
+            child: origin(520),
+            probe_segment: "probe-fixed".into(),
+        };
+        assert!(after.can_replace(&before));
     }
     #[test]
     fn proxy_blocks_mail_and_srv_targets_through_aliases_and_delegation() {

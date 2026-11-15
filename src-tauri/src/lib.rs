@@ -147,6 +147,88 @@ struct DomainTakeover<'a> {
 fn problem(error: CloudError) -> String {
     error.message
 }
+
+/// `DomainCheck.reason` for a Cloudflare read that got no HTTP response.
+const CLOUD_UNREACHABLE: &str = "cloud_unreachable";
+/// Check reasons that mean "the network did not let us finish", not "the
+/// domain is wrong". Repeating the same check is safe and often succeeds.
+const TRANSIENT_NETWORK_REASONS: [&str; 7] = [
+    "dns_timeout",
+    "dns_failed",
+    "public_dns_timeout",
+    "public_dns_failed",
+    CLOUD_UNREACHABLE,
+    "probe_timeout",
+    "probe_transport_error",
+];
+/// Present in an `apply_plan` error exactly when the domain plan was kept
+/// and may be confirmed again with the same plan ID (see docs/CONTRACT.md).
+const PLAN_STILL_VALID: &str = "接入计划仍然有效";
+/// Replaces the marker and what follows it when a network-only review failure
+/// could not keep the plan (it expired while the review was running).
+const PLAN_GONE_TAIL: &str = "这份接入计划已经过期，云端没有任何改动，请重新检查域名。";
+
+fn is_transient_network_reason(reason: &str) -> bool {
+    TRANSIENT_NETWORK_REASONS.contains(&reason)
+}
+
+fn is_transient_network_check(check: &DomainCheck) -> bool {
+    check
+        .reason
+        .as_deref()
+        .is_some_and(is_transient_network_reason)
+}
+
+/// True when there is at least one error and every error is a network one.
+fn only_transient_errors(checks: &[DomainCheck]) -> bool {
+    let mut errors = checks
+        .iter()
+        .filter(|check| check.level == DomainCheckLevel::Error)
+        .peekable();
+    errors.peek().is_some() && errors.all(is_transient_network_check)
+}
+
+/// Pause before the confirm-time review is repeated after a network failure.
+const REVIEW_RETRY_DELAY: Duration = if cfg!(test) {
+    Duration::from_millis(20)
+} else {
+    Duration::from_secs(1)
+};
+
+/// A confirm-time review that already took this long is not repeated at once:
+/// the network is down rather than hiccuping, and the user should hear now.
+const REVIEW_RETRY_WINDOW: Duration = Duration::from_secs(12);
+
+/// A failed preflight read. No HTTP response is a network problem worth one
+/// more try; a Cloudflare error response keeps its own wording.
+fn cloud_read_failure(label: &str, context: &str, error: CloudError) -> DomainCheck {
+    if error.network {
+        // Kept short: the dialog and the confirm error quote this text inside
+        // their own "try once more" sentence.
+        let mut check =
+            domain_check::hard_check(label, false, "暂时连不上 Cloudflare，这是网络问题");
+        check.reason = Some(CLOUD_UNREACHABLE.into());
+        check
+    } else {
+        domain_check::hard_check(label, false, format!("{context}{}", problem(error)))
+    }
+}
+
+/// Shown when no usable account is selected for a domain that has candidates.
+/// A chosen account that does not hold the domain is told which one does.
+fn account_choice_message(choice: Option<&str>, candidates: &[Candidate]) -> String {
+    match choice {
+        Some(_) => {
+            let mut labels: Vec<&str> = candidates.iter().map(|c| c.label.as_str()).collect();
+            labels.dedup();
+            format!(
+                "这个域名在账户「{}」下，不在你选的账户里；请把上面的账户改成它再检查",
+                labels.join("」或「")
+            )
+        }
+        None => "请选择此域名所属的账号".to_string(),
+    }
+}
 /// Outcome of the read checks an account must pass before it is imported.
 enum ImportAccessError {
     /// Cloudflare refused this token for this account.
@@ -1673,7 +1755,7 @@ impl Backend {
             checks.push(domain_check::hard_check(
                 "账号选择",
                 false,
-                "请选择此域名所属的账号",
+                account_choice_message(choice, &candidates),
             ));
         } else if let Some(candidate) = selected {
             match self
@@ -1883,10 +1965,13 @@ impl Backend {
         checks.push(domain_check::hard_check(
             "域名归属状态",
             active,
-            if active {
-                "域名所属区域已启用"
-            } else {
-                "域名所属区域未启用，或不属于此账号"
+            match zone {
+                _ if active => "域名所属区域已启用".to_string(),
+                Some(zone) => format!(
+                    "这个域名在 Cloudflare 还没生效（当前状态：{}）。请先到 Cloudflare 按提示把域名服务器改好，生效后再来添加",
+                    zone.status
+                ),
+                None => "域名所属区域未启用，或不属于此账号".to_string(),
             },
         ));
         if !active {
@@ -1899,12 +1984,26 @@ impl Backend {
                 return (checks, None);
             }
         };
-        let remote_zone = self.cloud.get(&token, &format!("zones/{zone_id}")).await;
-        let remote_active = remote_zone.is_ok_and(|v| {
-            v["result"]["status"] == "active"
-                && v["result"]["id"].as_str() == Some(zone_id)
-                && v["result"]["account"]["id"].as_str() == Some(account_id)
-        });
+        // The three reads are independent; send them together. Results are
+        // still shown in order and a failed earlier step hides later ones.
+        let zone_path = format!("zones/{zone_id}");
+        let dns_path = format!("zones/{zone_id}/dns_records?name={}", cloud::encode(host));
+        let routes_path = format!("zones/{zone_id}/workers/routes");
+        let (remote_zone, dns, routes) = tokio::join!(
+            self.cloud.get(&token, &zone_path),
+            self.cloud.list_pages(&token, &dns_path),
+            self.cloud.get(&token, &routes_path),
+        );
+        let remote_zone = match remote_zone {
+            Ok(value) => value,
+            Err(error) => {
+                checks.push(cloud_read_failure("云端域名归属", "", error));
+                return (checks, None);
+            }
+        };
+        let remote_active = remote_zone["result"]["status"] == "active"
+            && remote_zone["result"]["id"].as_str() == Some(zone_id)
+            && remote_zone["result"]["account"]["id"].as_str() == Some(account_id);
         checks.push(domain_check::hard_check(
             "云端域名归属",
             remote_active,
@@ -1917,10 +2016,10 @@ impl Backend {
         if !remote_active {
             return (checks, None);
         }
-        let dns_path = format!("zones/{zone_id}/dns_records?name={}", cloud::encode(host));
-        let dns = self.cloud.list_pages(&token, &dns_path).await;
-        let (ok, message) = match dns {
-            Ok(items) => match domain_check::classify_dns_records(&items, host) {
+        let dns_check = match dns {
+            Err(error) => cloud_read_failure("DNS", "无法读取 DNS 记录：", error),
+            Ok(items) => {
+                let (ok, message) = match domain_check::classify_dns_records(&items, host) {
                 Ok(domain_check::DnsClassification::Ready) => (true, "DNS 已代理".into()),
                 Ok(domain_check::DnsClassification::Missing) => (
                     false,
@@ -1934,18 +2033,13 @@ impl Backend {
                 Ok(domain_check::DnsClassification::Unsupported(message))
                 | Ok(domain_check::DnsClassification::Conflict(message)) => (false, message),
                 Err(message) => (false, format!("DNS 记录格式无效：{message}")),
-            },
-            Err(_) => (
-                false,
-                "无法读取 DNS 记录；未确认当前状态，不能准备接入计划".into(),
-            ),
+                };
+                domain_check::hard_check("DNS", ok, message)
+            }
         };
-        checks.push(domain_check::hard_check("DNS", ok, message));
-        let routes = self
-            .cloud
-            .get(&token, &format!("zones/{zone_id}/workers/routes"))
-            .await;
-        let (ok, message) = match routes {
+        checks.push(dns_check);
+        let routes_check = match routes {
+            Err(error) => cloud_read_failure("转发规则", "无法读取云端转发规则：", error),
             Ok(v) => {
                 let Some(arr) = v["result"].as_array() else {
                     checks.push(domain_check::hard_check(
@@ -1960,7 +2054,8 @@ impl Backend {
                         .as_str()
                         .is_some_and(|p| route_conflict(p, host, prefix))
                 });
-                (
+                domain_check::hard_check(
+                    "转发规则",
                     !found,
                     if found {
                         "现有转发规则与此前缀重叠"
@@ -1969,9 +2064,8 @@ impl Backend {
                     },
                 )
             }
-            Err(_) => (false, "无法读取云端转发规则"),
         };
-        checks.push(domain_check::hard_check("转发规则", ok, message));
+        checks.push(routes_check);
         if checks
             .iter()
             .any(|check| check.level == DomainCheckLevel::Error)
@@ -2054,7 +2148,7 @@ impl Backend {
             checks.push(domain_check::hard_check(
                 "账号选择",
                 false,
-                "请选择此域名所属的账号",
+                account_choice_message(choice, &candidates),
             ));
         } else if let Some(c) = selected {
             let (next_checks, path_risk) = self
@@ -2834,7 +2928,30 @@ impl Backend {
                 {
                     return Err("请明确确认更新本机授权；尚未读取任何旧凭据".into());
                 }
-                self.apply(plan.kind, acknowledge_domain_takeover).await?;
+                // A domain review that failed only on the network leaves the
+                // plan reusable (same ID, expiry and snapshot); see CONTRACT.md.
+                let retained = matches!(&plan.kind, PlanKind::Domain { .. }).then(|| Plan {
+                    view: plan.view.clone(),
+                    kind: plan.kind.clone(),
+                    expires_at: plan.expires_at,
+                    snapshot: plan.snapshot.clone(),
+                });
+                if let Err(error) = self.apply(plan.kind, acknowledge_domain_takeover).await {
+                    let Some((head, _)) = error.split_once(PLAN_STILL_VALID) else {
+                        return Err(error);
+                    };
+                    if let Some(retained) = retained {
+                        if retained.expires_at > Instant::now()
+                            && retained.snapshot == self.database_snapshot()
+                        {
+                            self.plans.push(retained);
+                            return Err(error);
+                        }
+                    }
+                    // The plan ran out during the review and is gone: the text
+                    // must not keep the marker or invite another confirm.
+                    return Err(format!("{head}{PLAN_GONE_TAIL}"));
+                }
                 Ok(self.state())
             }
             "selftest_link" => Err("自检调用路径无效".into()),
@@ -3752,7 +3869,10 @@ impl Backend {
         if self.db.domains.iter().any(|d| d.host == host) {
             return Err("这个主机名已经添加".into());
         }
-        let (checks, current_path_risk) = self
+        // Nothing below writes a journal, local state or cloud data until the
+        // review passes; a network-only failure therefore keeps the plan valid.
+        let review_started = Instant::now();
+        let mut review = self
             .preflight(
                 account_id,
                 zone_id,
@@ -3762,15 +3882,45 @@ impl Backend {
                 takeover.dns_mode,
             )
             .await;
-        if checks
+        if only_transient_errors(&review.0) && review_started.elapsed() < REVIEW_RETRY_WINDOW {
+            tokio::time::sleep(REVIEW_RETRY_DELAY).await;
+            review = self
+                .preflight(
+                    account_id,
+                    zone_id,
+                    host,
+                    prefix,
+                    Some(&takeover.expected_path_risk.probe_segment),
+                    takeover.dns_mode,
+                )
+                .await;
+        }
+        let (checks, current_path_risk) = review;
+        let errors: Vec<&DomainCheck> = checks
             .iter()
-            .any(|check| check.level == DomainCheckLevel::Error)
-        {
-            return Err("预检状态已变化，请重新检查域名".into());
+            .filter(|check| check.level == DomainCheckLevel::Error)
+            .collect();
+        if let Some(first) = errors.first() {
+            if only_transient_errors(&checks) {
+                return Err(format!(
+                    "网络检查没有完成（{}：{}）。{PLAN_STILL_VALID}，云端没有任何改动，可以直接再点一次确认。",
+                    first.label, first.message
+                ));
+            }
+            let failed = errors
+                .iter()
+                .find(|check| !is_transient_network_check(check))
+                .unwrap_or(first);
+            return Err(format!(
+                "复核没有通过（{}：{}）。云端没有任何改动，请重新检查域名。",
+                failed.label, failed.message
+            ));
         }
         let current_path_risk = current_path_risk.ok_or("路径预检状态已变化，请重新检查域名")?;
         if !current_path_risk.can_replace(takeover.expected_path_risk) {
-            return Err("路径响应状态已变化，请重新检查域名并确认接管范围".into());
+            return Err(
+                "路径响应状态已变化，请重新检查域名并确认接管范围；云端没有任何改动".into(),
+            );
         }
         let token = read_account_token(account_id).await?;
         let existing = self.account(account_id)?.resources.clone();
@@ -3902,6 +4052,7 @@ impl Backend {
                     .ok_or_else(|| CloudError {
                         message: "命名空间响应缺少标识".into(),
                         uncertain: true,
+                        network: false,
                     })?
                     .to_owned();
                 created_namespace = Some(namespace.clone());
@@ -3909,6 +4060,7 @@ impl Backend {
                     .map_err(|m| CloudError {
                         message: m,
                         uncertain: true,
+                        network: false,
                     })?;
                 let mut key = [0_u8; 32];
                 rand::thread_rng().fill_bytes(&mut key);
@@ -3916,6 +4068,7 @@ impl Backend {
                 keyring_set(account_id, "selftest", &key_hex).map_err(|m| CloudError {
                     message: m,
                     uncertain: false,
+                    network: false,
                 })?;
                 self.cloud
                     .upload_script(&token, account_id, &script, &namespace, &key_hex)
@@ -3925,6 +4078,7 @@ impl Backend {
                     .map_err(|m| CloudError {
                         message: m,
                         uncertain: true,
+                        network: false,
                     })?;
                 let manifest = json!({"schema":SCHEMA,"accountId":account_id,
                     "script":script,"namespace":namespace,"sourceHash":bundled_source_hash()});
@@ -3954,6 +4108,7 @@ impl Backend {
                 .map_err(|m| CloudError {
                     message: m,
                     uncertain: true,
+                    network: false,
                 })?;
             let route = self
                 .cloud
@@ -3969,6 +4124,7 @@ impl Backend {
                     .ok_or_else(|| CloudError {
                         message: "路由响应缺少标识".into(),
                         uncertain: true,
+                        network: false,
                     })?
                     .to_owned(),
             );
@@ -6478,6 +6634,16 @@ async fn run_pool_health(snapshot: HealthSnapshot) -> Result<Value, String> {
     Ok(json!({"poolId":snapshot.pool.id,"accounts":accounts}))
 }
 
+/// Self-test summary when an attempt loop ended on a network failure.
+const SELFTEST_NETWORK_MESSAGE: &str = "网络没连通，自检没有完成。请检查网络或代理后再检测一次";
+
+/// Pause between signed self-test attempts.
+const REGION_RETRY_PAUSE: Duration = if cfg!(test) {
+    Duration::from_millis(20)
+} else {
+    Duration::from_secs(5)
+};
+
 async fn run_region_test(
     snapshot: &SelftestSnapshot,
     country: &str,
@@ -6486,6 +6652,8 @@ async fn run_region_test(
     dns_mode: local_check::DnsMode,
 ) -> Result<DomainCheck, String> {
     let mut pending = false;
+    // The latest attempt's network failure, if it ended with one.
+    let mut network_failure: Option<cloud::ProbeError> = None;
     for attempt in 0..5 {
         let seconds = Utc::now().timestamp();
         let text = format!(
@@ -6528,7 +6696,11 @@ async fn run_region_test(
                     "云端监测记录显示所有大陆备用地址暂时不可用，转发返回 HTTP 503",
                 ));
             }
-            Ok(Err(error)) if error.reason.is_some() => {
+            Ok(Err(error))
+                if error
+                    .reason
+                    .is_some_and(|reason| !is_transient_network_reason(reason)) =>
+            {
                 // Resolver/address guard failures are definitive for this mode.
                 // Preserve their typed cause; never retry them as propagation.
                 return Ok(domain_check::classify_probe_detailed(
@@ -6539,12 +6711,32 @@ async fn run_region_test(
                 )
                 .0);
             }
-            Ok(Ok((404, _))) | Ok(Err(_)) | Err(_) => pending = true,
-            _ => pending = false,
+            Ok(Err(error)) if error.reason.is_some() => {
+                // Timeouts and connection failures are worth another attempt.
+                pending = true;
+                network_failure = Some(error);
+            }
+            Err(_) => {
+                pending = true;
+                network_failure = Some(cloud::probe_timeout());
+            }
+            Ok(Ok((404, _))) | Ok(Err(_)) => {
+                pending = true;
+                network_failure = None;
+            }
+            _ => {
+                pending = false;
+                network_failure = None;
+            }
         }
         if attempt < 4 {
-            tokio::time::sleep(Duration::from_secs(5)).await;
+            tokio::time::sleep(REGION_RETRY_PAUSE).await;
         }
+    }
+    if let Some(error) = network_failure {
+        // Still a network failure after every attempt: say so, with its reason,
+        // rather than suggesting that the edge is still propagating.
+        return Ok(domain_check::classify_probe_detailed(label, &snapshot.url, None, Err(error)).0);
     }
     Ok(domain_check::hard_check(
         label,
@@ -6618,11 +6810,17 @@ async fn run_selftest_with_mode(
             domain_check::hard_check("中国大陆", false, "自检超时，请稍后重试"),
         ],
     };
+    // A probe that never got through the network proves nothing about the
+    // route: it stays "pending", never "failed", and is not called propagation.
+    let network = checks
+        .iter()
+        .any(|c| !c.ok && is_transient_network_check(c));
     let status = if checks.iter().all(|c| c.ok) {
         "passed"
-    } else if checks
-        .iter()
-        .any(|c| c.message.contains("传播") || c.message.contains("超时"))
+    } else if network
+        || checks
+            .iter()
+            .any(|c| c.message.contains("传播") || c.message.contains("超时"))
     {
         "pending"
     } else {
@@ -6630,6 +6828,7 @@ async fn run_selftest_with_mode(
     };
     Ok(json!({"status":status,
             "message":match status {"passed"=>"两个地区的跳转均通过自检",
+                "pending" if network=>SELFTEST_NETWORK_MESSAGE,
                 "pending"=>"边缘配置可能仍在传播","failed"=>"自检失败，请检查转发规则和目标地址",
                 _=>""},"checks":checks}))
 }
@@ -9100,6 +9299,694 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.contains("路径响应状态已变化"));
+        assert!(error.contains("云端没有任何改动"));
+    }
+
+    /// A local server that accepts and immediately closes every connection, so
+    /// requests fail without any HTTP response.
+    async fn closing_listener() -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = count.clone();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                drop(stream);
+            }
+        });
+        (format!("http://{address}/client/v4/"), count)
+    }
+
+    fn no_cloud_writes(requests: &[wiremock::Request]) -> bool {
+        !requests
+            .iter()
+            .any(|request| matches!(request.method.as_str(), "PUT" | "POST" | "PATCH" | "DELETE"))
+    }
+
+    #[test]
+    fn transient_network_reasons_exclude_definitive_dns_results() {
+        for reason in [
+            "dns_timeout",
+            "dns_failed",
+            "public_dns_timeout",
+            "public_dns_failed",
+            "cloud_unreachable",
+            "probe_timeout",
+            "probe_transport_error",
+        ] {
+            assert!(is_transient_network_reason(reason), "{reason}");
+        }
+        for reason in [
+            "virtual_dns_address",
+            "blocked_non_public_address",
+            "invalid_url",
+            "public_dns_invalid_response",
+            "public_dns_response_too_large",
+            "dns_no_answer",
+            "client_initialization",
+        ] {
+            assert!(!is_transient_network_reason(reason), "{reason}");
+        }
+        let network = |label: &str| {
+            let mut check = domain_check::hard_check(label, false, "x");
+            check.reason = Some("probe_timeout".into());
+            check
+        };
+        let pass = domain_check::hard_check("DNS", true, "ok");
+        let real = domain_check::hard_check("转发规则", false, "现有转发规则与此前缀重叠");
+        assert!(!only_transient_errors(std::slice::from_ref(&pass)));
+        assert!(only_transient_errors(&[pass, network("短链接目录")]));
+        assert!(!only_transient_errors(&[network("短链接目录"), real]));
+    }
+
+    #[tokio::test]
+    async fn preflight_reads_are_sent_together() {
+        let (server, mut backend, _dir) = fixture().await;
+        let delay = Duration::from_millis(800);
+        Mock::given(method("GET"))
+            .and(path("/client/v4/zones/zone1"))
+            .respond_with(
+                ok(json!({"id":"zone1","status":"active","account":{"id":"acct1"}}))
+                    .set_delay(delay),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/client/v4/zones/zone1/dns_records"))
+            .respond_with(
+                ok(json!([{"name":"example.com","type":"A","proxied":true}])).set_delay(delay),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/client/v4/zones/zone1/workers/routes"))
+            .respond_with(ok(json!([])).set_delay(delay))
+            .mount(&server)
+            .await;
+        mount_domain_probes(
+            &server,
+            ResponseTemplate::new(404),
+            ResponseTemplate::new(404),
+        )
+        .await;
+        let started = Instant::now();
+        let prepared = backend
+            .dispatch(
+                "prepare_domain",
+                &json!({"input":"example.com","prefix":"go"}),
+            )
+            .await
+            .unwrap();
+        // Sequential reads would need at least 3 x 800 ms.
+        assert!(
+            started.elapsed() < Duration::from_millis(2000),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(prepared["canApply"], true);
+        let labels: Vec<_> = prepared["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|check| check["label"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(
+            labels,
+            [
+                "域名归属状态",
+                "云端域名归属",
+                "DNS",
+                "转发规则",
+                "短链接目录",
+                "随机测试链接"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn preflight_marks_unreachable_cloudflare_as_a_network_problem() {
+        let (_server, mut backend, _dir) = fixture().await;
+        let (base, connections) = closing_listener().await;
+        backend.cloud = Cloud::for_test(&base);
+        let prepared = backend
+            .dispatch(
+                "prepare_domain",
+                &json!({"input":"example.com","prefix":"go"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(prepared["canApply"], false);
+        let checks = prepared["checks"].as_array().unwrap();
+        // The failed ownership read hides the later checks, as before.
+        assert_eq!(checks.len(), 2);
+        assert_eq!(checks[1]["label"], "云端域名归属");
+        assert_eq!(checks[1]["level"], "error");
+        assert_eq!(checks[1]["reason"], "cloud_unreachable");
+        let message = checks[1]["message"].as_str().unwrap();
+        assert_eq!(message, "暂时连不上 Cloudflare，这是网络问题");
+        assert!(!message.contains("归属此账号"), "{message}");
+        // Three reads, each tried three times.
+        assert_eq!(connections.load(std::sync::atomic::Ordering::SeqCst), 9);
+    }
+
+    #[tokio::test]
+    async fn preflight_shows_cloudflare_refusals_and_real_state_separately() {
+        let (server, mut backend, _dir) = fixture().await;
+        Mock::given(method("GET"))
+            .and(path("/client/v4/zones/zone1"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/client/v4/zones/zone1/dns_records"))
+            .respond_with(ok(
+                json!([{"name":"example.com","type":"A","proxied":true}]),
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/client/v4/zones/zone1/workers/routes"))
+            .respond_with(ok(json!([])))
+            .mount(&server)
+            .await;
+        let prepared = backend
+            .dispatch(
+                "prepare_domain",
+                &json!({"input":"example.com","prefix":"go"}),
+            )
+            .await
+            .unwrap();
+        let zone_check = &prepared["checks"][1];
+        assert_eq!(zone_check["label"], "云端域名归属");
+        assert!(zone_check["message"].as_str().unwrap().contains("HTTP 403"));
+        assert!(zone_check.get("reason").is_none());
+
+        // A readable zone in the wrong state keeps the ownership wording.
+        server.reset().await;
+        Mock::given(method("GET"))
+            .and(path("/client/v4/zones/zone1"))
+            .respond_with(ok(
+                json!({"id":"zone1","status":"pending","account":{"id":"acct1"}}),
+            ))
+            .mount(&server)
+            .await;
+        let prepared = backend
+            .dispatch(
+                "prepare_domain",
+                &json!({"input":"example.com","prefix":"go"}),
+            )
+            .await
+            .unwrap();
+        assert!(prepared["checks"][1]["message"]
+            .as_str()
+            .unwrap()
+            .contains("无法确认域名所属区域已启用且归属此账号"));
+
+        // A DNS read refusal names the read and the real cause; routes still show.
+        server.reset().await;
+        mount_zone_owner(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/client/v4/zones/zone1/dns_records"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/client/v4/zones/zone1/workers/routes"))
+            .respond_with(ok(json!([])))
+            .mount(&server)
+            .await;
+        let prepared = backend
+            .dispatch(
+                "prepare_domain",
+                &json!({"input":"example.com","prefix":"go"}),
+            )
+            .await
+            .unwrap();
+        let checks = prepared["checks"].as_array().unwrap();
+        let dns = checks.iter().find(|check| check["label"] == "DNS").unwrap();
+        let message = dns["message"].as_str().unwrap();
+        assert!(message.starts_with("无法读取 DNS 记录："), "{message}");
+        assert!(message.contains("HTTP 403"), "{message}");
+        assert!(dns.get("reason").is_none());
+        assert!(checks
+            .iter()
+            .any(|check| check["label"] == "转发规则" && check["level"] == "pass"));
+        assert!(!server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .any(|request| request.method.as_str() == "HEAD"));
+    }
+
+    #[tokio::test]
+    async fn preflight_explains_a_cached_zone_that_is_not_active_yet() {
+        let (server, mut backend, _dir) = fixture().await;
+        backend.db.accounts[0].zones[0].status = "pending".into();
+        let (checks, risk) = backend
+            .preflight(
+                "acct1",
+                "zone1",
+                "example.com",
+                "go",
+                None,
+                local_check::DnsMode::System,
+            )
+            .await;
+        assert!(risk.is_none());
+        assert_eq!(checks.len(), 1);
+        assert_eq!(
+            checks[0].message,
+            "这个域名在 Cloudflare 还没生效（当前状态：pending）。请先到 Cloudflare 按提示把域名服务器改好，生效后再来添加"
+        );
+        let (checks, _) = backend
+            .preflight(
+                "acct1",
+                "zone-other",
+                "example.com",
+                "go",
+                None,
+                local_check::DnsMode::System,
+            )
+            .await;
+        assert_eq!(checks[0].message, "域名所属区域未启用，或不属于此账号");
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn prepare_domain_names_the_account_that_holds_the_domain() {
+        let (server, mut backend, _dir) = fixture().await;
+        let mut second = backend.db.accounts[0].clone();
+        second.id = "acct2".into();
+        second.label = "账号 2".into();
+        second.zones.clear();
+        backend.db.accounts.push(second);
+        keyring_set("acct2", "token", "second-test-token").unwrap();
+        Mock::given(method("GET"))
+            .and(path("/client/v4/zones"))
+            .and(query_param("account.id", "acct2"))
+            .respond_with(ok(json!([])))
+            .mount(&server)
+            .await;
+        let prepared = backend
+            .dispatch(
+                "prepare_domain",
+                &json!({"input":"example.com","prefix":"go","accountId":"acct2"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(prepared["canApply"], false);
+        let check = &prepared["checks"][0];
+        assert_eq!(check["label"], "账号选择");
+        assert_eq!(
+            check["message"],
+            "这个域名在账户「账号 1」下，不在你选的账户里；请把上面的账户改成它再检查"
+        );
+    }
+
+    #[tokio::test]
+    async fn domain_plan_survives_network_only_review_failure_and_applies_with_same_id() {
+        let (server, mut backend, _dir) = fixture().await;
+        mount_domain_hard_checks(
+            &server,
+            json!([{"name":"example.com","type":"A","proxied":true}]),
+            json!([]),
+        )
+        .await;
+        mount_domain_probes(
+            &server,
+            ResponseTemplate::new(404),
+            ResponseTemplate::new(404),
+        )
+        .await;
+        let prepared = backend
+            .dispatch(
+                "prepare_domain",
+                &json!({"input":"example.com","prefix":"go"}),
+            )
+            .await
+            .unwrap();
+        let plan_id = prepared["plan"]["id"].as_str().unwrap().to_owned();
+        let original = backend.plans.iter().find(|p| p.view.id == plan_id).unwrap();
+        let (expires_at, plan_snapshot) = (original.expires_at, original.snapshot.clone());
+        let state_before = backend.database_snapshot();
+        let persists_before = backend
+            .persist_count
+            .load(std::sync::atomic::Ordering::SeqCst);
+
+        // Both directory probes time out in the review and in its automatic retry.
+        server.reset().await;
+        mount_domain_hard_checks(
+            &server,
+            json!([{"name":"example.com","type":"A","proxied":true}]),
+            json!([]),
+        )
+        .await;
+        mount_domain_probes(
+            &server,
+            ResponseTemplate::new(404).set_delay(Duration::from_secs(3)),
+            ResponseTemplate::new(404).set_delay(Duration::from_secs(3)),
+        )
+        .await;
+        let error = backend
+            .dispatch("apply_plan", &json!({"planId":plan_id}))
+            .await
+            .unwrap_err();
+        assert!(error.starts_with("网络检查没有完成（"), "{error}");
+        assert!(error.contains(PLAN_STILL_VALID), "{error}");
+        assert!(
+            error.contains("云端没有任何改动，可以直接再点一次确认。"),
+            "{error}"
+        );
+        assert!(error.contains("超时"), "{error}");
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|r| r.method.as_str() == "HEAD")
+                .count(),
+            4,
+            "the review runs twice"
+        );
+        // Invariant: nothing was written before the marker was returned.
+        assert!(no_cloud_writes(&requests));
+        assert!(backend.db.pending_operations.is_empty());
+        assert_eq!(backend.database_snapshot(), state_before);
+        assert_eq!(
+            backend
+                .persist_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            persists_before
+        );
+        let kept = backend.plans.iter().find(|p| p.view.id == plan_id).unwrap();
+        assert_eq!(kept.expires_at, expires_at);
+        assert_eq!(kept.snapshot, plan_snapshot);
+        assert!(matches!(kept.kind, PlanKind::Domain { .. }));
+
+        // The network recovers: the same plan ID now completes.
+        server.reset().await;
+        mount_domain_hard_checks(
+            &server,
+            json!([{"name":"example.com","type":"A","proxied":true}]),
+            json!([]),
+        )
+        .await;
+        mount_domain_probes(
+            &server,
+            ResponseTemplate::new(404),
+            ResponseTemplate::new(404),
+        )
+        .await;
+        mount_existing_resource_domain_write(&server).await;
+        let state = backend
+            .dispatch("apply_plan", &json!({"planId":plan_id}))
+            .await
+            .unwrap();
+        assert_eq!(state["domains"].as_array().unwrap().len(), 1);
+        assert!(backend
+            .dispatch("apply_plan", &json!({"planId":plan_id}))
+            .await
+            .unwrap_err()
+            .contains("计划不存在或已被使用"));
+    }
+
+    #[tokio::test]
+    async fn domain_review_retries_once_by_itself_after_a_network_failure() {
+        let (server, mut backend, _dir) = fixture().await;
+        mount_domain_hard_checks(
+            &server,
+            json!([{"name":"example.com","type":"A","proxied":true}]),
+            json!([]),
+        )
+        .await;
+        mount_domain_probes(
+            &server,
+            ResponseTemplate::new(404),
+            ResponseTemplate::new(404),
+        )
+        .await;
+        let prepared = backend
+            .dispatch(
+                "prepare_domain",
+                &json!({"input":"example.com","prefix":"go"}),
+            )
+            .await
+            .unwrap();
+        let plan_id = prepared["plan"]["id"].as_str().unwrap().to_owned();
+        server.reset().await;
+        mount_domain_hard_checks(
+            &server,
+            json!([{"name":"example.com","type":"A","proxied":true}]),
+            json!([]),
+        )
+        .await;
+        // Only the first review's directory probe times out.
+        Mock::given(method("HEAD"))
+            .and(path("/client/v4/probe/example.com/go/"))
+            .respond_with(ResponseTemplate::new(404).set_delay(Duration::from_secs(3)))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        mount_domain_probes(
+            &server,
+            ResponseTemplate::new(404),
+            ResponseTemplate::new(404),
+        )
+        .await;
+        mount_existing_resource_domain_write(&server).await;
+        let state = backend
+            .dispatch("apply_plan", &json!({"planId":plan_id}))
+            .await
+            .unwrap();
+        assert_eq!(state["domains"].as_array().unwrap().len(), 1);
+        assert!(backend.plans.iter().all(|p| p.view.id != plan_id));
+    }
+
+    #[tokio::test]
+    async fn domain_review_real_failure_voids_plan_and_names_the_check() {
+        let (server, mut backend, _dir) = fixture().await;
+        mount_domain_hard_checks(
+            &server,
+            json!([{"name":"example.com","type":"A","proxied":true}]),
+            json!([]),
+        )
+        .await;
+        mount_domain_probes(
+            &server,
+            ResponseTemplate::new(404),
+            ResponseTemplate::new(404),
+        )
+        .await;
+        let prepared = backend
+            .dispatch(
+                "prepare_domain",
+                &json!({"input":"example.com","prefix":"go"}),
+            )
+            .await
+            .unwrap();
+        let plan_id = prepared["plan"]["id"].as_str().unwrap().to_owned();
+        server.reset().await;
+        mount_domain_hard_checks(
+            &server,
+            json!([{"name":"example.com","type":"A","proxied":true}]),
+            json!([{"id":"other","pattern":"example.com/go/*","script":"another"}]),
+        )
+        .await;
+        let error = backend
+            .dispatch("apply_plan", &json!({"planId":plan_id}))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error,
+            "复核没有通过（转发规则：现有转发规则与此前缀重叠）。云端没有任何改动，请重新检查域名。"
+        );
+        assert!(!error.contains(PLAN_STILL_VALID));
+        assert!(no_cloud_writes(&server.received_requests().await.unwrap()));
+        assert!(backend.db.pending_operations.is_empty());
+        assert!(backend
+            .dispatch("apply_plan", &json!({"planId":plan_id}))
+            .await
+            .unwrap_err()
+            .contains("计划不存在或已被使用"));
+    }
+
+    fn region_snapshot(cloud: Cloud) -> SelftestSnapshot {
+        SelftestSnapshot {
+            cloud,
+            host: "example.com".into(),
+            path: "/go/sample".into(),
+            url: "https://example.com/go/sample".into(),
+            cn_url: "https://example.org/local".into(),
+            default_url: "https://example.org/global".into(),
+            key: Zeroizing::new(vec![0xa1; 32]),
+            pool: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn region_test_retries_network_failures_then_passes() {
+        let (server, backend, _guard) = fixture().await;
+        Mock::given(method("HEAD"))
+            .and(path("/client/v4/probe/example.com/go/sample"))
+            .respond_with(ResponseTemplate::new(404).set_delay(Duration::from_millis(2500)))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("HEAD"))
+            .and(path("/client/v4/probe/example.com/go/sample"))
+            .respond_with(
+                ResponseTemplate::new(302).insert_header("location", "https://example.org/global"),
+            )
+            .mount(&server)
+            .await;
+        let check = run_region_test(
+            &region_snapshot(backend.cloud.clone()),
+            "US",
+            "其他地区",
+            Some("https://example.org/global"),
+            local_check::DnsMode::Public,
+        )
+        .await
+        .unwrap();
+        assert!(check.ok, "{}", check.message);
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn region_test_reports_a_persistent_network_failure_with_its_reason() {
+        let (base, connections) = closing_listener().await;
+        let check = run_region_test(
+            &region_snapshot(Cloud::for_test(&base)),
+            "US",
+            "其他地区",
+            Some("https://example.org/global"),
+            local_check::DnsMode::Public,
+        )
+        .await
+        .unwrap();
+        assert!(!check.ok);
+        assert_eq!(check.reason.as_deref(), Some("probe_transport_error"));
+        assert!(!check.message.contains("传播"), "{}", check.message);
+        // Every attempt ran instead of stopping at the first network error.
+        assert_eq!(connections.load(std::sync::atomic::Ordering::SeqCst), 5);
+    }
+
+    #[tokio::test]
+    async fn selftest_that_never_got_through_the_network_is_pending_not_failed() {
+        let (base, _connections) = closing_listener().await;
+        let report = run_selftest_with_mode(
+            region_snapshot(Cloud::for_test(&base)),
+            local_check::DnsMode::Public,
+        )
+        .await
+        .unwrap();
+        // No response at all says nothing about the route or the targets.
+        assert_eq!(report["status"], "pending", "{report}");
+        assert_eq!(report["message"], SELFTEST_NETWORK_MESSAGE);
+        let checks = report["checks"].as_array().unwrap();
+        assert_eq!(checks.len(), 2);
+        for check in checks {
+            assert_eq!(check["reason"], "probe_transport_error", "{check}");
+            assert!(
+                !check["message"].as_str().unwrap().contains("传播"),
+                "{check}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn selftest_summary_keeps_propagation_and_mismatch_wording() {
+        // A 404 on every attempt is still reported as propagation.
+        let (server, backend, _guard) = fixture().await;
+        Mock::given(method("HEAD"))
+            .and(path("/client/v4/probe/example.com/go/sample"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        let report = run_selftest_with_mode(
+            region_snapshot(backend.cloud.clone()),
+            local_check::DnsMode::Public,
+        )
+        .await
+        .unwrap();
+        assert_eq!(report["status"], "pending", "{report}");
+        assert_eq!(report["message"], "边缘配置可能仍在传播");
+
+        // A wrong answer is a real failure.
+        server.reset().await;
+        Mock::given(method("HEAD"))
+            .and(path("/client/v4/probe/example.com/go/sample"))
+            .respond_with(
+                ResponseTemplate::new(302).insert_header("location", "https://example.org/wrong"),
+            )
+            .mount(&server)
+            .await;
+        let report = run_selftest_with_mode(
+            region_snapshot(backend.cloud.clone()),
+            local_check::DnsMode::Public,
+        )
+        .await
+        .unwrap();
+        assert_eq!(report["status"], "failed", "{report}");
+        assert_eq!(report["message"], "自检失败，请检查转发规则和目标地址");
+    }
+
+    #[tokio::test]
+    async fn network_only_review_failure_drops_the_marker_when_the_plan_expired_meanwhile() {
+        let (server, mut backend, _dir) = fixture().await;
+        mount_domain_hard_checks(
+            &server,
+            json!([{"name":"example.com","type":"A","proxied":true}]),
+            json!([]),
+        )
+        .await;
+        mount_domain_probes(
+            &server,
+            ResponseTemplate::new(404),
+            ResponseTemplate::new(404),
+        )
+        .await;
+        let prepared = backend
+            .dispatch(
+                "prepare_domain",
+                &json!({"input":"example.com","prefix":"go"}),
+            )
+            .await
+            .unwrap();
+        let plan_id = prepared["plan"]["id"].as_str().unwrap().to_owned();
+        // The plan is still valid when confirmed but runs out while the review
+        // (two rounds of reads that get no response) is in progress.
+        backend
+            .plans
+            .iter_mut()
+            .find(|p| p.view.id == plan_id)
+            .unwrap()
+            .expires_at = Instant::now() + Duration::from_millis(500);
+        let state_before = backend.database_snapshot();
+        let (base, _connections) = closing_listener().await;
+        backend.cloud = Cloud::for_test(&base);
+        let error = backend
+            .dispatch("apply_plan", &json!({"planId":plan_id}))
+            .await
+            .unwrap_err();
+        assert!(
+            error.starts_with("网络检查没有完成（云端域名归属："),
+            "{error}"
+        );
+        assert!(!error.contains(PLAN_STILL_VALID), "{error}");
+        assert!(!error.contains("再点一次确认"), "{error}");
+        assert!(error.ends_with(PLAN_GONE_TAIL), "{error}");
+        assert!(backend.plans.iter().all(|p| p.view.id != plan_id));
+        assert!(backend.db.pending_operations.is_empty());
+        assert_eq!(backend.database_snapshot(), state_before);
+        assert!(backend
+            .dispatch("apply_plan", &json!({"planId":plan_id}))
+            .await
+            .unwrap_err()
+            .contains("计划不存在或已被使用"));
     }
 
     #[tokio::test]

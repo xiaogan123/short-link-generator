@@ -520,6 +520,11 @@ button:disabled{opacity:0.72;}
 .form-grid .domain-network-checkbox{display:flex;align-items:center;gap:8px;margin-top:11px;font-weight:500;cursor:pointer;}
 .domain-network-checkbox input{flex:0 0 auto;margin:0;accent-color:#106c4c;}
 .domain-network-options small{display:block;margin-top:8px;line-height:1.6;}
+.domain-more-options{font-size:11px;color:#536b59;}
+.domain-more-options > summary{cursor:pointer;font-weight:700;padding:2px 0;}
+.domain-more-options > :not(summary){margin-top:10px;}
+.domain-result-actions{display:flex;align-items:center;gap:10px;margin-top:10px;}
+.domain-result-actions small{font-size:11px;line-height:1.5;color:#536b59;}
 @media (max-width:520px){.domain-list-refresh{align-items:flex-start;flex-direction:column;}
 .domain-feedback{align-items:stretch;flex-direction:column;}
 .domain-feedback-actions{justify-content:flex-start;}
